@@ -1,0 +1,18 @@
+{
+  "localhost": {
+    "network": "localhost",
+    "kycRegistry": "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f",
+    "vaultFactory": "0x7a2088a1bFc9d81c55368AE168C2C02570cB814F",
+    "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "verifiedBorrower": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "deployedAt": "2026-07-03T05:08:23.796Z"
+  },
+  "arbitrumSepolia": {
+    "network": "arbitrumSepolia",
+    "kycRegistry": "0xfF8f34a70E5393600430B43E55a31C411A220CB2",
+    "vaultFactory": "0xb999Ca894Cc7578433F4d9F67759C153E108029F",
+    "operator": "0x6C9317C1F839Ca166a9B92d925515BD1Fd533a68",
+    "verifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
+    "deployedAt": "2026-07-05T11:01:37.866Z"
+  }
+}
