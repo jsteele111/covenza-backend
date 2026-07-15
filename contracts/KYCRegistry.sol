@@ -4,6 +4,8 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "@openzeppelin/contracts/utils/Base64.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
  * @title KYCRegistry
@@ -30,6 +32,9 @@ import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
  *         status. The badge token is NOT burned on revocation - it remains
  *         as a historical record that verification happened at some point.
  *         Never infer current status from badge ownership alone.
+ *
+ *         Badge artwork is generated fully on-chain (tokenURI() below) as
+ *         a self-contained SVG - no external hosting dependency.
  */
 contract KYCRegistry is ERC721 {
     using ECDSA for bytes32;
@@ -228,19 +233,44 @@ contract KYCRegistry is ERC721 {
         return _badgeIdOf[_wallet];
     }
 
-    // --- Soulbound enforcement: block all transfers, allow only minting ---
+    // --- On-chain badge artwork ---
 
-    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
-        address from = _ownerOf(tokenId);
-        require(from == address(0), "KYC badge is non-transferable");
-        return super._update(to, tokenId, auth);
+    /**
+     * @notice Returns fully on-chain metadata (including a generated SVG image)
+     *         for a given badge token id. No external hosting dependency.
+     */
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
+
+        string memory svg = _generateSVG(tokenId);
+        string memory json = Base64.encode(
+            bytes(
+                string(
+                    abi.encodePacked(
+                        '{"name": "Covenza KYC Badge #', Strings.toString(tokenId),
+                        '", "description": "Soulbound proof of KYC verification for the Covenza lending protocol. Non-transferable.",',
+                        '"image": "data:image/svg+xml;base64,', Base64.encode(bytes(svg)), '"}'
+                    )
+                )
+            )
+        );
+
+        return string(abi.encodePacked("data:application/json;base64,", json));
     }
 
-    function approve(address, uint256) public pure override {
-        revert("KYC badge is non-transferable");
-    }
-
-    function setApprovalForAll(address, bool) public pure override {
-        revert("KYC badge is non-transferable");
+    function _generateSVG(uint256 tokenId) private pure returns (string memory) {
+        return string(
+            abi.encodePacked(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">',
+                '<rect width="300" height="300" fill="#1C1C1A"/>',
+                '<circle cx="150" cy="150" r="120" fill="none" stroke="#B08D57" stroke-width="4"/>',
+                '<circle cx="150" cy="150" r="105" fill="none" stroke="#B08D57" stroke-width="1"/>',
+                '<text x="150" y="130" font-family="Georgia, serif" font-size="26" fill="#EDE4D3" text-anchor="middle" letter-spacing="2">COVENZA</text>',
+                '<line x1="110" y1="150" x2="190" y2="150" stroke="#B08D57" stroke-width="1"/>',
+                '<text x="150" y="175" font-family="Georgia, serif" font-size="13" fill="#B08D57" text-anchor="middle" letter-spacing="3">KYC VERIFIED</text>',
+                '<text x="150" y="205" font-family="monospace" font-size="11" fill="#8a8a86" text-anchor="middle">#', Strings.toString(tokenId), '</text>',
+                '</svg>'
+            )
+        );
     }
 }

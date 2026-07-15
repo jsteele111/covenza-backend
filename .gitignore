@@ -16,3 +16,5 @@ coverage.json
 # Editor/OS files
 .vscode/
 .DS_Store
+
+test-wallet-*.json

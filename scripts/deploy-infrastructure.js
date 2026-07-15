@@ -10,14 +10,24 @@ async function main() {
   const isLocalNetwork = hre.network.name === "hardhat" || hre.network.name === "localhost";
   const borrowerAddress = isLocalNetwork ? localBorrower.address : REAL_BORROWER_ADDRESS;
 
+  // --- Verifier signing key (from .env) — signs KYC attestations, kept separate from operator ---
+  const verifierAddress = process.env.VERIFIER_ADDRESS;
+  if (!verifierAddress || !hre.ethers.isAddress(verifierAddress)) {
+    throw new Error(
+      "VERIFIER_ADDRESS is missing or invalid in your .env file. " +
+      "Run scripts/generate-verifier-key.js and add the printed address to .env as VERIFIER_ADDRESS."
+    );
+  }
+
   console.log("Deploying infrastructure (KYCRegistry + VaultFactory)...");
   console.log("Network:                     ", hre.network.name);
   console.log("Deployer / operator / lender:", deployer.address);
+  console.log("Verifier key:                ", verifierAddress);
   console.log("Borrower to verify:          ", borrowerAddress);
 
   // --- Step 1: Deploy KYCRegistry ---
   const KYCRegistry = await hre.ethers.getContractFactory("KYCRegistry");
-  const registry = await KYCRegistry.deploy(deployer.address);
+  const registry = await KYCRegistry.deploy(deployer.address, verifierAddress);
   await registry.waitForDeployment();
   const registryAddress = await registry.getAddress();
   console.log("\n✅ KYCRegistry deployed:", registryAddress);
@@ -40,6 +50,7 @@ async function main() {
     kycRegistry: registryAddress,
     vaultFactory: factoryAddress,
     operator: deployer.address,
+    verifierKey: verifierAddress,
     verifiedBorrower: borrowerAddress,
     deployedAt: new Date().toISOString()
   };
