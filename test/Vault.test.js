@@ -10,10 +10,11 @@ describe("Vault", function () {
   let borrower;
   let otherAccount;
 
-  const ONE_ETH   = ethers.parseEther("1.0");
-  const REPAYMENT = ethers.parseEther("1.03");  // principal + 3% fee
-  const DEPOSIT   = ethers.parseEther("0.15");  // 15% risk buffer
-  const DURATION  = 30;                          // 30 days (production mode)
+  const ONE_ETH      = ethers.parseEther("1.0");
+  const FEE_RATE_BPS  = 300n;                     // 3%, charged in full regardless of timing
+  const FEE           = (ONE_ETH * FEE_RATE_BPS) / 10000n; // 0.03 ETH
+  const DEPOSIT       = ethers.parseEther("0.15"); // 15% risk buffer
+  const DURATION      = 30;                        // 30 days (production mode)
 
   // --- Deploy a fresh vault before each test ---
   beforeEach(async function () {
@@ -23,7 +24,7 @@ describe("Vault", function () {
     vault = await VaultFactory.deploy(
       lender.address,
       borrower.address,
-      REPAYMENT,
+      FEE_RATE_BPS,
       DURATION,
       false,
       DEPOSIT,
@@ -47,8 +48,8 @@ describe("Vault", function () {
       expect(await vault.principal()).to.equal(ONE_ETH);
     });
 
-    it("Should record the repayment amount correctly", async function () {
-      expect(await vault.repaymentDue()).to.equal(REPAYMENT);
+    it("Should record the fee rate correctly", async function () {
+      expect(await vault.feeRateBps()).to.equal(FEE_RATE_BPS);
     });
 
     it("Should record the required deposit correctly", async function () {
@@ -58,6 +59,10 @@ describe("Vault", function () {
     it("Should start with deposit unpaid", async function () {
       expect(await vault.depositPaid()).to.equal(false);
       expect(await vault.deposit()).to.equal(0);
+    });
+
+    it("Should start with zero invested amount", async function () {
+      expect(await vault.investedAmount()).to.equal(0);
     });
 
     it("Should lock the principal inside the vault", async function () {
@@ -89,7 +94,7 @@ describe("Vault", function () {
         VaultFactory.deploy(
           ethers.ZeroAddress,
           borrower.address,
-          REPAYMENT,
+          FEE_RATE_BPS,
           DURATION,
           false,
           DEPOSIT,
@@ -104,7 +109,7 @@ describe("Vault", function () {
         VaultFactory.deploy(
           lender.address,
           ethers.ZeroAddress,
-          REPAYMENT,
+          FEE_RATE_BPS,
           DURATION,
           false,
           DEPOSIT,
@@ -119,7 +124,7 @@ describe("Vault", function () {
         VaultFactory.deploy(
           lender.address,
           borrower.address,
-          REPAYMENT,
+          FEE_RATE_BPS,
           DURATION,
           false,
           DEPOSIT,
@@ -128,19 +133,19 @@ describe("Vault", function () {
       ).to.be.revertedWith("Principal must be greater than zero");
     });
 
-    it("Should revert if repayment is less than principal", async function () {
+    it("Should revert if fee rate is zero", async function () {
       const VaultFactory = await ethers.getContractFactory("Vault");
       await expect(
         VaultFactory.deploy(
           lender.address,
           borrower.address,
-          ethers.parseEther("0.5"),
+          0,
           DURATION,
           false,
           DEPOSIT,
           { value: ONE_ETH }
         )
-      ).to.be.revertedWith("Repayment must be >= principal");
+      ).to.be.revertedWith("Fee rate must be greater than zero");
     });
 
     it("Should revert if duration is zero", async function () {
@@ -149,7 +154,7 @@ describe("Vault", function () {
         VaultFactory.deploy(
           lender.address,
           borrower.address,
-          REPAYMENT,
+          FEE_RATE_BPS,
           0,
           false,
           DEPOSIT,
@@ -164,7 +169,7 @@ describe("Vault", function () {
         VaultFactory.deploy(
           lender.address,
           borrower.address,
-          REPAYMENT,
+          FEE_RATE_BPS,
           DURATION,
           false,
           0,
@@ -216,51 +221,56 @@ describe("Vault", function () {
 
   });
 
-  // --- Repayment tests ---
-  describe("Repayment", function () {
+  // --- Settlement tests: unified settle() covers both early close and
+  // post-deadline default, replacing the old separate repay()/settleDefault().
+  describe("Settlement — early close (before deadline)", function () {
 
-    // Pay deposit before each repayment test
     beforeEach(async function () {
       await vault.connect(borrower).payDeposit({ value: DEPOSIT });
     });
 
-    it("Should allow the borrower to repay in full before the deadline", async function () {
+    it("Should allow the borrower to close early with no investment activity", async function () {
       await expect(
-        vault.connect(borrower).repay({ value: REPAYMENT })
+        vault.connect(borrower).settle()
       ).to.not.be.reverted;
       expect(await vault.isSettled()).to.equal(true);
     });
 
-    it("Should return the deposit to the borrower on repayment", async function () {
+    it("Should pay the lender principal + fee on early close", async function () {
+      const lenderBalanceBefore = await ethers.provider.getBalance(lender.address);
+      await vault.connect(borrower).settle();
+      const lenderBalanceAfter = await ethers.provider.getBalance(lender.address);
+
+      expect(lenderBalanceAfter).to.equal(lenderBalanceBefore + ONE_ETH + FEE);
+    });
+
+    it("Should return the remainder (deposit minus fee) to the borrower", async function () {
       const borrowerBalanceBefore = await ethers.provider.getBalance(borrower.address);
 
-      const tx      = await vault.connect(borrower).repay({ value: REPAYMENT });
+      const tx      = await vault.connect(borrower).settle();
       const receipt = await tx.wait();
       const gasCost = receipt.gasUsed * receipt.gasPrice;
 
       const borrowerBalanceAfter = await ethers.provider.getBalance(borrower.address);
 
-      // Borrower paid REPAYMENT + gas, received back principal + deposit
-      const expectedBalance = borrowerBalanceBefore - REPAYMENT - gasCost + ONE_ETH + DEPOSIT;
+      // totalReturned = ONE_ETH + DEPOSIT (nothing invested). Lender takes
+      // ONE_ETH + FEE. Borrower gets the rest: DEPOSIT - FEE.
+      const expectedBorrowerPayout = DEPOSIT - FEE;
+      const expectedBalance = borrowerBalanceBefore - gasCost + expectedBorrowerPayout;
       expect(borrowerBalanceAfter).to.equal(expectedBalance);
     });
 
-    it("Should send the repayment to the lender", async function () {
-      const lenderBalanceBefore = await ethers.provider.getBalance(lender.address);
-      await vault.connect(borrower).repay({ value: REPAYMENT });
-      const lenderBalanceAfter = await ethers.provider.getBalance(lender.address);
-      expect(lenderBalanceAfter).to.equal(lenderBalanceBefore + REPAYMENT);
-    });
-
-    it("Should leave vault balance at zero after repayment", async function () {
-      await vault.connect(borrower).repay({ value: REPAYMENT });
+    it("Should leave vault balance at zero after settlement", async function () {
+      await vault.connect(borrower).settle();
       expect(await vault.vaultBalance()).to.equal(0);
     });
 
-    it("Should emit a LoanRepaid event on successful repayment", async function () {
+    it("Should emit a Settled event with early=true", async function () {
       await expect(
-        vault.connect(borrower).repay({ value: REPAYMENT })
-      ).to.emit(vault, "LoanRepaid");
+        vault.connect(borrower).settle()
+      )
+        .to.emit(vault, "Settled")
+        .withArgs(borrower.address, true, ONE_ETH + DEPOSIT, ONE_ETH + FEE, DEPOSIT - FEE, FEE, anyValue);
     });
 
     it("Should revert if deposit not yet paid", async function () {
@@ -268,7 +278,7 @@ describe("Vault", function () {
       const freshVault = await VaultFactory.deploy(
         lender.address,
         borrower.address,
-        REPAYMENT,
+        FEE_RATE_BPS,
         DURATION,
         false,
         DEPOSIT,
@@ -277,51 +287,44 @@ describe("Vault", function () {
       await freshVault.waitForDeployment();
 
       await expect(
-        freshVault.connect(borrower).repay({ value: REPAYMENT })
+        freshVault.connect(borrower).settle()
       ).to.be.revertedWith("Deposit not yet paid");
     });
 
-    it("Should revert if someone other than the borrower tries to repay", async function () {
+    it("Should revert if someone other than the borrower tries to close early", async function () {
       await expect(
-        vault.connect(otherAccount).repay({ value: REPAYMENT })
-      ).to.be.revertedWith("Only borrower can repay");
+        vault.connect(otherAccount).settle()
+      ).to.be.revertedWith("Only borrower can close early");
     });
 
-    it("Should revert if the wrong repayment amount is sent", async function () {
+    it("Should revert if trying to settle twice", async function () {
+      await vault.connect(borrower).settle();
       await expect(
-        vault.connect(borrower).repay({ value: ethers.parseEther("0.5") })
-      ).to.be.revertedWith("Must repay exact amount owed");
-    });
-
-    it("Should revert if trying to repay after the deadline", async function () {
-      await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
-      await ethers.provider.send("evm_mine");
-
-      await expect(
-        vault.connect(borrower).repay({ value: REPAYMENT })
-      ).to.be.revertedWith("Loan deadline has passed");
-    });
-
-    it("Should revert if trying to repay twice", async function () {
-      await vault.connect(borrower).repay({ value: REPAYMENT });
-      await expect(
-        vault.connect(borrower).repay({ value: REPAYMENT })
+        vault.connect(borrower).settle()
       ).to.be.revertedWith("Loan already settled");
     });
 
+    // Note: testing the "cannot close early at a loss beyond deposit" guard
+    // requires a scenario where the vault's liquidated balance is actually
+    // less than principal + fee — not achievable in a local unit test without
+    // a mock investment capable of losing value. The real Aave integration
+    // can only meaningfully gain (interest), never lose, on testnet. This
+    // guard is exercised implicitly by the profit/break-even paths above,
+    // but the loss-specific branch remains unverified by automated tests —
+    // flagging this explicitly rather than silently leaving it uncovered.
+
   });
 
-  // --- Default settlement tests ---
-  describe("Default settlement", function () {
+  describe("Settlement — post-deadline (default)", function () {
 
     beforeEach(async function () {
       await vault.connect(borrower).payDeposit({ value: DEPOSIT });
     });
 
-    it("Should revert if trying to settle before deadline", async function () {
+    it("Should revert if trying to settle before deadline as a non-borrower", async function () {
       await expect(
-        vault.connect(otherAccount).settleDefault()
-      ).to.be.revertedWith("Deadline has not yet passed");
+        vault.connect(otherAccount).settle()
+      ).to.be.revertedWith("Only borrower can close early");
     });
 
     it("Should allow ANY address to trigger settlement after deadline", async function () {
@@ -329,49 +332,51 @@ describe("Vault", function () {
       await ethers.provider.send("evm_mine");
 
       await expect(
-        vault.connect(otherAccount).settleDefault()
+        vault.connect(otherAccount).settle()
       ).to.not.be.reverted;
 
       expect(await vault.isSettled()).to.equal(true);
     });
 
-    it("Should send full repaymentDue to lender when vault covers it", async function () {
+    it("Should send principal + fee to lender when vault covers it", async function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
 
       const lenderBalanceBefore = await ethers.provider.getBalance(lender.address);
-      await vault.connect(otherAccount).settleDefault();
+      await vault.connect(otherAccount).settle();
       const lenderBalanceAfter = await ethers.provider.getBalance(lender.address);
 
-      expect(lenderBalanceAfter).to.equal(lenderBalanceBefore + REPAYMENT);
+      expect(lenderBalanceAfter).to.equal(lenderBalanceBefore + ONE_ETH + FEE);
     });
 
-    it("Should return excess deposit to borrower when vault covers repaymentDue", async function () {
+    it("Should return the remainder to borrower when vault covers principal + fee", async function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
 
       const borrowerBalanceBefore = await ethers.provider.getBalance(borrower.address);
-      await vault.connect(otherAccount).settleDefault();
+      await vault.connect(otherAccount).settle();
       const borrowerBalanceAfter = await ethers.provider.getBalance(borrower.address);
 
-      const expectedReturn = ONE_ETH + DEPOSIT - REPAYMENT; // 0.12 ETH
+      const expectedReturn = DEPOSIT - FEE;
       expect(borrowerBalanceAfter).to.equal(borrowerBalanceBefore + expectedReturn);
     });
 
-    it("Should emit LoanDefaulted event on settlement", async function () {
+    it("Should emit a Settled event with early=false", async function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
 
       await expect(
-        vault.connect(otherAccount).settleDefault()
-      ).to.emit(vault, "LoanDefaulted");
+        vault.connect(otherAccount).settle()
+      )
+        .to.emit(vault, "Settled")
+        .withArgs(otherAccount.address, false, ONE_ETH + DEPOSIT, ONE_ETH + FEE, DEPOSIT - FEE, FEE, anyValue);
     });
 
     it("Should leave vault empty after settlement", async function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
 
-      await vault.connect(otherAccount).settleDefault();
+      await vault.connect(otherAccount).settle();
       expect(await vault.vaultBalance()).to.equal(0);
     });
 
@@ -379,19 +384,9 @@ describe("Vault", function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
 
-      await vault.connect(otherAccount).settleDefault();
+      await vault.connect(otherAccount).settle();
       await expect(
-        vault.connect(otherAccount).settleDefault()
-      ).to.be.revertedWith("Loan already settled");
-    });
-
-    it("Should revert if borrower tries to repay after default settled", async function () {
-      await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
-      await ethers.provider.send("evm_mine");
-
-      await vault.connect(otherAccount).settleDefault();
-      await expect(
-        vault.connect(borrower).repay({ value: REPAYMENT })
+        vault.connect(otherAccount).settle()
       ).to.be.revertedWith("Loan already settled");
     });
 
@@ -415,7 +410,7 @@ describe("Vault", function () {
       const freshVault = await VaultFactory.deploy(
         lender.address,
         borrower.address,
-        REPAYMENT,
+        FEE_RATE_BPS,
         DURATION,
         false,
         DEPOSIT,
@@ -434,11 +429,21 @@ describe("Vault", function () {
       ).to.be.revertedWith("Amount must be greater than zero");
     });
 
-    it("Should revert if amount exceeds vault balance", async function () {
-      const tooMuch = ONE_ETH + DEPOSIT + ethers.parseEther("1.0");
+    it("Should revert if amount exceeds principal, even though vault balance (incl. deposit) is larger", async function () {
+      // This is the key deposit-segregation guard: vault balance is
+      // ONE_ETH + DEPOSIT, but only ONE_ETH (principal) may ever be
+      // invested. Attempting to supply the full balance must revert.
+      const fullBalance = ONE_ETH + DEPOSIT;
       await expect(
-        vault.connect(borrower).supplyToAave(tooMuch)
-      ).to.be.revertedWith("Insufficient vault balance");
+        vault.connect(borrower).supplyToAave(fullBalance)
+      ).to.be.revertedWith("Cannot invest more than principal - deposit is not investable");
+    });
+
+    it("Should revert on a second call if cumulative investment would exceed principal", async function () {
+      await vault.connect(borrower).supplyToAave(ethers.parseEther("0.6"));
+      await expect(
+        vault.connect(borrower).supplyToAave(ethers.parseEther("0.5"))
+      ).to.be.revertedWith("Cannot invest more than principal - deposit is not investable");
     });
 
     it("Should revert if loan deadline has passed", async function () {
@@ -453,7 +458,7 @@ describe("Vault", function () {
     it("Should revert if loan already settled", async function () {
       await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
       await ethers.provider.send("evm_mine");
-      await vault.connect(otherAccount).settleDefault();
+      await vault.connect(otherAccount).settle();
 
       await expect(
         vault.connect(borrower).supplyToAave(ONE_ETH)
@@ -476,6 +481,12 @@ describe("Vault", function () {
       expect(balanceAfter).to.equal(balanceBefore - amount);
     });
 
+    it("Should track cumulative invested amount correctly", async function () {
+      await vault.connect(borrower).supplyToAave(ethers.parseEther("0.4"));
+      await vault.connect(borrower).supplyToAave(ethers.parseEther("0.3"));
+      expect(await vault.investedAmount()).to.equal(ethers.parseEther("0.7"));
+    });
+
     it("Should emit WhitelistedActionExecuted event with correct args", async function () {
       const amount = ethers.parseEther("0.5");
 
@@ -486,14 +497,15 @@ describe("Vault", function () {
         .withArgs(borrower.address, await vault.AAVE_WETH_GATEWAY(), amount, anyValue);
     });
 
-    it("Should allow supplying the full vault balance", async function () {
-      const fullBalance = await vault.vaultBalance();
-
+    it("Should allow supplying up to the full principal amount", async function () {
       await expect(
-        vault.connect(borrower).supplyToAave(fullBalance)
+        vault.connect(borrower).supplyToAave(ONE_ETH)
       ).to.not.be.reverted;
 
-      expect(await vault.vaultBalance()).to.equal(0);
+      // Deposit remains untouched in the vault even though the full
+      // principal has been invested.
+      expect(await vault.vaultBalance()).to.equal(DEPOSIT);
+      expect(await vault.investedAmount()).to.equal(ONE_ETH);
     });
 
   });

@@ -20,7 +20,7 @@ async function main() {
   // --- Loan terms (short/testnet timing) ---
   const borrowerAddress   = addresses.verifiedBorrower;
   const principalAmount   = hre.ethers.parseEther("0.001");
-  const repaymentDue      = hre.ethers.parseEther("0.00103"); // principal + 3%
+  const feeRateBps        = 300n; // 3%, charged in full regardless of early or on-time close
   const depositAmount     = hre.ethers.parseEther("0.00015"); // 15% of principal
   const durationSeconds   = 3600; // 1 hour — enough slack for a full interactive test session
 
@@ -29,7 +29,7 @@ async function main() {
   console.log("Lender:       ", lender.address);
   console.log("Borrower:     ", borrowerAddress);
   console.log("Principal:    ", hre.ethers.formatEther(principalAmount), "ETH");
-  console.log("Repayment due:", hre.ethers.formatEther(repaymentDue), "ETH");
+  console.log("Fee rate:     ", Number(feeRateBps) / 100, "%");
   console.log("Deposit req:  ", hre.ethers.formatEther(depositAmount), "ETH");
   console.log("Duration:     ", durationSeconds, "seconds");
 
@@ -37,7 +37,7 @@ async function main() {
 
   const tx = await factory.deployVault(
     borrowerAddress,
-    repaymentDue,
+    feeRateBps,
     durationSeconds,
     true, // _useSeconds = true — short/testnet timing
     depositAmount,
@@ -81,7 +81,7 @@ async function main() {
     lender: lender.address,
     borrower: borrowerAddress,
     principal: hre.ethers.formatEther(principalAmount),
-    repaymentDue: hre.ethers.formatEther(repaymentDue),
+    feeRateBps: feeRateBps.toString(),
     depositRequired: hre.ethers.formatEther(depositAmount),
     durationSeconds,
     useSeconds: true,

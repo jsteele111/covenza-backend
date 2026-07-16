@@ -2,58 +2,104 @@ const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 
+// Consolidated settlement script — replaces the old repay.js, settle.js, and
+// settle-specific.js. Works for both early voluntary close (borrower-only,
+// before deadline) and post-deadline default settlement (callable by anyone),
+// since both now go through the single Vault.settle() function.
+//
+// Usage:
+//   npx hardhat run scripts/settle.js --network <network>
+//     — settles the most recently deployed vault for this network.
+//
+//   To target a specific vault instead, set VAULT_ADDRESS_OVERRIDE below.
+
+const VAULT_ADDRESS_OVERRIDE = null; // e.g. "0x..." to target a specific vault
+
 async function main() {
-  // --- Load the most recently deployed vault for this network ---
-  const vaultsPath = path.join(__dirname, "..", "deployed-vaults.json");
-  if (!fs.existsSync(vaultsPath)) {
-    throw new Error("deployed-vaults.json not found — run deploy-vault.js first.");
+  // --- Resolve which vault to act on ---
+  let vaultAddress = VAULT_ADDRESS_OVERRIDE;
+
+  if (!vaultAddress) {
+    const vaultsPath = path.join(__dirname, "..", "deployed-vaults.json");
+    if (!fs.existsSync(vaultsPath)) {
+      throw new Error("deployed-vaults.json not found — run deploy-vault.js first.");
+    }
+    const vaults = JSON.parse(fs.readFileSync(vaultsPath, "utf8"));
+    const vaultsOnThisNetwork = vaults.filter(v => v.network === hre.network.name);
+    if (vaultsOnThisNetwork.length === 0) {
+      throw new Error(`No vaults found for network "${hre.network.name}" in deployed-vaults.json.`);
+    }
+    vaultAddress = vaultsOnThisNetwork[vaultsOnThisNetwork.length - 1].vaultAddress;
   }
-  const vaults = JSON.parse(fs.readFileSync(vaultsPath, "utf8"));
-  const vaultsOnThisNetwork = vaults.filter(v => v.network === hre.network.name);
-  if (vaultsOnThisNetwork.length === 0) {
-    throw new Error(`No vaults found for network "${hre.network.name}" in deployed-vaults.json.`);
-  }
-  const vaultAddress = vaultsOnThisNetwork[vaultsOnThisNetwork.length - 1].vaultAddress;
 
-  const [lender] = await hre.ethers.getSigners();
-
-  console.log("Triggering default settlement...");
-  console.log("Caller (keeper):", lender.address);
-  console.log("Vault:", vaultAddress);
-
+  const [lender, borrower] = await hre.ethers.getSigners();
   const vault = await hre.ethers.getContractAt("Vault", vaultAddress);
 
-  // --- Local networks only: force a block to be mined so block.timestamp catches up to real time ---
+  console.log("Network:", hre.network.name);
+  console.log("Vault:", vaultAddress);
+
+  // --- Local networks only: force a block to be mined so block.timestamp catches up ---
   const isLocalNetwork = hre.network.name === "hardhat" || hre.network.name === "localhost";
   if (isLocalNetwork) {
     await hre.network.provider.send("evm_mine");
   }
 
-  // Check current state before settling
-  const isExpired  = await vault.isExpired();
-  const balance    = await vault.vaultBalance();
-  console.log("\nVault isExpired:", isExpired);
-  console.log("Vault balance:", hre.ethers.formatEther(balance), "ETH");
-
-  if (!isExpired) {
-    console.log("\n❌ Vault has not yet expired (or is already settled). Wait longer and try again.");
+  const isSettled = await vault.isSettled();
+  if (isSettled) {
+    console.log("\n❌ This vault is already settled — nothing to do.");
     return;
   }
 
-  const lenderBalanceBefore = await hre.ethers.provider.getBalance(lender.address);
+  const [principal, feeRateBps, deadline, balance] = await Promise.all([
+    vault.principal(),
+    vault.feeRateBps(),
+    vault.deadline(),
+    vault.vaultBalance(),
+  ]);
 
-  const tx = await vault.settleDefault();
+  const now = Math.floor(Date.now() / 1000);
+  const isEarly = now <= Number(deadline);
+  const expectedFee = (principal * feeRateBps) / 10000n;
+
+  console.log("Mode:", isEarly ? "EARLY CLOSE (borrower-triggered)" : "POST-DEADLINE (keeper-triggered)");
+  console.log("Principal:", hre.ethers.formatEther(principal), "ETH");
+  console.log("Fee rate:", Number(feeRateBps) / 100, "%  (expected fee:", hre.ethers.formatEther(expectedFee), "ETH)");
+  console.log("Current plain ETH balance:", hre.ethers.formatEther(balance), "ETH");
+
+  // Early close must be triggered by the borrower specifically.
+  const caller = isEarly ? borrower : lender;
+  console.log("Calling as:", caller.address, isEarly ? "(borrower)" : "(keeper — anyone can call post-deadline)");
+
+  const tx = await vault.connect(caller).settle();
   console.log("\nTransaction sent, waiting for confirmation...");
   const receipt = await tx.wait();
 
-  const lenderBalanceAfter = await hre.ethers.provider.getBalance(lender.address);
+  // --- Decode the Settled event for a clear picture of what actually happened ---
+  let settledEvent = null;
+  for (const log of receipt.logs) {
+    try {
+      const parsed = vault.interface.parseLog(log);
+      if (parsed.name === "Settled") {
+        settledEvent = parsed.args;
+      }
+    } catch (e) {
+      // log from elsewhere — ignore
+    }
+  }
 
-  console.log("\n✅ Default settlement confirmed!");
+  console.log("\n✅ Settlement confirmed!");
   console.log("   Transaction hash:", receipt.hash);
   console.log("   View on explorer: https://sepolia.arbiscan.io/tx/" + receipt.hash);
-  console.log("   Vault isSettled:", await vault.isSettled());
-  console.log("   Vault remaining balance:", hre.ethers.formatEther(await vault.vaultBalance()), "ETH");
-  console.log("   Lender balance change:", hre.ethers.formatEther(lenderBalanceAfter - lenderBalanceBefore), "ETH");
+
+  if (settledEvent) {
+    console.log("   Early close:", settledEvent.early);
+    console.log("   Total returned to vault at settlement:", hre.ethers.formatEther(settledEvent.totalReturned), "ETH");
+    console.log("   Lender payout:", hre.ethers.formatEther(settledEvent.lenderPayout), "ETH");
+    console.log("   Borrower payout:", hre.ethers.formatEther(settledEvent.borrowerPayout), "ETH");
+    console.log("   Fee charged:", hre.ethers.formatEther(settledEvent.fee), "ETH");
+  } else {
+    console.log("   (Settled event not found in receipt — check manually via vaultBalance()/isSettled())");
+  }
 }
 
 main().catch((error) => {

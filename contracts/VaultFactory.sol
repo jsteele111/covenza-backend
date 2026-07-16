@@ -43,6 +43,7 @@ contract VaultFactory {
         address indexed borrower,
         uint256 principal,
         uint256 depositRequired,
+        uint256 feeRateBps,
         uint256 deadline
     );
 
@@ -76,14 +77,16 @@ contract VaultFactory {
      *         Lender sends principal as msg.value.
      *
      * @param _borrower      Borrower's wallet address — must be KYC verified.
-     * @param _repaymentDue  Total repayment amount (principal + fee).
+     * @param _feeRateBps    Fixed fee rate in basis points (e.g. 300 = 3%),
+     *                       applied to principal, charged in full regardless
+     *                       of early or on-time settlement.
      * @param _duration      Loan duration (in days if _useSeconds=false).
      * @param _useSeconds    True for testnet short durations, false for production.
      * @param _depositAmount Required deposit the borrower must pay to activate.
      */
     function deployVault(
         address _borrower,
-        uint256 _repaymentDue,
+        uint256 _feeRateBps,
         uint256 _duration,
         bool    _useSeconds,
         uint256 _depositAmount
@@ -96,16 +99,16 @@ contract VaultFactory {
         );
 
         // --- Basic validation ---
-        require(msg.value > 0,              "Principal must be greater than zero");
-        require(_repaymentDue >= msg.value, "Repayment must be >= principal");
-        require(_duration > 0,              "Duration must be greater than zero");
-        require(_depositAmount > 0,         "Deposit must be greater than zero");
+        require(msg.value > 0,       "Principal must be greater than zero");
+        require(_feeRateBps > 0,     "Fee rate must be greater than zero");
+        require(_duration > 0,       "Duration must be greater than zero");
+        require(_depositAmount > 0,  "Deposit must be greater than zero");
 
         // --- Deploy vault ---
         Vault vault = new Vault{value: msg.value}(
             msg.sender,
             _borrower,
-            _repaymentDue,
+            _feeRateBps,
             _duration,
             _useSeconds,
             _depositAmount
@@ -124,6 +127,7 @@ contract VaultFactory {
             _borrower,
             msg.value,
             _depositAmount,
+            _feeRateBps,
             vault.deadline()
         );
 

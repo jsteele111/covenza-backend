@@ -4,17 +4,32 @@ pragma solidity ^0.8.24;
 /**
  * @title Vault
  * @notice Per-borrower lending vault for the low-collateral lending protocol.
- *         Version 0.9 — adds a receive() function so the vault can accept
- *         plain ETH transfers with no calldata, required for Aave's WETH
- *         Gateway to send withdrawn funds back to the vault.
+ *         Version 1.0 — tranche-based settlement. Deposit is pure untouched
+ *         collateral; principal is the only capital ever put to work via the
+ *         whitelisted Aave action. Settlement is a single unified function
+ *         that liquidates the vault's own position and pays lender + borrower
+ *         directly from it — the borrower never needs to source external
+ *         funds to close out a loan.
  *
  * @dev Vault holds two distinct pools of ETH:
- *      1. principal   — the lender's funds, locked for the loan duration.
- *      2. deposit     — the borrower's upfront risk buffer, held separately.
+ *      1. principal   — the lender's funds. Only this may ever be invested.
+ *      2. deposit     — the borrower's upfront risk buffer. Never invested,
+ *                       sits untouched until settlement.
  *
- *      On repayment:  principal + deposit → borrower, repayment → lender.
- *      On default:    deposit covers shortfall only. Excess deposit returned
- *                     to borrower. Residual loss borne by lender / insurance pool.
+ *      At settlement (repay early, or default after deadline):
+ *      - Vault liquidates any Aave position back to plain ETH.
+ *      - totalReturned = whatever the vault now holds (deposit + principal
+ *        + investment P&L).
+ *      - fee = principal * feeRateBps / 10000, agreed at origination,
+ *        charged in FULL regardless of when settlement happens (no proration
+ *        for early close).
+ *      - lender receives min(totalReturned, principal + fee).
+ *      - borrower receives whatever's left over (could be less than deposit
+ *        if there was a loss; could be more than deposit if there was a
+ *        profit).
+ *      - Deposit absorbs losses first, by construction of this math — no
+ *        separate branching needed. Losses beyond deposit are borne by the
+ *        lender in the interim, until an insurance pool exists (FR-12).
  */
 
 interface IERC20 {
@@ -30,9 +45,11 @@ contract Vault {
     address public borrower;
     uint256 public principal;
     uint256 public deposit;
-    uint256 public repaymentDue;
+    uint256 public feeRateBps;      // fixed fee rate agreed at origination, e.g. 300 = 3%
     uint256 public deadline;
     bool    public isSettled;
+
+    uint256 public investedAmount;  // cumulative amount of `principal` supplied to Aave
 
     // --- Internal storage for required deposit ---
     uint256 private _requiredDeposit;
@@ -44,7 +61,7 @@ contract Vault {
         address indexed borrower,
         uint256 principal,
         uint256 requiredDeposit,
-        uint256 repaymentDue,
+        uint256 feeRateBps,
         uint256 deadline
     );
 
@@ -53,18 +70,13 @@ contract Vault {
         uint256 amount
     );
 
-    event LoanRepaid(
-        address indexed borrower,
-        uint256 amountRepaid,
-        uint256 depositReturned,
-        uint256 timestamp
-    );
-
-    event LoanDefaulted(
+    event Settled(
         address indexed triggeredBy,
-        uint256 principalSwept,
-        uint256 depositApplied,
-        uint256 depositReturned,
+        bool    early,
+        uint256 totalReturned,
+        uint256 lenderPayout,
+        uint256 borrowerPayout,
+        uint256 fee,
         uint256 timestamp
     );
 
@@ -89,7 +101,9 @@ contract Vault {
     /**
      * @param _lender         The lender's wallet address (EOA or protocol address).
      * @param _borrower       Authorised borrower address.
-     * @param _repaymentDue   Total repayment amount (principal + fee).
+     * @param _feeRateBps     Fixed fee rate in basis points (e.g. 300 = 3%),
+     *                        applied to principal, charged in full regardless
+     *                        of early or on-time settlement.
      * @param _duration       Duration in seconds (if _useSeconds=true) or days.
      * @param _useSeconds     True for testnet/PoC short durations, false for production.
      * @param _depositAmount  Required deposit amount the borrower must pay.
@@ -97,22 +111,22 @@ contract Vault {
     constructor(
         address _lender,
         address _borrower,
-        uint256 _repaymentDue,
+        uint256 _feeRateBps,
         uint256 _duration,
         bool    _useSeconds,
         uint256 _depositAmount
     ) payable {
-        require(_lender != address(0),      "Invalid lender address");
-        require(_borrower != address(0),    "Invalid borrower address");
-        require(msg.value > 0,              "Principal must be greater than zero");
-        require(_repaymentDue >= msg.value, "Repayment must be >= principal");
-        require(_duration > 0,             "Duration must be greater than zero");
-        require(_depositAmount > 0,         "Deposit must be greater than zero");
+        require(_lender != address(0),   "Invalid lender address");
+        require(_borrower != address(0), "Invalid borrower address");
+        require(msg.value > 0,           "Principal must be greater than zero");
+        require(_feeRateBps > 0,         "Fee rate must be greater than zero");
+        require(_duration > 0,           "Duration must be greater than zero");
+        require(_depositAmount > 0,      "Deposit must be greater than zero");
 
         lender            = _lender;
         borrower          = _borrower;
         principal         = msg.value;
-        repaymentDue      = _repaymentDue;
+        feeRateBps        = _feeRateBps;
         deposit           = 0;
         _requiredDeposit  = _depositAmount;
         deadline          = _useSeconds
@@ -125,7 +139,7 @@ contract Vault {
             borrower,
             msg.value,
             _depositAmount,
-            _repaymentDue,
+            _feeRateBps,
             deadline
         );
     }
@@ -170,9 +184,11 @@ contract Vault {
 
     /**
      * @notice Allows the borrower to supply vault-held ETH to Aave V3 via the
-     *         WETH Gateway, earning yield on idle capital while the loan is active.
-     *         This is the only external call the vault will ever make on the
-     *         borrower's behalf — calls to any other address are rejected.
+     *         WETH Gateway, earning yield on idle capital while the loan is
+     *         active. Only `principal` may ever be invested — deposit is pure
+     *         collateral and is never at risk in the investment itself.
+     *         Cumulative investment across multiple calls is capped at
+     *         `principal` via `investedAmount`.
      * @param amount The amount of ETH to supply to Aave.
      */
     function supplyToAave(uint256 amount) external {
@@ -181,7 +197,17 @@ contract Vault {
         require(!isSettled,                  "Loan already settled");
         require(block.timestamp <= deadline, "Loan deadline has passed");
         require(amount > 0,                  "Amount must be greater than zero");
-        require(amount <= address(this).balance, "Insufficient vault balance");
+        require(
+            investedAmount + amount <= principal,
+            "Cannot invest more than principal - deposit is not investable"
+        );
+        // Note: no separate "amount <= vault balance" check needed here.
+        // Vault balance is always >= principal (deposit only ever adds to
+        // it, never subtracts below principal), so the cap above is always
+        // at least as strict — a redundant balance check would be
+        // unreachable dead code.
+
+        investedAmount += amount;
 
         (bool success, ) = AAVE_WETH_GATEWAY.call{value: amount}(
             abi.encodeWithSignature(
@@ -198,14 +224,22 @@ contract Vault {
 
     /**
      * @dev Internal helper: pulls any Aave-supplied funds back into the vault
-     *      as plain ETH. Called automatically at the start of repay() and
-     *      settleDefault(), so the vault's ability to close out a loan never
-     *      depends on the borrower proactively withdrawing first.
+     *      as plain ETH. Called automatically at the start of settle(), so
+     *      the vault's ability to close out a loan never depends on the
+     *      borrower proactively withdrawing first.
      *
      *      Two-step process required by Aave's WETH Gateway:
      *      1. Approve the Gateway to pull the vault's aWETH.
      *      2. Call withdrawETH, which burns the aWETH, unwraps to ETH,
      *         and sends it to `to` (the vault itself, via receive()).
+     *
+     *      Hardened check: after the withdrawal call, confirms the aWETH
+     *      balance actually decreased — not just that the low-level call
+     *      didn't revert. A call that reports success without genuinely
+     *      executing (e.g. an unexpected fallback on the target) would
+     *      otherwise let isSettled flip to true while funds remain
+     *      permanently stuck in Aave, with no other code path able to
+     *      retrieve them.
      *
      *      Explicitly checks for deployed code at the aToken address first.
      *      On networks where it doesn't exist (e.g. local test networks),
@@ -219,116 +253,85 @@ contract Vault {
             return;
         }
 
-        uint256 aWethBalance = IERC20(AAVE_WETH_A_TOKEN).balanceOf(address(this));
-        if (aWethBalance == 0) {
+        uint256 aWethBalanceBefore = IERC20(AAVE_WETH_A_TOKEN).balanceOf(address(this));
+        if (aWethBalanceBefore == 0) {
             return;
         }
 
-        bool approveSuccess = IERC20(AAVE_WETH_A_TOKEN).approve(AAVE_WETH_GATEWAY, aWethBalance);
+        bool approveSuccess = IERC20(AAVE_WETH_A_TOKEN).approve(AAVE_WETH_GATEWAY, aWethBalanceBefore);
         require(approveSuccess, "aWETH approval failed");
 
         (bool withdrawSuccess, ) = AAVE_WETH_GATEWAY.call(
             abi.encodeWithSignature(
                 "withdrawETH(address,uint256,address)",
                 address(0),
-                aWethBalance,
+                aWethBalanceBefore,
                 address(this)
             )
         );
         require(withdrawSuccess, "Aave withdrawal failed");
 
-        emit AaveWithdrawn(aWethBalance, block.timestamp);
+        uint256 aWethBalanceAfter = IERC20(AAVE_WETH_A_TOKEN).balanceOf(address(this));
+        require(
+            aWethBalanceAfter < aWethBalanceBefore,
+            "Aave withdrawal did not reduce balance"
+        );
+
+        emit AaveWithdrawn(aWethBalanceBefore - aWethBalanceAfter, block.timestamp);
     }
 
     // --- Core logic ---
 
     /**
-     * @notice Borrower repays the loan in full before the deadline.
-     *         Automatically withdraws any Aave-supplied funds first.
-     *         On success: repayment goes to lender, principal + deposit
-     *         returned to borrower.
-     */
-    function repay() external payable {
-        require(msg.sender == borrower,      "Only borrower can repay");
-        require(!isSettled,                  "Loan already settled");
-        require(deposit >= _requiredDeposit, "Deposit not yet paid");
-        require(block.timestamp <= deadline, "Loan deadline has passed");
-        require(msg.value == repaymentDue,   "Must repay exact amount owed");
-
-        _withdrawFromAaveIfNeeded();
-
-        isSettled = true;
-
-        uint256 depositToReturn = deposit;
-        deposit = 0;
-
-        // Return deposit to borrower
-        (bool depositSent, ) = borrower.call{value: depositToReturn}("");
-        require(depositSent, "Failed to return deposit to borrower");
-
-        // Return principal to borrower
-        (bool principalSent, ) = borrower.call{value: principal}("");
-        require(principalSent, "Failed to return principal to borrower");
-
-        // Send repayment to lender
-        (bool repaymentSent, ) = lender.call{value: msg.value}("");
-        require(repaymentSent, "Failed to send repayment to lender");
-
-        emit LoanRepaid(borrower, msg.value, depositToReturn, block.timestamp);
-    }
-
-    /**
-     * @notice Settles a defaulted loan. Callable by anyone after the deadline.
-     *         Automatically withdraws any Aave-supplied funds first.
+     * @notice Settles the loan — either a voluntary early close (borrower-only,
+     *         any time before the deadline) or a post-deadline close (callable
+     *         by anyone, keeper-style, same as the old settleDefault()).
      *
-     *         Deposit covers shortfall only:
-     *         - Lender receives up to repaymentDue.
-     *         - Excess deposit returned to borrower.
-     *         - Residual loss (vault+deposit < repaymentDue) borne by lender
-     *           and covered by insurance pool at protocol level (FR-12).
+     *         Automatically liquidates any Aave position first. Pays the lender
+     *         principal + fee (fee is always the full-term amount, never
+     *         prorated for early close), capped at whatever the vault actually
+     *         holds. Borrower receives the remainder — which absorbs any
+     *         investment loss first (via the deposit) before the lender's
+     *         principal is ever touched.
+     *
+     *         Early close is only permitted if the lender would be made whole
+     *         (totalReturned >= principal + fee) — a borrower cannot use early
+     *         close to walk away from a locked-in loss.
      */
-    function settleDefault() external {
-        require(!isSettled,                 "Loan already settled");
-        require(block.timestamp > deadline, "Deadline has not yet passed");
+    function settle() external {
+        require(!isSettled, "Loan already settled");
 
-        _withdrawFromAaveIfNeeded();
+        bool early = block.timestamp <= deadline;
 
-        isSettled = true;
-
-        uint256 totalAvailable  = address(this).balance;
-        uint256 depositApplied  = 0;
-        uint256 depositReturned = 0;
-
-        if (totalAvailable >= repaymentDue) {
-            // Vault covers full repayment — return excess to borrower
-            depositReturned = totalAvailable - repaymentDue;
-            depositApplied  = deposit > depositReturned
-                              ? deposit - depositReturned
-                              : 0;
-
-            (bool lenderSent, ) = lender.call{value: repaymentDue}("");
-            require(lenderSent, "Failed to send to lender");
-
-            if (depositReturned > 0) {
-                (bool borrowerSent, ) = borrower.call{value: depositReturned}("");
-                require(borrowerSent, "Failed to return excess deposit to borrower");
-            }
-        } else {
-            // Vault insufficient — deposit partially or fully consumed
-            depositApplied  = deposit;
-            depositReturned = 0;
-
-            (bool lenderSent, ) = lender.call{value: totalAvailable}("");
-            require(lenderSent, "Failed to send to lender");
+        if (early) {
+            require(msg.sender == borrower,      "Only borrower can close early");
+            require(deposit >= _requiredDeposit, "Deposit not yet paid");
         }
 
-        emit LoanDefaulted(
-            msg.sender,
-            principal,
-            depositApplied,
-            depositReturned,
-            block.timestamp
-        );
+        isSettled = true; // set before any external calls — reentrancy guard
+
+        _withdrawFromAaveIfNeeded();
+
+        uint256 totalReturned = address(this).balance;
+        uint256 fee = (principal * feeRateBps) / 10000;
+        uint256 lenderTarget = principal + fee;
+
+        uint256 lenderPayout   = totalReturned >= lenderTarget ? lenderTarget : totalReturned;
+        uint256 borrowerPayout = totalReturned > lenderTarget ? totalReturned - lenderTarget : 0;
+
+        if (early) {
+            require(totalReturned >= lenderTarget, "Cannot close early at a loss beyond deposit");
+        }
+
+        (bool lenderSent, ) = lender.call{value: lenderPayout}("");
+        require(lenderSent, "Failed to pay lender");
+
+        if (borrowerPayout > 0) {
+            (bool borrowerSent, ) = borrower.call{value: borrowerPayout}("");
+            require(borrowerSent, "Failed to pay borrower");
+        }
+
+        emit Settled(msg.sender, early, totalReturned, lenderPayout, borrowerPayout, fee, block.timestamp);
     }
 
     // --- View functions ---
