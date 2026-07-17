@@ -175,5 +175,18 @@
     "durationSeconds": 3600,
     "useSeconds": true,
     "deployedAt": "2026-07-05T11:01:47.370Z"
+  },
+  {
+    "vaultAddress": "0x7eC130095c92Fe72652E88e66d95C898CDb2b739",
+    "network": "arbitrumSepolia",
+    "txHash": "0x0095a847f19f703d35eb03f21722c0d0991bf6be1761da5f0e8491dd949e1cd9",
+    "lender": "0x6C9317C1F839Ca166a9B92d925515BD1Fd533a68",
+    "borrower": "0x076399e743B0b5a6e5B2dD4F20dd7e9CC04f04F3",
+    "principal": "0.001",
+    "feeRateBps": "300",
+    "depositRequired": "0.00015",
+    "durationSeconds": 3600,
+    "useSeconds": true,
+    "deployedAt": "2026-07-17T04:12:34.212Z"
   }
 ]
