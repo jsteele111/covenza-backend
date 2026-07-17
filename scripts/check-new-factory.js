@@ -1,7 +1,7 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
 
-const NEW_FACTORY_ADDRESS = "0x10EF32020096428D8d3386718a563c4cDbc2a123";
+const NEW_FACTORY_ADDRESS = "0xAa7645d954f69BfEF8EF884fE96eff8a229FBD9f";
 const EXPECTED_REGISTRY_ADDRESS = "0x5B6C57cA408dD1bbE9cbdeB0cbb6e923E01a584D";
 
 const ABI = [

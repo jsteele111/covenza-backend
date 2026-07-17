@@ -11,13 +11,13 @@
   "arbitrumSepolia": {
     "network": "arbitrumSepolia",
     "kycRegistry": "0x5B6C57cA408dD1bbE9cbdeB0cbb6e923E01a584D",
-    "vaultFactory": "0x10EF32020096428D8d3386718a563c4cDbc2a123",
+    "vaultFactory": "0xAa7645d954f69BfEF8EF884fE96eff8a229FBD9f",
     "operator": "0x6C9317C1F839Ca166a9B92d925515BD1Fd533a68",
     "verifierKey": "0x077F82e525bCe142eFF37c59FAaee2Ec5F66645B",
     "verifiedBorrower": "0x076399e743B0b5a6e5B2dD4F20dd7e9CC04f04F3",
     "deployedAt": "2026-07-10T06:48:27.691Z",
-    "vaultFactoryRedeployedAt": "2026-07-17T04:03:52.120Z",
-    "previousVaultFactory": "0x30B316a2573a27f999116929E5b4aa17a6aFf7B6",
+    "vaultFactoryRedeployedAt": "2026-07-17T23:19:44.516Z",
+    "previousVaultFactory": "0x10EF32020096428D8d3386718a563c4cDbc2a123",
     "previousVerifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
     "note": "verifiedBorrower switched to test-wallet-2 because the original borrower's KYC was revoked during OperatorTab testing on 2026-07-17 and never re-verified. verifierKey updated to reflect the rotation performed earlier the same session."
   }
