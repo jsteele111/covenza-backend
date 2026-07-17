@@ -100,13 +100,16 @@ async function main() {
 
   if (settledEvent) {
     const lenderTarget = principal + expectedFee;
-    const lenderShortfall = lenderTarget - settledEvent.lenderPayout; // >0 means lender took a loss
-    const borrowerShortfallVsDeposit = (await vault.deposit()) - settledEvent.borrowerPayout; // >0 means borrower lost some/all deposit
-    // Note: deposit() itself is still readable post-settlement — it's never zeroed out.
+    const depositAmount = await vault.deposit(); // still readable post-settlement, never zeroed out
+    const noLossBaseline = principal + depositAmount;
 
+    // Severity is based on whether the INVESTMENT itself lost value, not on
+    // whether the borrower got back less than the raw deposit — the fee is
+    // always paid out of the deposit's slack when there's no investment
+    // yield to cover it separately, which is normal and not a loss at all.
     let severity = "none";
-    if (lenderShortfall > 0n) severity = "lender-impacted";
-    else if (borrowerShortfallVsDeposit > 0n) severity = "borrower-only";
+    if (settledEvent.lenderPayout < lenderTarget) severity = "lender-impacted";
+    else if (settledEvent.totalReturned < noLossBaseline) severity = "borrower-only";
 
     console.log("   Early close:", settledEvent.early);
     console.log("   Total returned to vault at settlement:", hre.ethers.formatEther(settledEvent.totalReturned), "ETH");

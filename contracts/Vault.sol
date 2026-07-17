@@ -51,6 +51,15 @@ contract Vault {
 
     uint256 public investedAmount;  // cumulative amount of `principal` supplied to Aave
 
+    // Settlement outcome, readable after settle() completes. Needed because
+    // settle() fully drains the vault's balance — without these, the actual
+    // payout amounts would only ever exist in the emitted Settled event,
+    // unreadable by a front-end without scanning historical event logs.
+    uint256 public settledTotalReturned;
+    uint256 public settledLenderPayout;
+    uint256 public settledBorrowerPayout;
+    uint256 public settledFee;
+
     // --- Internal storage for required deposit ---
     uint256 private _requiredDeposit;
 
@@ -323,6 +332,11 @@ contract Vault {
             require(totalReturned >= lenderTarget, "Cannot close early at a loss beyond deposit");
         }
 
+        settledTotalReturned  = totalReturned;
+        settledLenderPayout   = lenderPayout;
+        settledBorrowerPayout = borrowerPayout;
+        settledFee            = fee;
+
         (bool lenderSent, ) = lender.call{value: lenderPayout}("");
         require(lenderSent, "Failed to pay lender");
 
@@ -344,5 +358,23 @@ contract Vault {
     /// @notice Returns true if the loan deadline has passed without settlement.
     function isExpired() external view returns (bool) {
         return block.timestamp > deadline && !isSettled;
+    }
+
+    /// @notice Returns a loss severity classification for the settlement
+    ///         outcome, matching the off-chain classification used by
+    ///         scripts/settle.js and scripts/check-loss-history.js. Kept
+    ///         on-chain as the single canonical source of truth, so the
+    ///         front-end never needs to reimplement this logic separately.
+    ///         0 = not yet settled, or settled with no loss.
+    ///         1 = borrower-only loss (deposit absorbed it, lender made whole).
+    ///         2 = lender-impacted loss (deposit insufficient, lender
+    ///             received less than principal + fee).
+    function lossSeverity() external view returns (uint8) {
+        if (!isSettled) return 0;
+        uint256 lenderTarget = principal + settledFee;
+        uint256 noLossBaseline = principal + deposit;
+        if (settledLenderPayout < lenderTarget) return 2;
+        if (settledTotalReturned < noLossBaseline) return 1;
+        return 0;
     }
 }

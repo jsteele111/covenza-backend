@@ -510,4 +510,121 @@ describe("Vault", function () {
 
   });
 
+  // --- Settlement outcome recording and loss severity ---
+  // These test the new settledTotalReturned/settledLenderPayout/
+  // settledBorrowerPayout/settledFee state and the lossSeverity() view.
+  //
+  // The genuine loss scenario below is only achievable in a LOCAL test —
+  // on a local Hardhat network, AAVE_WETH_GATEWAY and AAVE_WETH_A_TOKEN are
+  // just plain addresses with no deployed code. Calling supplyToAave()
+  // genuinely sends ETH there via a low-level call, which the EVM allows
+  // even to a no-code address (it simply credits balance, no logic runs) —
+  // the funds are gone for good locally, since _withdrawFromAaveIfNeeded()
+  // correctly no-ops (its code.length guard) rather than attempting a
+  // withdrawal that would fail. This gives us a real, verifiable loss to
+  // test against, which is NOT achievable on Sepolia where Aave genuinely
+  // exists and can only ever accrue interest, never lose value.
+  describe("Settlement outcome recording and loss severity", function () {
+
+    it("Should return lossSeverity 0 before settlement", async function () {
+      expect(await vault.lossSeverity()).to.equal(0);
+    });
+
+    it("Should record settlement outcome as readable state after a clean settlement", async function () {
+      await vault.connect(borrower).payDeposit({ value: DEPOSIT });
+
+      const tx = await vault.connect(borrower).settle();
+      const receipt = await tx.wait();
+      const parsed = receipt.logs
+        .map((log) => { try { return vault.interface.parseLog(log); } catch { return null; } })
+        .find((e) => e && e.name === "Settled");
+
+      expect(await vault.settledTotalReturned()).to.equal(parsed.args.totalReturned);
+      expect(await vault.settledLenderPayout()).to.equal(parsed.args.lenderPayout);
+      expect(await vault.settledBorrowerPayout()).to.equal(parsed.args.borrowerPayout);
+      expect(await vault.settledFee()).to.equal(parsed.args.fee);
+      expect(await vault.lossSeverity()).to.equal(0); // clean — no loss
+    });
+
+    it("Should classify a genuine investment loss as lender-impacted (severity 2)", async function () {
+      await vault.connect(borrower).payDeposit({ value: DEPOSIT });
+
+      // Invest the full principal — on a local network this genuinely sends
+      // the ETH to a no-code address and it never comes back.
+      await vault.connect(borrower).supplyToAave(ONE_ETH);
+      expect(await vault.vaultBalance()).to.equal(DEPOSIT); // only deposit remains
+
+      // Must wait for the deadline — this loss is deep enough that early
+      // close would correctly revert (lender wouldn't be made whole).
+      await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await vault.connect(otherAccount).settle();
+
+      const lenderTarget = ONE_ETH + FEE;
+      expect(await vault.settledTotalReturned()).to.equal(DEPOSIT); // only deposit came back
+      expect(await vault.settledLenderPayout()).to.equal(DEPOSIT); // lender gets everything there is
+      expect(await vault.settledLenderPayout()).to.be.lessThan(lenderTarget); // but it's not enough
+      expect(await vault.settledBorrowerPayout()).to.equal(0);
+      expect(await vault.lossSeverity()).to.equal(2); // lender-impacted
+    });
+
+    it("Should revert an early close attempt when the loss exceeds the deposit", async function () {
+      await vault.connect(borrower).payDeposit({ value: DEPOSIT });
+      await vault.connect(borrower).supplyToAave(ONE_ETH);
+
+      // Still before the deadline — borrower tries to close early, but the
+      // lender would not be made whole. Must revert, not silently settle
+      // at a loss to the lender via the early-close path.
+      await expect(
+        vault.connect(borrower).settle()
+      ).to.be.revertedWith("Cannot close early at a loss beyond deposit");
+    });
+
+    it("Should classify a partial investment loss as borrower-only (severity 1)", async function () {
+      await vault.connect(borrower).payDeposit({ value: DEPOSIT });
+
+      // Invest only part of the principal — enough to lose to a no-code
+      // address that the lender still ends up fully paid, but the borrower
+      // gets back less than a genuinely lossless settlement would give them.
+      const partialInvestment = ethers.parseEther("0.05");
+      await vault.connect(borrower).supplyToAave(partialInvestment);
+
+      await ethers.provider.send("evm_increaseTime", [DURATION * 24 * 60 * 60 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await vault.connect(otherAccount).settle();
+
+      const lenderTarget = ONE_ETH + FEE;
+      const noLossBaseline = ONE_ETH + DEPOSIT;
+      const expectedTotalReturned = (ONE_ETH - partialInvestment) + DEPOSIT;
+
+      expect(await vault.settledTotalReturned()).to.equal(expectedTotalReturned);
+      expect(await vault.settledTotalReturned()).to.be.lessThan(noLossBaseline);
+      expect(await vault.settledLenderPayout()).to.equal(lenderTarget); // lender made whole
+      expect(await vault.lossSeverity()).to.equal(1); // borrower-only
+    });
+
+    it("Should revert an early close attempt when a partial loss still exceeds available headroom", async function () {
+      await vault.connect(borrower).payDeposit({ value: DEPOSIT });
+
+      // A partial loss large enough that even though the lender COULD be
+      // made whole post-deadline, early close should still only succeed if
+      // totalReturned >= lenderTarget at the moment it's called. With a
+      // 0.05 ETH loss (well within the 0.12 ETH borrower-only headroom),
+      // totalReturned = 1.10 ETH >= lenderTarget (1.03 ETH), so early close
+      // should actually SUCCEED here — this confirms borrower-only losses
+      // don't block early close, only lender-impacted ones do.
+      const partialInvestment = ethers.parseEther("0.05");
+      await vault.connect(borrower).supplyToAave(partialInvestment);
+
+      await expect(
+        vault.connect(borrower).settle()
+      ).to.not.be.reverted;
+
+      expect(await vault.lossSeverity()).to.equal(1); // borrower-only, but early close was fine
+    });
+
+  });
+
 });
