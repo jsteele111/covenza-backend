@@ -1,4 +1,4 @@
-# Environment variables and secrets — never commit
+﻿# Environment variables and secrets — never commit
 .env
 .env.*
 
@@ -18,3 +18,4 @@ coverage.json
 .DS_Store
 
 test-wallet-*.json
+badge-artwork-check.svg
