@@ -3,36 +3,54 @@ pragma solidity ^0.8.24;
 
 import "./Vault.sol";
 import "./KYCRegistry.sol";
+import "./AssetRegistry.sol";
+import "./InsurancePool.sol";
+import "./interfaces/IERC20.sol";
 
 /**
  * @title VaultFactory
- * @notice Deploys per-borrower Vault contracts, gated behind KYC verification.
+ * @notice Deploys per-borrower Vault contracts — Version 2.0, multi-asset.
  *
- *         No vault can be deployed unless:
- *         (1) the borrower address is marked as verified in the KYCRegistry, AND
- *         (2) the lender sends the principal as msg.value.
+ *         Origination flow (single transaction):
+ *           1. KYC gate: borrower must be verified in the KYCRegistry.
+ *           2. Asset gate: the loan asset must be currently whitelisted
+ *              in the AssetRegistry.
+ *           3. Vault is deployed.
+ *           4. Principal is pulled from the lender (ERC20 transferFrom —
+ *              the lender must approve this factory for principal + the
+ *              insurance skim beforehand) and sent to the vault.
+ *           5. The insurance skim — a configured fraction of the loan's
+ *              fee — is pulled from the lender and paid into the
+ *              InsurancePool's reserve for the loan asset. Economically
+ *              this is a portion of the lender's fee income allocated to
+ *              the shared pool (BRD FR-8): the lender fronts it at
+ *              origination and earns it back through the full fee at
+ *              settlement.
+ *           6. The new vault is registered with the InsurancePool so it
+ *              may draw on a post-deadline shortfall.
  *
- *         This contract is the single entry point for loan origination.
- *         Direct Vault deployment (bypassing this factory) would skip the
- *         KYC check — in production the factory address would be the only
- *         authorised deployer, enforced at the protocol governance level.
+ *         ETH loans are WETH loans: the UI wraps ETH before origination,
+ *         and this factory only ever handles ERC20s.
  */
 contract VaultFactory {
 
     // --- State variables ---
 
-    KYCRegistry public registry;   // KYC registry contract
-    address     public owner;      // protocol owner (can update registry)
+    KYCRegistry   public kycRegistry;
+    AssetRegistry public assetRegistry;
+    InsurancePool public insurancePool;
+    address       public owner;
+
+    /// @notice Portion of each loan's fee skimmed into the insurance pool
+    ///         at origination, in bps of the fee (e.g. 2000 = 20% of the
+    ///         fee). Launch value is a placeholder pending VaR calibration
+    ///         (Build-Readiness Spec section 6).
+    uint256 public insuranceSkimRateBps = 2000;
 
     // --- Vault tracking ---
 
-    /// @notice All vaults deployed by this factory.
     address[] public allVaults;
-
-    /// @notice Vaults deployed for a specific borrower address.
     mapping(address => address[]) public vaultsByBorrower;
-
-    /// @notice Vaults deployed by a specific lender address.
     mapping(address => address[]) public vaultsByLender;
 
     // --- Events ---
@@ -41,26 +59,28 @@ contract VaultFactory {
         address indexed vault,
         address indexed lender,
         address indexed borrower,
+        address asset,
         uint256 principal,
         uint256 depositRequired,
         uint256 feeRateBps,
+        uint256 insuranceSkim,
         uint256 deadline
     );
 
-    event RegistryUpdated(
-        address indexed previousRegistry,
-        address indexed newRegistry
-    );
+    event InsuranceSkimRateUpdated(uint256 previousBps, uint256 newBps);
+    event RegistriesUpdated(address kycRegistry, address assetRegistry, address insurancePool);
 
     // --- Constructor ---
 
-    /**
-     * @param _registry Address of the deployed KYCRegistry contract.
-     */
-    constructor(address _registry) {
-        require(_registry != address(0), "Invalid registry address");
-        registry = KYCRegistry(_registry);
-        owner    = msg.sender;
+    constructor(address _kycRegistry, address _assetRegistry, address _insurancePool) {
+        require(_kycRegistry != address(0),   "Invalid KYC registry address");
+        require(_assetRegistry != address(0), "Invalid asset registry address");
+        require(_insurancePool != address(0), "Invalid insurance pool address");
+
+        kycRegistry   = KYCRegistry(_kycRegistry);
+        assetRegistry = AssetRegistry(_assetRegistry);
+        insurancePool = InsurancePool(_insurancePool);
+        owner         = msg.sender;
     }
 
     // --- Modifiers ---
@@ -73,48 +93,73 @@ contract VaultFactory {
     // --- Core function ---
 
     /**
-     * @notice Deploys a new Vault for a verified borrower.
-     *         Lender sends principal as msg.value.
+     * @notice Deploys a new Vault for a verified borrower, denominated in
+     *         any whitelisted asset. The lender must first approve this
+     *         factory for `_principal` plus the insurance skim (see
+     *         quoteInsuranceSkim() for the exact amount).
      *
+     * @param _asset         The loan's denomination — must be whitelisted.
      * @param _borrower      Borrower's wallet address — must be KYC verified.
-     * @param _feeRateBps    Fixed fee rate in basis points (e.g. 300 = 3%),
-     *                       applied to principal, charged in full regardless
-     *                       of early or on-time settlement.
-     * @param _duration      Loan duration (in days if _useSeconds=false).
-     * @param _useSeconds    True for testnet short durations, false for production.
-     * @param _depositAmount Required deposit the borrower must pay to activate.
+     * @param _principal     Loan principal, in the asset's own units.
+     * @param _feeRateBps    Fixed fee rate in basis points.
+     * @param _duration      Loan duration (days, or seconds if _useSeconds).
+     * @param _useSeconds    True for testnet short durations.
+     * @param _depositAmount Required deposit, in the same asset.
      */
     function deployVault(
+        address _asset,
         address _borrower,
+        uint256 _principal,
         uint256 _feeRateBps,
         uint256 _duration,
         bool    _useSeconds,
         uint256 _depositAmount
-    ) external payable returns (address) {
+    ) external returns (address) {
 
-        // --- KYC gate ---
-        require(
-            registry.isVerified(_borrower),
-            "Borrower is not KYC verified"
-        );
+        // --- Gates ---
+        require(kycRegistry.isVerified(_borrower),     "Borrower is not KYC verified");
+        require(assetRegistry.isWhitelisted(_asset),   "Loan asset is not whitelisted");
 
         // --- Basic validation ---
-        require(msg.value > 0,       "Principal must be greater than zero");
-        require(_feeRateBps > 0,     "Fee rate must be greater than zero");
-        require(_duration > 0,       "Duration must be greater than zero");
-        require(_depositAmount > 0,  "Deposit must be greater than zero");
+        require(_principal > 0,     "Principal must be greater than zero");
+        require(_feeRateBps > 0,    "Fee rate must be greater than zero");
+        require(_duration > 0,      "Duration must be greater than zero");
+        require(_depositAmount > 0, "Deposit must be greater than zero");
 
         // --- Deploy vault ---
-        Vault vault = new Vault{value: msg.value}(
+        Vault vault = new Vault(
+            _asset,
             msg.sender,
             _borrower,
+            _principal,
             _feeRateBps,
             _duration,
             _useSeconds,
-            _depositAmount
+            _depositAmount,
+            address(assetRegistry),
+            address(insurancePool)
+        );
+        address vaultAddress = address(vault);
+
+        // --- Fund vault with principal (pulled from the lender) ---
+        require(
+            IERC20(_asset).transferFrom(msg.sender, vaultAddress, _principal),
+            "Principal transfer failed"
         );
 
-        address vaultAddress = address(vault);
+        // --- Insurance skim: pull from lender, fund the pool ---
+        uint256 skim = quoteInsuranceSkim(_principal, _feeRateBps);
+        if (skim > 0) {
+            require(
+                IERC20(_asset).transferFrom(msg.sender, address(this), skim),
+                "Skim transfer failed"
+            );
+            require(IERC20(_asset).approve(address(insurancePool), skim), "Skim approval failed");
+            insurancePool.fund(_asset, skim);
+        }
+
+        // --- Register vault with the pool (enables shortfall draws) ---
+        insurancePool.registerVault(vaultAddress);
 
         // --- Record vault ---
         allVaults.push(vaultAddress);
@@ -122,50 +167,59 @@ contract VaultFactory {
         vaultsByLender[msg.sender].push(vaultAddress);
 
         emit VaultDeployed(
-            vaultAddress,
-            msg.sender,
-            _borrower,
-            msg.value,
-            _depositAmount,
-            _feeRateBps,
-            vault.deadline()
+            vaultAddress, msg.sender, _borrower, _asset,
+            _principal, _depositAmount, _feeRateBps, skim, vault.deadline()
         );
 
         return vaultAddress;
     }
 
+    // --- Quoting ---
+
+    /// @notice The insurance skim for a given principal and fee rate —
+    ///         the extra amount (beyond principal) the lender must approve.
+    function quoteInsuranceSkim(uint256 _principal, uint256 _feeRateBps)
+        public view returns (uint256)
+    {
+        uint256 fee = (_principal * _feeRateBps) / 10000;
+        return (fee * insuranceSkimRateBps) / 10000;
+    }
+
     // --- Admin functions ---
 
-    /**
-     * @notice Updates the KYC registry address.
-     *         Allows the registry to be upgraded without redeploying
-     *         the factory.
-     */
-    function updateRegistry(address _newRegistry) external onlyOwner {
-        require(_newRegistry != address(0), "Invalid registry address");
-        address previous = address(registry);
-        registry = KYCRegistry(_newRegistry);
-        emit RegistryUpdated(previous, _newRegistry);
+    function setInsuranceSkimRateBps(uint256 _newBps) external onlyOwner {
+        require(_newBps <= 10000, "Skim rate cannot exceed 100% of fee");
+        uint256 previous = insuranceSkimRateBps;
+        insuranceSkimRateBps = _newBps;
+        emit InsuranceSkimRateUpdated(previous, _newBps);
+    }
+
+    /// @notice Updates registry/pool references. All three set together.
+    function setRegistries(
+        address _kycRegistry,
+        address _assetRegistry,
+        address _insurancePool
+    ) external onlyOwner {
+        require(_kycRegistry != address(0),   "Invalid KYC registry address");
+        require(_assetRegistry != address(0), "Invalid asset registry address");
+        require(_insurancePool != address(0), "Invalid insurance pool address");
+        kycRegistry   = KYCRegistry(_kycRegistry);
+        assetRegistry = AssetRegistry(_assetRegistry);
+        insurancePool = InsurancePool(_insurancePool);
+        emit RegistriesUpdated(_kycRegistry, _assetRegistry, _insurancePool);
     }
 
     // --- View functions ---
 
-    /// @notice Returns total number of vaults deployed by this factory.
     function totalVaults() external view returns (uint256) {
         return allVaults.length;
     }
 
-    /// @notice Returns all vault addresses deployed for a borrower.
-    function getVaultsByBorrower(address _borrower)
-        external view returns (address[] memory)
-    {
+    function getVaultsByBorrower(address _borrower) external view returns (address[] memory) {
         return vaultsByBorrower[_borrower];
     }
 
-    /// @notice Returns all vault addresses deployed by a lender.
-    function getVaultsByLender(address _lender)
-        external view returns (address[] memory)
-    {
+    function getVaultsByLender(address _lender) external view returns (address[] memory) {
         return vaultsByLender[_lender];
     }
 }

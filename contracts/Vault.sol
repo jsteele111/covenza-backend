@@ -1,380 +1,476 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "./AssetRegistry.sol";
+import "./InsurancePool.sol";
+import "./interfaces/IERC20.sol";
+import "./libraries/UniswapTwap.sol";
+
 /**
  * @title Vault
- * @notice Per-borrower lending vault for the low-collateral lending protocol.
- *         Version 1.0 — tranche-based settlement. Deposit is pure untouched
- *         collateral; principal is the only capital ever put to work via the
- *         whitelisted Aave action. Settlement is a single unified function
- *         that liquidates the vault's own position and pays lender + borrower
- *         directly from it — the borrower never needs to source external
- *         funds to close out a loan.
+ * @notice Per-borrower lending vault — Version 2.0, multi-asset.
  *
- * @dev Vault holds two distinct pools of ETH:
- *      1. principal   — the lender's funds. Only this may ever be invested.
- *      2. deposit     — the borrower's upfront risk buffer. Never invested,
- *                       sits untouched until settlement.
+ *         Loans are natively denominated in any whitelisted ERC20 asset
+ *         (WETH, WBTC, USDC, USDT, ...). The vault is ERC20-native
+ *         throughout: principal arrives as an ERC20 transfer from the
+ *         factory, the deposit is paid in the same asset, and settlement
+ *         pays out in the same asset. Native ETH never enters this
+ *         contract — ETH loans are WETH loans, wrapped at the edges.
  *
- *      At settlement (repay early, or default after deadline):
- *      - Vault liquidates any Aave position back to plain ETH.
- *      - totalReturned = whatever the vault now holds (deposit + principal
- *        + investment P&L).
- *      - fee = principal * feeRateBps / 10000, agreed at origination,
- *        charged in FULL regardless of when settlement happens (no proration
- *        for early close).
- *      - lender receives min(totalReturned, principal + fee).
- *      - borrower receives whatever's left over (could be less than deposit
- *        if there was a loss; could be more than deposit if there was a
- *        profit).
- *      - Deposit absorbs losses first, by construction of this math — no
- *        separate branching needed. Losses beyond deposit are borne by the
- *        lender in the interim, until an insurance pool exists (FR-12).
+ *         DEPOSIT SEGREGATION INVARIANT (replaces v1's investedAmount cap):
+ *         the vault's loan-asset balance may never drop below `deposit`
+ *         as a result of any borrower action. Every borrower-triggered
+ *         outflow of the loan asset (Aave supply, swap out) checks that
+ *         the post-action balance remains >= deposit. One rule, enforced
+ *         uniformly across all action types.
+ *
+ *         SETTLEMENT WATERFALL: deposit absorbs loss first (by
+ *         construction of the payout math) --> insurance pool covers
+ *         remaining shortfall (capped, post-deadline settlements only)
+ *         --> only a true tail event reaches the lender's principal.
+ *
+ *         FORCED SWAP-BACK: if the borrower holds non-loan assets at
+ *         settlement, they are swapped back to the loan asset first,
+ *         TWAP-bounded (reverts if execution deviates beyond tolerance
+ *         from the Uniswap V3 time-weighted average price — settlement
+ *         happens in the loan asset or not at all). Three-tier access:
+ *           T1 before deadline           - borrower only (early close)
+ *           T2 deadline -> grace end     - lender or borrower, no bounty
+ *           T3 after grace period        - anyone; time-increasing bounty
+ *                                          paid from the borrower residual
+ *         If no foreign assets are held, post-deadline settlement is
+ *         open to anyone immediately (unchanged from v1).
  */
 
-interface IERC20 {
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
+interface IAavePool {
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
+}
+
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24  fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
 contract Vault {
 
-    // --- State variables ---
+    // --- Protocol references ---
 
+    AssetRegistry public registry;
+    InsurancePool public insurancePool;
+    address       public factory;
+
+    // --- Loan terms ---
+
+    address public asset;           // the loan's denomination (whitelisted ERC20)
     address public lender;
     address public borrower;
     uint256 public principal;
-    uint256 public deposit;
-    uint256 public feeRateBps;      // fixed fee rate agreed at origination, e.g. 300 = 3%
+    uint256 public deposit;         // amount actually paid (0 until payDeposit)
+    uint256 public feeRateBps;
     uint256 public deadline;
     bool    public isSettled;
 
-    uint256 public investedAmount;  // cumulative amount of `principal` supplied to Aave
+    uint256 private _requiredDeposit;
 
-    // Settlement outcome, readable after settle() completes. Needed because
-    // settle() fully drains the vault's balance — without these, the actual
-    // payout amounts would only ever exist in the emitted Settled event,
-    // unreadable by a front-end without scanning historical event logs.
-    uint256 public settledTotalReturned;
+    // --- Foreign asset tracking (assets swapped into, not yet swapped back) ---
+
+    address[] public heldAssets;
+    mapping(address => bool)   public isHeld;
+    mapping(address => uint24) public swapFeeTierOf;  // pool fee tier used when swapping in; reused for swap-back TWAP lookup
+
+    // --- Settlement outcome (readable post-settlement) ---
+
+    uint256 public settledTotalReturned;   // vault's own funds at settlement, BEFORE any insurance draw
+    uint256 public settledInsuranceDraw;   // amount actually received from the insurance pool
     uint256 public settledLenderPayout;
     uint256 public settledBorrowerPayout;
     uint256 public settledFee;
-
-    // --- Internal storage for required deposit ---
-    uint256 private _requiredDeposit;
+    uint256 public settledBounty;
 
     // --- Events ---
 
-    event VaultInitialised(
-        address indexed lender,
-        address indexed borrower,
-        uint256 principal,
-        uint256 requiredDeposit,
-        uint256 feeRateBps,
-        uint256 deadline
-    );
-
-    event DepositReceived(
-        address indexed borrower,
-        uint256 amount
-    );
-
-    event Settled(
-        address indexed triggeredBy,
-        bool    early,
-        uint256 totalReturned,
-        uint256 lenderPayout,
-        uint256 borrowerPayout,
-        uint256 fee,
-        uint256 timestamp
-    );
-
-    // --- Whitelisted external protocol addresses (Arbitrum Sepolia testnet) ---
-    address public constant AAVE_WETH_GATEWAY = 0x20040a64612555042335926d72B4E5F667a67fA1;
-    address public constant AAVE_WETH_A_TOKEN = 0xf5f17EbE81E516Dc7cB38D61908EC252F150CE60;
-
-    event WhitelistedActionExecuted(
-        address indexed borrower,
-        address indexed target,
-        uint256 amount,
-        uint256 timestamp
-    );
-
-    event AaveWithdrawn(
-        uint256 amount,
-        uint256 timestamp
-    );
+    event VaultInitialised(address indexed lender, address indexed borrower, address indexed asset,
+        uint256 principal, uint256 requiredDeposit, uint256 feeRateBps, uint256 deadline);
+    event DepositReceived(address indexed borrower, uint256 amount);
+    event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, bool isSwapBack);
+    event AaveSupplied(uint256 amount, uint256 timestamp);
+    event AaveWithdrawn(uint256 amount, uint256 timestamp);
+    event ForcedSwapBack(address indexed heldAsset, uint256 amountIn, uint256 amountOut);
+    event Settled(address indexed triggeredBy, bool early, uint256 totalReturned, uint256 insuranceDraw,
+        uint256 lenderPayout, uint256 borrowerPayout, uint256 fee, uint256 bounty, uint256 timestamp);
 
     // --- Constructor ---
 
     /**
-     * @param _lender         The lender's wallet address (EOA or protocol address).
-     * @param _borrower       Authorised borrower address.
-     * @param _feeRateBps     Fixed fee rate in basis points (e.g. 300 = 3%),
-     *                        applied to principal, charged in full regardless
-     *                        of early or on-time settlement.
-     * @param _duration       Duration in seconds (if _useSeconds=true) or days.
-     * @param _useSeconds     True for testnet/PoC short durations, false for production.
-     * @param _depositAmount  Required deposit amount the borrower must pay.
+     * @dev Deployed exclusively by VaultFactory, which transfers `_principal`
+     *      of `_asset` to this vault within the same transaction. The vault
+     *      trusts the factory for funding — the factory is the only
+     *      authorised deployer, and its code guarantees the transfer.
      */
     constructor(
+        address _asset,
         address _lender,
         address _borrower,
+        uint256 _principal,
         uint256 _feeRateBps,
         uint256 _duration,
         bool    _useSeconds,
-        uint256 _depositAmount
-    ) payable {
-        require(_lender != address(0),   "Invalid lender address");
-        require(_borrower != address(0), "Invalid borrower address");
-        require(msg.value > 0,           "Principal must be greater than zero");
-        require(_feeRateBps > 0,         "Fee rate must be greater than zero");
-        require(_duration > 0,           "Duration must be greater than zero");
-        require(_depositAmount > 0,      "Deposit must be greater than zero");
+        uint256 _depositAmount,
+        address _registry,
+        address _insurancePool
+    ) {
+        require(_asset != address(0),         "Invalid asset address");
+        require(_lender != address(0),        "Invalid lender address");
+        require(_borrower != address(0),      "Invalid borrower address");
+        require(_principal > 0,               "Principal must be greater than zero");
+        require(_feeRateBps > 0,              "Fee rate must be greater than zero");
+        require(_duration > 0,                "Duration must be greater than zero");
+        require(_depositAmount > 0,           "Deposit must be greater than zero");
+        require(_registry != address(0),      "Invalid registry address");
+        require(_insurancePool != address(0), "Invalid insurance pool address");
 
-        lender            = _lender;
-        borrower          = _borrower;
-        principal         = msg.value;
-        feeRateBps        = _feeRateBps;
-        deposit           = 0;
-        _requiredDeposit  = _depositAmount;
-        deadline          = _useSeconds
-                            ? block.timestamp + _duration
-                            : block.timestamp + (_duration * 1 days);
-        isSettled         = false;
+        factory          = msg.sender;
+        asset            = _asset;
+        lender           = _lender;
+        borrower         = _borrower;
+        principal        = _principal;
+        feeRateBps       = _feeRateBps;
+        _requiredDeposit = _depositAmount;
+        deadline         = _useSeconds ? block.timestamp + _duration
+                                       : block.timestamp + (_duration * 1 days);
+        registry         = AssetRegistry(_registry);
+        insurancePool    = InsurancePool(_insurancePool);
 
-        emit VaultInitialised(
-            lender,
-            borrower,
-            msg.value,
-            _depositAmount,
-            _feeRateBps,
-            deadline
+        emit VaultInitialised(_lender, _borrower, _asset, _principal, _depositAmount, _feeRateBps, deadline);
+    }
+
+    // --- Deposit ---
+
+    function requiredDeposit() external view returns (uint256) { return _requiredDeposit; }
+    function depositPaid()     public  view returns (bool)     { return deposit >= _requiredDeposit; }
+
+    /// @notice Borrower pays the required deposit (in the loan asset).
+    ///         Borrower must approve this vault for the amount first.
+    function payDeposit() external {
+        require(msg.sender == borrower,      "Only borrower can pay deposit");
+        require(deposit == 0,                "Deposit already paid");
+        require(!isSettled,                  "Loan already settled");
+        require(block.timestamp <= deadline, "Deadline has passed");
+
+        deposit = _requiredDeposit;
+        bool ok = IERC20(asset).transferFrom(borrower, address(this), _requiredDeposit);
+        require(ok, "Deposit transfer failed");
+
+        emit DepositReceived(borrower, _requiredDeposit);
+    }
+
+    // --- Deposit segregation invariant ---
+
+    /// @dev Reverts if removing `amount` of the loan asset would leave the
+    ///      vault holding less than the deposit. THE core safety rule.
+    function _enforceDepositInvariant(uint256 amount) internal view {
+        require(
+            IERC20(asset).balanceOf(address(this)) >= amount + deposit,
+            "Action would touch the deposit - deposit is not investable"
         );
     }
 
-    /**
-     * @notice Allows the vault to receive plain ETH transfers with no calldata —
-     *         required for Aave's WETH Gateway to send withdrawn ETH back here.
-     */
-    receive() external payable {}
-
-    // --- Deposit view functions ---
-
-    /// @notice Returns the deposit amount required from the borrower.
-    function requiredDeposit() external view returns (uint256) {
-        return _requiredDeposit;
-    }
-
-    /// @notice Returns true once the borrower has paid the required deposit.
-    function depositPaid() external view returns (bool) {
-        return deposit >= _requiredDeposit;
-    }
-
-    // --- Deposit payment ---
-
-    /**
-     * @notice Borrower pays the required deposit to activate the vault.
-     *         Must send exactly the required amount before the deadline.
-     */
-    function payDeposit() external payable {
-        require(msg.sender == borrower,        "Only borrower can pay deposit");
-        require(deposit == 0,                  "Deposit already paid");
-        require(!isSettled,                    "Loan already settled");
-        require(block.timestamp <= deadline,   "Deadline has passed");
-        require(msg.value == _requiredDeposit, "Must send exact deposit amount");
-
-        deposit = msg.value;
-
-        emit DepositReceived(borrower, msg.value);
-    }
-
-    // --- Aave whitelist ---
-
-    /**
-     * @notice Allows the borrower to supply vault-held ETH to Aave V3 via the
-     *         WETH Gateway, earning yield on idle capital while the loan is
-     *         active. Only `principal` may ever be invested — deposit is pure
-     *         collateral and is never at risk in the investment itself.
-     *         Cumulative investment across multiple calls is capped at
-     *         `principal` via `investedAmount`.
-     * @param amount The amount of ETH to supply to Aave.
-     */
-    function supplyToAave(uint256 amount) external {
+    modifier onlyActiveBorrower() {
         require(msg.sender == borrower,      "Only borrower can execute");
-        require(deposit >= _requiredDeposit, "Deposit not yet paid");
+        require(depositPaid(),               "Deposit not yet paid");
         require(!isSettled,                  "Loan already settled");
         require(block.timestamp <= deadline, "Loan deadline has passed");
-        require(amount > 0,                  "Amount must be greater than zero");
-        require(
-            investedAmount + amount <= principal,
-            "Cannot invest more than principal - deposit is not investable"
-        );
-        // Note: no separate "amount <= vault balance" check needed here.
-        // Vault balance is always >= principal (deposit only ever adds to
-        // it, never subtracts below principal), so the cap above is always
-        // at least as strict — a redundant balance check would be
-        // unreachable dead code.
-
-        investedAmount += amount;
-
-        (bool success, ) = AAVE_WETH_GATEWAY.call{value: amount}(
-            abi.encodeWithSignature(
-                "depositETH(address,address,uint16)",
-                address(0),
-                address(this),
-                uint16(0)
-            )
-        );
-        require(success, "Aave supply call failed");
-
-        emit WhitelistedActionExecuted(msg.sender, AAVE_WETH_GATEWAY, amount, block.timestamp);
+        _;
     }
 
+    // --- Whitelisted action 1: Aave V3 supply/withdraw (loan asset only) ---
+
+    /// @notice Supplies loan-asset funds to Aave V3 to earn yield.
+    function supplyToAave(uint256 amount) external onlyActiveBorrower {
+        require(amount > 0, "Amount must be greater than zero");
+        require(registry.aTokenOf(asset) != address(0), "Asset has no Aave support");
+        _enforceDepositInvariant(amount);
+
+        address pool = registry.aavePool();
+        require(IERC20(asset).approve(pool, amount), "Aave approval failed");
+        IAavePool(pool).supply(asset, amount, address(this), 0);
+
+        emit AaveSupplied(amount, block.timestamp);
+    }
+
+    /// @notice Withdraws a borrower-chosen amount back from Aave mid-term.
+    function withdrawFromAave(uint256 amount) external onlyActiveBorrower {
+        require(amount > 0, "Amount must be greater than zero");
+        IAavePool(registry.aavePool()).withdraw(asset, amount, address(this));
+        emit AaveWithdrawn(amount, block.timestamp);
+    }
+
+    // --- Whitelisted action 2: Uniswap V3 directional swaps ---
+
     /**
-     * @dev Internal helper: pulls any Aave-supplied funds back into the vault
-     *      as plain ETH. Called automatically at the start of settle(), so
-     *      the vault's ability to close out a loan never depends on the
-     *      borrower proactively withdrawing first.
-     *
-     *      Two-step process required by Aave's WETH Gateway:
-     *      1. Approve the Gateway to pull the vault's aWETH.
-     *      2. Call withdrawETH, which burns the aWETH, unwraps to ETH,
-     *         and sends it to `to` (the vault itself, via receive()).
-     *
-     *      Hardened check: after the withdrawal call, confirms the aWETH
-     *      balance actually decreased — not just that the low-level call
-     *      didn't revert. A call that reports success without genuinely
-     *      executing (e.g. an unexpected fallback on the target) would
-     *      otherwise let isSettled flip to true while funds remain
-     *      permanently stuck in Aave, with no other code path able to
-     *      retrieve them.
-     *
-     *      Explicitly checks for deployed code at the aToken address first.
-     *      On networks where it doesn't exist (e.g. local test networks),
-     *      this safely does nothing rather than attempting a call that would
-     *      fail in a way ordinary try/catch cannot reliably intercept — so
-     *      plain ETH-only vaults that never touched Aave are unaffected.
+     * @notice Swaps the loan asset into a whitelisted foreign asset
+     *         (directional exposure). The destination must be currently
+     *         whitelisted, and the deposit invariant is enforced. For the
+     *         reverse direction use swapBack() — always permitted, even if
+     *         the held asset has since been removed from the whitelist.
+     *         Swaps between two non-loan assets are not supported directly —
+     *         route through the loan asset in two swaps.
+     * @param tokenOut     Destination asset (must be whitelisted, != loan asset).
+     * @param amountIn     Amount of the loan asset to swap.
+     * @param minAmountOut Borrower-supplied slippage floor, enforced on-chain.
+     * @param poolFee      Uniswap V3 fee tier (500 / 3000 / 10000).
      */
-    function _withdrawFromAaveIfNeeded() internal {
-        if (AAVE_WETH_A_TOKEN.code.length == 0) {
-            // No aToken contract deployed on this network — nothing to withdraw
-            return;
-        }
+    function swap(
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint24  poolFee
+    ) external onlyActiveBorrower {
+        require(amountIn > 0,                       "Amount must be greater than zero");
+        require(minAmountOut > 0,                   "minAmountOut must be greater than zero");
+        require(tokenOut != asset,                  "Use swapBack() for the loan asset");
+        require(registry.isWhitelisted(tokenOut),   "Destination asset not whitelisted");
+        _enforceDepositInvariant(amountIn);
 
-        uint256 aWethBalanceBefore = IERC20(AAVE_WETH_A_TOKEN).balanceOf(address(this));
-        if (aWethBalanceBefore == 0) {
-            return;
-        }
+        uint256 amountOut = _executeSwap(asset, tokenOut, amountIn, minAmountOut, poolFee);
+        _trackHeldAsset(tokenOut, poolFee);
 
-        bool approveSuccess = IERC20(AAVE_WETH_A_TOKEN).approve(AAVE_WETH_GATEWAY, aWethBalanceBefore);
-        require(approveSuccess, "aWETH approval failed");
-
-        (bool withdrawSuccess, ) = AAVE_WETH_GATEWAY.call(
-            abi.encodeWithSignature(
-                "withdrawETH(address,uint256,address)",
-                address(0),
-                aWethBalanceBefore,
-                address(this)
-            )
-        );
-        require(withdrawSuccess, "Aave withdrawal failed");
-
-        uint256 aWethBalanceAfter = IERC20(AAVE_WETH_A_TOKEN).balanceOf(address(this));
-        require(
-            aWethBalanceAfter < aWethBalanceBefore,
-            "Aave withdrawal did not reduce balance"
-        );
-
-        emit AaveWithdrawn(aWethBalanceBefore - aWethBalanceAfter, block.timestamp);
+        emit SwapExecuted(asset, tokenOut, amountIn, amountOut, false);
     }
 
-    // --- Core logic ---
+    /// @notice Explicit swap-back entry point: converts `heldAsset` back to
+    ///         the loan asset. Always permitted while the loan is active.
+    function swapBack(
+        address heldAsset,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) external onlyActiveBorrower {
+        require(isHeld[heldAsset], "Not a held asset");
+        require(amountIn > 0,      "Amount must be greater than zero");
+        require(minAmountOut > 0,  "minAmountOut must be greater than zero");
+
+        uint256 amountOut = _executeSwap(heldAsset, asset, amountIn, minAmountOut, swapFeeTierOf[heldAsset]);
+        _untrackIfEmptied(heldAsset);
+
+        emit SwapExecuted(heldAsset, asset, amountIn, amountOut, true);
+    }
+
+    function _executeSwap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint24  poolFee
+    ) internal returns (uint256 amountOut) {
+        address router = registry.swapRouter();
+        require(IERC20(tokenIn).approve(router, amountIn), "Swap approval failed");
+
+        amountOut = ISwapRouter(router).exactInputSingle(
+            ISwapRouter.ExactInputSingleParams({
+                tokenIn:  tokenIn,
+                tokenOut: tokenOut,
+                fee:      poolFee,
+                recipient: address(this),
+                deadline:  block.timestamp,
+                amountIn:  amountIn,
+                amountOutMinimum: minAmountOut,
+                sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
+    function _trackHeldAsset(address _asset, uint24 poolFee) internal {
+        if (!isHeld[_asset]) {
+            isHeld[_asset] = true;
+            heldAssets.push(_asset);
+        }
+        swapFeeTierOf[_asset] = poolFee;
+    }
+
+    function _untrackIfEmptied(address _asset) internal {
+        if (IERC20(_asset).balanceOf(address(this)) == 0 && isHeld[_asset]) {
+            isHeld[_asset] = false;
+            for (uint256 i = 0; i < heldAssets.length; i++) {
+                if (heldAssets[i] == _asset) {
+                    heldAssets[i] = heldAssets[heldAssets.length - 1];
+                    heldAssets.pop();
+                    break;
+                }
+            }
+        }
+    }
+
+    function heldAssetCount() external view returns (uint256) { return heldAssets.length; }
+
+    // --- Settlement ---
 
     /**
-     * @notice Settles the loan — either a voluntary early close (borrower-only,
-     *         any time before the deadline) or a post-deadline close (callable
-     *         by anyone, keeper-style, same as the old settleDefault()).
-     *
-     *         Automatically liquidates any Aave position first. Pays the lender
-     *         principal + fee (fee is always the full-term amount, never
-     *         prorated for early close), capped at whatever the vault actually
-     *         holds. Borrower receives the remainder — which absorbs any
-     *         investment loss first (via the deposit) before the lender's
-     *         principal is ever touched.
-     *
-     *         Early close is only permitted if the lender would be made whole
-     *         (totalReturned >= principal + fee) — a borrower cannot use early
-     *         close to walk away from a locked-in loss.
+     * @notice Settles the loan. Early (borrower-only, before deadline) or
+     *         post-deadline. Forced swap-back of any held foreign assets
+     *         happens first, TWAP-bounded. See contract header for the
+     *         three-tier access model and bounty rules.
      */
     function settle() external {
         require(!isSettled, "Loan already settled");
 
         bool early = block.timestamp <= deadline;
+        uint256 bounty = 0;
 
         if (early) {
-            require(msg.sender == borrower,      "Only borrower can close early");
-            require(deposit >= _requiredDeposit, "Deposit not yet paid");
+            require(msg.sender == borrower, "Only borrower can close early");
+            require(depositPaid(),          "Deposit not yet paid");
+        } else if (heldAssets.length > 0) {
+            uint256 graceEnd = deadline + registry.swapBackGracePeriod();
+            if (block.timestamp <= graceEnd) {
+                require(msg.sender == lender || msg.sender == borrower,
+                    "Grace period: only lender or borrower may settle");
+            } else if (msg.sender != lender && msg.sender != borrower) {
+                bounty = _accruedBounty(graceEnd);
+            }
         }
+        // No foreign assets + past deadline: open to anyone immediately, no bounty (v1 behaviour).
 
-        isSettled = true; // set before any external calls — reentrancy guard
+        isSettled = true; // before external calls — reentrancy guard
 
-        _withdrawFromAaveIfNeeded();
+        _forcedSwapBackAll();
+        _withdrawAllFromAave();
+        _distribute(early, bounty);
+    }
 
-        uint256 totalReturned = address(this).balance;
-        uint256 fee = (principal * feeRateBps) / 10000;
+    /// @dev Settlement phase 2: computes the waterfall, stores the outcome,
+    ///      and pays out. Separated from settle() to keep each function's
+    ///      stack frame within EVM limits — and it reads better in an audit.
+    function _distribute(bool early, uint256 bounty) internal {
+        uint256 totalReturned = IERC20(asset).balanceOf(address(this));
+        uint256 fee          = (principal * feeRateBps) / 10000;
         uint256 lenderTarget = principal + fee;
-
-        uint256 lenderPayout   = totalReturned >= lenderTarget ? lenderTarget : totalReturned;
-        uint256 borrowerPayout = totalReturned > lenderTarget ? totalReturned - lenderTarget : 0;
 
         if (early) {
             require(totalReturned >= lenderTarget, "Cannot close early at a loss beyond deposit");
         }
 
-        settledTotalReturned  = totalReturned;
-        settledLenderPayout   = lenderPayout;
-        settledBorrowerPayout = borrowerPayout;
-        settledFee            = fee;
-
-        (bool lenderSent, ) = lender.call{value: lenderPayout}("");
-        require(lenderSent, "Failed to pay lender");
-
-        if (borrowerPayout > 0) {
-            (bool borrowerSent, ) = borrower.call{value: borrowerPayout}("");
-            require(borrowerSent, "Failed to pay borrower");
+        // Insurance pool draw — post-deadline settlements only. Early close
+        // must make the lender whole from the vault's own funds; a borrower
+        // voluntarily realising a loss cannot tap the shared pool at will.
+        uint256 insuranceDraw = 0;
+        if (!early && totalReturned < lenderTarget) {
+            insuranceDraw = insurancePool.draw(asset, lenderTarget - totalReturned, principal);
         }
 
-        emit Settled(msg.sender, early, totalReturned, lenderPayout, borrowerPayout, fee, block.timestamp);
+        uint256 available        = totalReturned + insuranceDraw;
+        uint256 lenderPayout     = available >= lenderTarget ? lenderTarget : available;
+        uint256 borrowerResidual = available > lenderTarget ? available - lenderTarget : 0;
+
+        if (bounty > borrowerResidual) { bounty = borrowerResidual; }
+
+        settledTotalReturned  = totalReturned;
+        settledInsuranceDraw  = insuranceDraw;
+        settledLenderPayout   = lenderPayout;
+        settledBorrowerPayout = borrowerResidual - bounty;
+        settledFee            = fee;
+        settledBounty         = bounty;
+
+        require(IERC20(asset).transfer(lender, lenderPayout), "Failed to pay lender");
+        if (settledBorrowerPayout > 0) {
+            require(IERC20(asset).transfer(borrower, settledBorrowerPayout), "Failed to pay borrower");
+        }
+        if (bounty > 0) {
+            require(IERC20(asset).transfer(msg.sender, bounty), "Failed to pay bounty");
+        }
+
+        emit Settled(msg.sender, early, settledTotalReturned, settledInsuranceDraw,
+            settledLenderPayout, settledBorrowerPayout, settledFee, settledBounty, block.timestamp);
     }
 
-    // --- View functions ---
+    /// @dev Swaps every held foreign asset back to the loan asset,
+    ///      TWAP-bounded: output must be within the registry's tolerance of
+    ///      the TWAP-implied value, or the whole settlement reverts.
+    ///      Settlement happens in the loan asset, or not at all.
+    function _forcedSwapBackAll() internal {
+        address router = registry.swapRouter();
+        uint32 twapWindow = registry.twapWindow();
+        uint256 tolBps = registry.twapToleranceBps();
 
-    /// @notice Returns the ETH balance currently held in this vault.
+        while (heldAssets.length > 0) {
+            address held = heldAssets[heldAssets.length - 1];
+            uint256 bal = IERC20(held).balanceOf(address(this));
+            if (bal > 0) {
+                uint24 feeTier = swapFeeTierOf[held];
+                uint256 twapQuote = UniswapTwap.quote(
+                    registry.uniswapFactory(), held, asset, feeTier, bal, twapWindow
+                );
+                uint256 minOut = (twapQuote * (10000 - tolBps)) / 10000;
+
+                require(IERC20(held).approve(router, bal), "Swap-back approval failed");
+                uint256 out = ISwapRouter(router).exactInputSingle(
+                    ISwapRouter.ExactInputSingleParams({
+                        tokenIn: held, tokenOut: asset, fee: feeTier,
+                        recipient: address(this), deadline: block.timestamp,
+                        amountIn: bal, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
+                    })
+                );
+                emit ForcedSwapBack(held, bal, out);
+            }
+            isHeld[held] = false;
+            heldAssets.pop();
+        }
+    }
+
+    /// @dev Withdraws the vault's full Aave position, if any. Hardened:
+    ///      balance must genuinely decrease (the v1 stuck-funds fix, kept).
+    function _withdrawAllFromAave() internal {
+        address aToken = registry.aTokenOf(asset);
+        if (aToken == address(0) || aToken.code.length == 0) { return; }
+
+        uint256 before = IERC20(aToken).balanceOf(address(this));
+        if (before == 0) { return; }
+
+        IAavePool(registry.aavePool()).withdraw(asset, type(uint256).max, address(this));
+
+        require(IERC20(aToken).balanceOf(address(this)) < before, "Aave withdrawal did not reduce balance");
+        emit AaveWithdrawn(before, block.timestamp);
+    }
+
+    /// @dev Time-increasing keeper bounty: linear accrual from grace end,
+    ///      rate and cap read from the registry (operator-configurable;
+    ///      launch values to be calibrated empirically per the spec).
+    function _accruedBounty(uint256 graceEnd) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp - graceEnd;
+        uint256 ratePerHourBps = registry.bountyRatePerHourBps();
+        uint256 capBps = registry.bountyCapBps();
+        uint256 accruedBps = (elapsed * ratePerHourBps) / 1 hours;
+        if (accruedBps > capBps) { accruedBps = capBps; }
+        return (principal * accruedBps) / 10000;
+    }
+
+    // --- Views ---
+
     function vaultBalance() external view returns (uint256) {
-        return address(this).balance;
+        return IERC20(asset).balanceOf(address(this));
     }
 
-    /// @notice Returns true if the loan deadline has passed without settlement.
     function isExpired() external view returns (bool) {
         return block.timestamp > deadline && !isSettled;
     }
 
-    /// @notice Returns a loss severity classification for the settlement
-    ///         outcome, matching the off-chain classification used by
-    ///         scripts/settle.js and scripts/check-loss-history.js. Kept
-    ///         on-chain as the single canonical source of truth, so the
-    ///         front-end never needs to reimplement this logic separately.
-    ///         0 = not yet settled, or settled with no loss.
-    ///         1 = borrower-only loss (deposit absorbed it, lender made whole).
-    ///         2 = lender-impacted loss (deposit insufficient, lender
-    ///             received less than principal + fee).
+    /// 0 = no loss (or unsettled); 1 = borrower-only; 2 = lender-impacted.
+    /// Severity reflects the vault's OWN performance (pre-insurance-draw):
+    /// a pool draw that makes the lender whole still records severity 1+,
+    /// because the loss genuinely occurred — the pool absorbed it.
     function lossSeverity() external view returns (uint8) {
         if (!isSettled) return 0;
-        uint256 lenderTarget = principal + settledFee;
-        uint256 noLossBaseline = principal + deposit;
-        if (settledLenderPayout < lenderTarget) return 2;
-        if (settledTotalReturned < noLossBaseline) return 1;
+        if (settledLenderPayout < principal + settledFee) return 2;
+        if (settledTotalReturned < principal + deposit) return 1;
         return 0;
     }
 }
