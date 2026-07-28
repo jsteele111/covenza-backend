@@ -128,7 +128,7 @@ npx hardhat test
 npx hardhat run scripts/deploy-v2-infrastructure.js --network hardhat
 ```
 
-The web interface lives in a separate repository: **[covenza-frontend](https://github.com/jsteele111/covenza-frontend)** — React + Vite + wagmi/RainbowKit. Live at **[covenza.netlify.app](https://covenza.netlify.app)**.
+The web interface lives in a separate repository: **[covenza-frontend](https://github.com/jsteele111/covenza-frontend)** — React + Vite + wagmi/RainbowKit. Live at **[covenza.netlify.app](https://covenza.xyz/)**.
 
 ---
 
