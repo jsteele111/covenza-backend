@@ -49,6 +49,48 @@ library UniswapTwap {
         amountOut = _getQuoteAtTick(avgTick, uint128(amountIn), tokenIn, tokenOut);
     }
 
+    /**
+     * @notice Non-reverting probe: can a TWAP over `window` seconds actually
+     *         be obtained for this pair and fee tier?
+     *
+     * @dev    Exists because quote() reverts in two distinct ways that are
+     *         indistinguishable to a caller who must not revert: the pool may
+     *         not exist, or it may exist with insufficient observation history
+     *         (a freshly-created pool has observationCardinality == 1 and
+     *         stores only the current observation, so observe() reverts with
+     *         "OLD" for any non-zero window).
+     *
+     *         The second case is the dangerous one. A pool can hold real,
+     *         deep liquidity — so a swap INTO it succeeds — while being unable
+     *         to serve a TWAP, so the forced swap-back OUT of it at settlement
+     *         reverts. That would leave the vault permanently unsettleable,
+     *         freezing lender principal, borrower deposit and the insurance
+     *         pool's exposure alike. Callers use this to refuse entry into any
+     *         position they could not force an exit from.
+     */
+    function canQuote(
+        address factory,
+        address tokenIn,
+        address tokenOut,
+        uint24  fee,
+        uint32  window
+    ) internal view returns (bool) {
+        if (window == 0) return false;
+
+        address pool = IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee);
+        if (pool == address(0)) return false;
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = window;
+        secondsAgos[1] = 0;
+
+        try IUniswapV3Pool(pool).observe(secondsAgos) returns (int56[] memory, uint160[] memory) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     /// @dev Arithmetic mean tick over the window. Ported from Uniswap
     ///      v3-periphery OracleLibrary.consult.
     function _consult(address pool, uint32 secondsAgo) private view returns (int24 avgTick) {

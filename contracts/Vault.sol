@@ -288,6 +288,23 @@ contract Vault {
         require(minAmountOut > 0,                   "minAmountOut must be greater than zero");
         require(tokenOut != asset,                  "Use swapBack() for the loan asset");
         require(registry.isWhitelisted(tokenOut),   "Destination asset not whitelisted");
+
+        // Refuse entry into a position we could not force an exit from.
+        // _forcedSwapBackAll() quotes (tokenOut -> asset) at this same fee
+        // tier; if that quote is unobtainable, settlement would revert and the
+        // vault would be permanently stuck. Checked in the same direction the
+        // forced swap-back will use, so the two cannot disagree.
+        require(
+            UniswapTwap.canQuote(
+                registry.uniswapFactory(),
+                tokenOut,
+                asset,
+                poolFee,
+                registry.twapWindow()
+            ),
+            "No TWAP history for this pair and fee tier"
+        );
+
         _enforceDepositInvariant(amountIn);
 
         uint256 amountOut = _executeSwap(asset, tokenOut, amountIn, minAmountOut, poolFee);
