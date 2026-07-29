@@ -59,6 +59,14 @@ const BOUNTY_CAP_BPS        = 200;  // 2%
 
 const INSURANCE_DRAW_CAP_BPS = 1000; // 10% of principal, matches test convention
 
+// --- Protocol fee treasury ---
+// Set TREASURY_ADDRESS in .env to your dedicated fee-collection address
+// before any deployment you intend to earn from. Deliberately separate from
+// the deployer/operator key so revenue and governance are not the same
+// wallet. Falls back to the deployer only so local dry runs work without
+// configuration — the script warns loudly when it does.
+const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS || "";
+
 const POOL_FEE = 3000; // Uniswap V3 0.3% tier, used for the USDC<->USDT pool
 
 async function main() {
@@ -173,11 +181,20 @@ async function main() {
   console.log("   Settlement config set (DEMO-TUNED — see script header).");
 
   // --- Step 6: VaultFactory, wired to the existing KYCRegistry ---
+  const treasury = TREASURY_ADDRESS || deployer.address;
+  if (!TREASURY_ADDRESS) {
+    console.log("\n⚠️  TREASURY_ADDRESS is not set — defaulting the protocol fee");
+    console.log("   treasury to the deployer address. Set it in .env before any");
+    console.log("   deployment you intend to collect fees from.");
+  }
+
   const factory = await (await hre.ethers.getContractFactory("VaultFactory", deployer)).deploy(
-    kycRegistryAddress, await registry.getAddress(), await pool.getAddress()
+    kycRegistryAddress, await registry.getAddress(), await pool.getAddress(), treasury
   );
   await factory.waitForDeployment();
   console.log("✅ VaultFactory deployed:", await factory.getAddress());
+  console.log("   Protocol fee treasury:", treasury);
+  console.log("   Protocol fee rate:     10% of each loan's fee (add-on, charged to borrower)");
 
   await (await pool.setVaultFactory(await factory.getAddress())).wait();
   console.log("   InsurancePool wired to the new factory.");
@@ -211,6 +228,7 @@ async function main() {
     vaultFactory: await factory.getAddress(),
     assetRegistry: await registry.getAddress(),
     insurancePool: await pool.getAddress(),
+    treasury: treasury,
     tokens: {
       weth: await weth.getAddress(),
       wbtc: await wbtc.getAddress(),
@@ -243,7 +261,7 @@ async function main() {
   console.log(`npx hardhat verify --network ${hre.network.name} ${await usdcUsdtPool.getAddress()}`);
   console.log(`npx hardhat verify --network ${hre.network.name} ${await pool.getAddress()} ${deployer.address} ${INSURANCE_DRAW_CAP_BPS}`);
   console.log(`npx hardhat verify --network ${hre.network.name} ${await registry.getAddress()} ${deployer.address} ${await aave.getAddress()} ${await router.getAddress()} ${await uniFactory.getAddress()} ${await weth.getAddress()}`);
-  console.log(`npx hardhat verify --network ${hre.network.name} ${await factory.getAddress()} ${kycRegistryAddress} ${await registry.getAddress()} ${await pool.getAddress()}`);
+  console.log(`npx hardhat verify --network ${hre.network.name} ${await factory.getAddress()} ${kycRegistryAddress} ${await registry.getAddress()} ${await pool.getAddress()} ${treasury}`);
   console.log("\nExplorer root: https://sepolia.arbiscan.io/address/" + (await factory.getAddress()));
 
   console.log("\n⚠️  Next: send the updated deployed-addresses.json (or just the new");

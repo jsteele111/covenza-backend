@@ -8,7 +8,7 @@ import "./libraries/UniswapTwap.sol";
 
 /**
  * @title Vault
- * @notice Per-borrower lending vault — Version 2.0, multi-asset.
+ * @notice Per-borrower lending vault — Version 2.1, multi-asset.
  *
  *         Loans are natively denominated in any whitelisted ERC20 asset
  *         (WETH, WBTC, USDC, USDT, ...). The vault is ERC20-native
@@ -28,6 +28,17 @@ import "./libraries/UniswapTwap.sol";
  *         construction of the payout math) --> insurance pool covers
  *         remaining shortfall (capped, post-deadline settlements only)
  *         --> only a true tail event reaches the lender's principal.
+ *         Once the lender is whole, the surviving residual is distributed
+ *         in order: keeper bounty --> protocol fee --> borrower.
+ *
+ *         PROTOCOL FEE (v2.1): an ADD-ON charged to the borrower, taken
+ *         from the residual at settlement. The lender's payout is entirely
+ *         unaffected by it — their advertised yield is what they receive.
+ *         Because the fee comes only from what survives after the lender
+ *         is made whole, a loss automatically yields zero protocol fee:
+ *         the protocol earns only when the lender does. Fee terms are
+ *         SNAPSHOTTED at origination and never re-read, so they cannot be
+ *         changed beneath a live loan.
  *
  *         FORCED SWAP-BACK: if the borrower holds non-loan assets at
  *         settlement, they are swapped back to the loan asset first,
@@ -61,6 +72,23 @@ interface ISwapRouter {
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
+/**
+ * @notice Protocol fee terms, snapshotted into each vault at origination.
+ * @dev    Passed as a struct rather than four separate constructor
+ *         arguments to keep the constructor's stack frame within EVM limits.
+ *
+ *         SNAPSHOTTING IS THE POINT. A vault must never read the factory's
+ *         current fee rate at settlement time — that would let the operator
+ *         raise the rate after a loan is live and retroactively take a
+ *         larger cut. Terms are fixed at the moment both parties commit.
+ */
+struct FeeConfig {
+    address treasury;             // protocol fee recipient
+    address referrer;             // integrator that sourced this loan; address(0) if none
+    uint256 protocolFeeRateBps;   // protocol fee, in bps of the loan's fee
+    uint256 referrerShareBps;     // referrer's share of the protocol fee, in bps
+}
+
 contract Vault {
 
     // --- Protocol references ---
@@ -82,6 +110,13 @@ contract Vault {
 
     uint256 private _requiredDeposit;
 
+    // --- Protocol fee terms (snapshotted at origination, never re-read) ---
+
+    address public treasury;
+    address public referrer;
+    uint256 public protocolFeeRateBps;
+    uint256 public referrerShareBps;
+
     // --- Foreign asset tracking (assets swapped into, not yet swapped back) ---
 
     address[] public heldAssets;
@@ -96,6 +131,8 @@ contract Vault {
     uint256 public settledBorrowerPayout;
     uint256 public settledFee;
     uint256 public settledBounty;
+    uint256 public settledProtocolFee;     // paid to treasury at settlement
+    uint256 public settledReferrerFee;     // paid to referrer at settlement
 
     // --- Events ---
 
@@ -108,6 +145,8 @@ contract Vault {
     event ForcedSwapBack(address indexed heldAsset, uint256 amountIn, uint256 amountOut);
     event Settled(address indexed triggeredBy, bool early, uint256 totalReturned, uint256 insuranceDraw,
         uint256 lenderPayout, uint256 borrowerPayout, uint256 fee, uint256 bounty, uint256 timestamp);
+    event ProtocolFeePaid(address indexed treasury, address indexed referrer,
+        uint256 treasuryAmount, uint256 referrerAmount);
 
     // --- Constructor ---
 
@@ -127,7 +166,8 @@ contract Vault {
         bool    _useSeconds,
         uint256 _depositAmount,
         address _registry,
-        address _insurancePool
+        address _insurancePool,
+        FeeConfig memory _feeConfig
     ) {
         require(_asset != address(0),         "Invalid asset address");
         require(_lender != address(0),        "Invalid lender address");
@@ -150,6 +190,14 @@ contract Vault {
                                        : block.timestamp + (_duration * 1 days);
         registry         = AssetRegistry(_registry);
         insurancePool    = InsurancePool(_insurancePool);
+
+        // Fee terms are snapshotted, not referenced. No require() here: a
+        // zero treasury or zero rate simply means no protocol fee is taken,
+        // which is a valid configuration.
+        treasury           = _feeConfig.treasury;
+        referrer           = _feeConfig.referrer;
+        protocolFeeRateBps = _feeConfig.protocolFeeRateBps;
+        referrerShareBps   = _feeConfig.referrerShareBps;
 
         emit VaultInitialised(_lender, _borrower, _asset, _principal, _depositAmount, _feeRateBps, deadline);
     }
@@ -350,6 +398,12 @@ contract Vault {
     /// @dev Settlement phase 2: computes the waterfall, stores the outcome,
     ///      and pays out. Separated from settle() to keep each function's
     ///      stack frame within EVM limits — and it reads better in an audit.
+    ///
+    ///      Order against the residual: keeper bounty -> protocol fee ->
+    ///      borrower. The bounty ranks ahead of the protocol's own take on
+    ///      purpose: the three-tier settlement model depends on that
+    ///      incentive being reliable, and it must never be squeezed by
+    ///      protocol revenue.
     function _distribute(bool early, uint256 bounty) internal {
         uint256 totalReturned = IERC20(asset).balanceOf(address(this));
         uint256 fee          = (principal * feeRateBps) / 10000;
@@ -367,29 +421,66 @@ contract Vault {
             insuranceDraw = insurancePool.draw(asset, lenderTarget - totalReturned, principal);
         }
 
-        uint256 available        = totalReturned + insuranceDraw;
-        uint256 lenderPayout     = available >= lenderTarget ? lenderTarget : available;
-        uint256 borrowerResidual = available > lenderTarget ? available - lenderTarget : 0;
+        uint256 available    = totalReturned + insuranceDraw;
+        uint256 lenderPayout = available >= lenderTarget ? lenderTarget : available;
+        uint256 residual     = available > lenderTarget ? available - lenderTarget : 0;
 
-        if (bounty > borrowerResidual) { bounty = borrowerResidual; }
+        // 1. Keeper bounty, capped at whatever residual exists.
+        if (bounty > residual) { bounty = residual; }
+        residual -= bounty;
+
+        // 2. Protocol fee. An ADD-ON charged to the borrower: the lender's
+        //    payout above is already final and is not reduced by it. Taken
+        //    only from what survives after the lender is whole and the
+        //    keeper is paid, so in any loss scenario residual is zero and
+        //    the protocol earns nothing. Block-scoped to keep the stack
+        //    frame small.
+        {
+            uint256 protocolFee = 0;
+            uint256 referrerFee = 0;
+
+            if (residual > 0 && protocolFeeRateBps > 0 && treasury != address(0)) {
+                protocolFee = (fee * protocolFeeRateBps) / 10000;
+                if (protocolFee > residual) { protocolFee = residual; }
+                residual -= protocolFee;
+
+                if (referrer != address(0) && referrerShareBps > 0) {
+                    referrerFee = (protocolFee * referrerShareBps) / 10000;
+                    protocolFee -= referrerFee;
+                }
+            }
+
+            settledProtocolFee = protocolFee;
+            settledReferrerFee = referrerFee;
+        }
 
         settledTotalReturned  = totalReturned;
         settledInsuranceDraw  = insuranceDraw;
         settledLenderPayout   = lenderPayout;
-        settledBorrowerPayout = borrowerResidual - bounty;
+        settledBorrowerPayout = residual;
         settledFee            = fee;
         settledBounty         = bounty;
 
         require(IERC20(asset).transfer(lender, lenderPayout), "Failed to pay lender");
-        if (settledBorrowerPayout > 0) {
-            require(IERC20(asset).transfer(borrower, settledBorrowerPayout), "Failed to pay borrower");
-        }
         if (bounty > 0) {
             require(IERC20(asset).transfer(msg.sender, bounty), "Failed to pay bounty");
+        }
+        if (settledProtocolFee > 0) {
+            require(IERC20(asset).transfer(treasury, settledProtocolFee), "Failed to pay treasury");
+        }
+        if (settledReferrerFee > 0) {
+            require(IERC20(asset).transfer(referrer, settledReferrerFee), "Failed to pay referrer");
+        }
+        if (settledBorrowerPayout > 0) {
+            require(IERC20(asset).transfer(borrower, settledBorrowerPayout), "Failed to pay borrower");
         }
 
         emit Settled(msg.sender, early, settledTotalReturned, settledInsuranceDraw,
             settledLenderPayout, settledBorrowerPayout, settledFee, settledBounty, block.timestamp);
+
+        if (settledProtocolFee > 0 || settledReferrerFee > 0) {
+            emit ProtocolFeePaid(treasury, referrer, settledProtocolFee, settledReferrerFee);
+        }
     }
 
     /// @dev Swaps every held foreign asset back to the loan asset,

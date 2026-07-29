@@ -80,15 +80,22 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
       .deploy(operator.address, 1000); // draw cap 10% of principal
 
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
-      await kyc.getAddress(), await registry.getAddress(), await pool.getAddress()
+      await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
+      operator.address                        // protocol fee treasury
     );
     await pool.setVaultFactory(await factory.getAddress());
+
+    // This suite predates the protocol fee and asserts exact borrower payouts
+    // throughout. Disabling the fee keeps those assertions valid as a clean
+    // regression baseline; fee behaviour is covered in GroupH.test.js.
+    await factory.setProtocolFeeRateBps(0);
 
     // --- Originate a WETH loan ---
     await weth.mint(lender.address, PRINCIPAL + SKIM);
     await weth.connect(lender).approve(await factory.getAddress(), PRINCIPAL + SKIM);
     await factory.connect(lender).deployVault(
-      await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT
+      await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+      ethers.ZeroAddress                      // no referrer
     );
     const vault = (await ethers.getContractFactory("Vault", operator))
       .attach(await factory.allVaults(0));

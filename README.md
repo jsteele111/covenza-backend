@@ -24,6 +24,7 @@ In a live test the price was deliberately moved 20% against an open position bef
 | **Insurance pool draw** | **8 USDC** |
 | **Lender payout** | **103 USDC — full principal + fee** |
 | Borrower payout | 0 USDC |
+| **Protocol fee taken** | **0 USDC** |
 | Loss severity recorded | 1 (borrower-only) |
 
 The deposit absorbed the first tranche of loss. The insurance pool automatically covered the remaining shortfall. The lender was made whole in full, with no manual intervention and no oracle.
@@ -42,7 +43,7 @@ Tier 3 has been demonstrated twice, capturing both halves of the bounty mechanis
 
 | Contract | Address |
 |---|---|
-| VaultFactory | [`0xd2bF51C369666076F1B0d0c544B8433ec74Db4e5`](https://sepolia.arbiscan.io/address/0xd2bF51C369666076F1B0d0c544B8433ec74Db4e5) |
+| VaultFactory | [`0x36DD23EBE221e30f9a71451F3a49F8cAd26c55Ab`](https://sepolia.arbiscan.io/address/0x36DD23EBE221e30f9a71451F3a49F8cAd26c55Ab) |
 | AssetRegistry | [`0x8DB2d815caD86eABF217205523621603F712aAE5`](https://sepolia.arbiscan.io/address/0x8DB2d815caD86eABF217205523621603F712aAE5) |
 | InsurancePool | [`0x11D4f02FA69D0352fb01725d822Fb05C54AD6e41`](https://sepolia.arbiscan.io/address/0x11D4f02FA69D0352fb01725d822Fb05C54AD6e41) |
 | KYCRegistry | [`0x842629E4C953De726946Db5886e50d4840F61FC4`](https://sepolia.arbiscan.io/address/0x842629E4C953De726946Db5886e50d4840F61FC4) |
@@ -69,7 +70,17 @@ require(
 );
 ```
 
-**4. Settlement waterfall — automatic, oracle-free.**
+**4. Protocol fee — an add-on, never a haircut.**
+A configurable share of each loan's fee (10% at launch) is charged to the
+*borrower* at settlement, taken from their residual after the lender has been
+paid in full. The lender's return is untouched by it. Because it comes only
+from what survives once the lender is whole, **a loss yields zero protocol
+fee** — the protocol earns only when the lender does. An optional referrer
+address splits the fee with platforms that integrate Covenza as a lending
+backend. Fee terms are snapshotted into each vault at origination and never
+re-read, so a rate change can never be applied retroactively to a live loan.
+
+**5. Settlement waterfall — automatic, oracle-free.**
 At settlement, held foreign assets are force-swapped back to the loan asset at a **TWAP-bounded** price — the realised output must land within a configured tolerance of the time-weighted average, or the settlement reverts. Settlement happens in the loan asset or not at all. Proceeds are then distributed: deposit absorbs loss first, then a per-asset insurance pool (capped as a percentage of principal, and only post-deadline), and only a genuine tail event reaches the lender's principal.
 
 TWAP bounding is what removes the oracle dependency — no price feed, no oracle governance, no oracle failure mode.
@@ -80,14 +91,14 @@ TWAP bounding is what removes the oracle dependency — no price feed, no oracle
 
 | Contract | SLOC | Responsibility |
 |---|---|---|
-| `Vault.sol` | 476 | Per-loan vault. Deposit invariant, Aave supply/withdraw, directional swaps, TWAP-bounded forced swap-back, three-tier settlement, keeper bounty, payout waterfall |
+| `Vault.sol` | 567 | Per-loan vault. Deposit invariant, Aave supply/withdraw, directional swaps, TWAP-bounded forced swap-back, three-tier settlement, keeper bounty, protocol fee, payout waterfall |
 | `KYCRegistry.sol` | 275 | Signature-based verification, ERC721 badge, operator revocation |
 | `AssetRegistry.sol` | 253 | Operator-controlled asset whitelist, aToken mapping, protocol-wide settlement config |
 | `InsurancePool.sol` | 226 | Per-asset reserves, fee-skim funding, principal-percentage draw cap, vault-only draws |
-| `VaultFactory.sol` | 225 | KYC and whitelist gating, vault deployment, principal transfer, insurance skim routing |
+| `VaultFactory.sol` | 324 | KYC and whitelist gating, vault deployment, principal transfer, insurance skim routing, protocol fee configuration |
 | `libraries/UniswapTwap.sol` | 174 | TWAP quote helper. Tick/price maths vendored unmodified from Uniswap v3-core/periphery |
 
-**1,641 SLOC** of deployed Solidity, excluding test mocks.
+**1,831 SLOC** of deployed Solidity, excluding test mocks.
 
 ### Design decisions worth knowing
 
@@ -102,7 +113,7 @@ TWAP bounding is what removes the oracle dependency — no price feed, no oracle
 
 ## Tests
 
-**76 tests, all passing.**
+**91 tests, all passing.**
 
 ```bash
 npm install
@@ -114,6 +125,7 @@ npx hardhat test
 | `GroupA.test.js` | 20 | AssetRegistry whitelist, InsurancePool funding/draw/cap, operator access control |
 | `GroupB.test.js` | 13 | Full v2 lifecycle: swaps, deposit invariant, forced swap-back (aligned and diverged TWAP), insurance draws, three-tier access, keeper bounty |
 | `GroupD.test.js` | 17 | Guard rails and edge cases |
+| `GroupH.test.js` | 15 | Protocol fee: add-on behaviour, zero fee on loss, referrer split, bounty precedence, rate snapshotting, caps |
 | `KYCRegistry.test.js` | 26 | Verification, signature path, revocation, operator transfer, badge rendering |
 
 Loss scenarios are tested against real state changes — mock Aave and Uniswap contracts with configurable rates and TWAP ticks, so a genuine loss is reproduced deterministically rather than stubbed.

@@ -65,14 +65,20 @@ describe("Group D — guard rails and edge cases", function () {
       .deploy(operator.address, 1000);
 
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
-      await kyc.getAddress(), await registry.getAddress(), await pool.getAddress()
+      await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
+      operator.address                        // protocol fee treasury
     );
     await pool.setVaultFactory(await factory.getAddress());
+
+    // Fee disabled here for the same reason as GroupB: this suite asserts
+    // exact payouts and predates the protocol fee. See GroupH.test.js.
+    await factory.setProtocolFeeRateBps(0);
 
     await weth.mint(lender.address, PRINCIPAL + SKIM);
     await weth.connect(lender).approve(await factory.getAddress(), PRINCIPAL + SKIM);
     await factory.connect(lender).deployVault(
-      await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT
+      await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+      ethers.ZeroAddress                      // no referrer
     );
     const vault = (await ethers.getContractFactory("Vault", operator))
       .attach(await factory.allVaults(0));
@@ -97,7 +103,8 @@ describe("Group D — guard rails and edge cases", function () {
     await weth.connect(lender).approve(await factory.getAddress(), PRINCIPAL + SKIM);
     await expect(
       factory.connect(lender).deployVault(
-        await weth.getAddress(), unverified.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT)
+        await weth.getAddress(), unverified.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+        ethers.ZeroAddress)
     ).to.be.revertedWith("Borrower is not KYC verified");
   });
 
@@ -106,7 +113,8 @@ describe("Group D — guard rails and edge cases", function () {
     const rogue = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Rogue", "RGE", 18);
     await expect(
       factory.connect(lender).deployVault(
-        await rogue.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT)
+        await rogue.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+        ethers.ZeroAddress)
     ).to.be.revertedWith("Loan asset is not whitelisted");
   });
 
@@ -117,7 +125,8 @@ describe("Group D — guard rails and edge cases", function () {
     await weth.connect(lender).approve(await factory.getAddress(), PRINCIPAL);
     await expect(
       factory.connect(lender).deployVault(
-        await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT)
+        await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+        ethers.ZeroAddress)
     ).to.be.reverted;
   });
 
@@ -125,13 +134,14 @@ describe("Group D — guard rails and edge cases", function () {
     const { factory, lender, borrower, weth } = await loadFixture(deployStackFixture);
     const w = await weth.getAddress();
     const d = factory.connect(lender);
-    await expect(d.deployVault(w, borrower.address, 0, FEE_BPS, DURATION, true, DEPOSIT))
+    const Z = ethers.ZeroAddress;
+    await expect(d.deployVault(w, borrower.address, 0, FEE_BPS, DURATION, true, DEPOSIT, Z))
       .to.be.revertedWith("Principal must be greater than zero");
-    await expect(d.deployVault(w, borrower.address, PRINCIPAL, 0, DURATION, true, DEPOSIT))
+    await expect(d.deployVault(w, borrower.address, PRINCIPAL, 0, DURATION, true, DEPOSIT, Z))
       .to.be.revertedWith("Fee rate must be greater than zero");
-    await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, 0, true, DEPOSIT))
+    await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, 0, true, DEPOSIT, Z))
       .to.be.revertedWith("Duration must be greater than zero");
-    await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, 0))
+    await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, 0, Z))
       .to.be.revertedWith("Deposit must be greater than zero");
   });
 

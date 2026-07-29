@@ -128,6 +128,13 @@ async function main() {
     // (USDC), so that's the leg that needs to be worse.
     await (await router.setRate(usdtAddr, usdcAddr, 80n, 100n)).wait();
     await (await router.setRate(usdcAddr, usdtAddr, 1n, 1n)).wait(); // unused reverse leg, keep sane
+    // NOTE: magnitude must be NEGATIVE here — tickFor's contract is
+    // "price(base->quote) = 1.0001^magnitude", and 1.0001^2232 ≈ 1.25,
+    // not 0.80. 1.0001^-2232 ≈ 0.80 is the one that matches the reference
+    // comment. Passing +2232 here made the TWAP quote imply the price rose
+    // 25% while the router was actually configured 20% lower — the
+    // resulting minOut came out far above what the router could pay,
+    // and settle() reverted with "Too little received".
     const tick = tickFor(usdtAddr, usdcAddr, -2232n); // ~0.80, per Group B's own tick reference
     await (await twapPool.setAvgTick(tick)).wait();
   }
@@ -137,7 +144,8 @@ async function main() {
     await (await usdc.connect(lender).approve(await factory.getAddress(), PRINCIPAL + skim)).wait();
     const countBefore = await factory.totalVaults();
     const tx = await factory.connect(lender).deployVault(
-      usdcAddr, borrower.address, PRINCIPAL, FEE_RATE_BPS, durationSeconds, true, DEPOSIT
+      usdcAddr, borrower.address, PRINCIPAL, FEE_RATE_BPS, durationSeconds, true, DEPOSIT,
+      hre.ethers.ZeroAddress                  // no referrer on proof runs
     );
     await tx.wait();
     const vaultAddress = await factory.allVaults(countBefore);
@@ -158,15 +166,18 @@ async function main() {
   }
 
   async function logOutcome(label, vault) {
-    const [settled, severity, totalReturned, lenderPayout, borrowerPayout, insuranceDraw, fee, bounty] =
+    const [settled, severity, totalReturned, lenderPayout, borrowerPayout, insuranceDraw, fee, bounty,
+           protocolFee, referrerFee] =
       await Promise.all([
         vault.isSettled(), vault.lossSeverity(), vault.settledTotalReturned(),
         vault.settledLenderPayout(), vault.settledBorrowerPayout(),
         vault.settledInsuranceDraw(), vault.settledFee(), vault.settledBounty(),
+        vault.settledProtocolFee(), vault.settledReferrerFee(),
       ]);
     console.log(`\n   [${label}] settled=${settled} lossSeverity=${severity}`);
     console.log(`   totalReturned=${totalReturned} lenderPayout=${lenderPayout} borrowerPayout=${borrowerPayout}`);
     console.log(`   insuranceDraw=${insuranceDraw} fee=${fee} bounty=${bounty}`);
+    console.log(`   protocolFee=${protocolFee} referrerFee=${referrerFee}`);
   }
 
   // ============================================================
