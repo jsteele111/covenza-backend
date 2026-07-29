@@ -58,6 +58,24 @@ interface IAavePool {
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }
 
+/**
+ * @dev The second yield venue is the ERC-4626 STANDARD rather than a named
+ *      protocol. Aave is not deployed on every chain Covenza targets; binding
+ *      to a specific lending market would mean re-integrating per chain. Any
+ *      compliant vault — MetaMorpho, Yearn, others — works through this one
+ *      interface.
+ *
+ *      Unlike Aave's aToken, which rebases 1:1 with the underlying, 4626
+ *      shares appreciate against it. Hence convertToAssets() wherever a
+ *      position's VALUE is needed rather than its share count.
+ */
+interface IERC4626 {
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+    function convertToAssets(uint256 shares) external view returns (uint256);
+}
+
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -117,6 +135,17 @@ contract Vault {
     uint256 public protocolFeeRateBps;
     uint256 public referrerShareBps;
 
+    // --- Yield venue (snapshotted at first supply, never re-read) ---
+    //
+    // Same reasoning as the fee terms above. An operator repointing an
+    // asset's venue mid-loan must not be able to strand a position: the
+    // vault settles against the venue it actually supplied to, not whatever
+    // the registry says today. Zero kind means the vault has never supplied.
+
+    uint8   public yieldVenueKind;      // 0 None, 1 Aave, 2 ERC4626 — mirrors AssetRegistry.YieldVenue
+    address public yieldVenue;          // Aave pool, or the ERC-4626 vault
+    address public yieldPositionToken;  // aToken, or the ERC-4626 vault (its own share token)
+
     // --- Foreign asset tracking (assets swapped into, not yet swapped back) ---
 
     address[] public heldAssets;
@@ -142,6 +171,8 @@ contract Vault {
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, bool isSwapBack);
     event AaveSupplied(uint256 amount, uint256 timestamp);
     event AaveWithdrawn(uint256 amount, uint256 timestamp);
+    event YieldSupplied(uint8 indexed venue, uint256 amount, uint256 timestamp);
+    event YieldWithdrawn(uint8 indexed venue, uint256 amount, uint256 timestamp);
     event ForcedSwapBack(address indexed heldAsset, uint256 amountIn, uint256 amountOut);
     event Settled(address indexed triggeredBy, bool early, uint256 totalReturned, uint256 insuranceDraw,
         uint256 lenderPayout, uint256 borrowerPayout, uint256 fee, uint256 bounty, uint256 timestamp);
@@ -241,27 +272,72 @@ contract Vault {
         _;
     }
 
-    // --- Whitelisted action 1: Aave V3 supply/withdraw (loan asset only) ---
+    // --- Whitelisted action 1: yield venue supply/withdraw (loan asset only) ---
 
-    /// @notice Supplies loan-asset funds to Aave V3 to earn yield.
-    function supplyToAave(uint256 amount) external onlyActiveBorrower {
+    /**
+     * @notice Supplies loan-asset funds to this asset's configured yield
+     *         venue — Aave V3 or any ERC-4626 vault.
+     *
+     * @dev    The venue is snapshotted on the first supply and locked for the
+     *         life of the vault. A borrower who wants to move venues must
+     *         fully withdraw and settle; the alternative is a vault holding
+     *         positions in two places with only one recorded, which is how
+     *         funds get stranded.
+     */
+    function supplyToYield(uint256 amount) public onlyActiveBorrower {
         require(amount > 0, "Amount must be greater than zero");
-        require(registry.aTokenOf(asset) != address(0), "Asset has no Aave support");
+
+        (AssetRegistry.YieldVenue venue, address venueAddr) = registry.venueOf(asset);
+        require(venue != AssetRegistry.YieldVenue.None, "Asset has no yield venue");
+
+        if (yieldVenueKind == 0) {
+            yieldVenueKind = uint8(venue);
+            if (venue == AssetRegistry.YieldVenue.Aave) {
+                yieldVenue         = registry.aavePool();
+                yieldPositionToken = registry.aTokenOf(asset);
+                require(yieldPositionToken != address(0), "Asset has no Aave support");
+            } else {
+                yieldVenue         = venueAddr;
+                yieldPositionToken = venueAddr;   // a 4626 vault IS its own share token
+            }
+        } else {
+            require(yieldVenueKind == uint8(venue), "Yield venue changed mid-loan");
+        }
+
         _enforceDepositInvariant(amount);
 
-        address pool = registry.aavePool();
-        require(IERC20(asset).approve(pool, amount), "Aave approval failed");
-        IAavePool(pool).supply(asset, amount, address(this), 0);
+        require(IERC20(asset).approve(yieldVenue, amount), "Yield approval failed");
+        if (yieldVenueKind == 1) {
+            IAavePool(yieldVenue).supply(asset, amount, address(this), 0);
+            emit AaveSupplied(amount, block.timestamp);
+        } else {
+            IERC4626(yieldVenue).deposit(amount, address(this));
+        }
 
-        emit AaveSupplied(amount, block.timestamp);
+        emit YieldSupplied(yieldVenueKind, amount, block.timestamp);
     }
 
-    /// @notice Withdraws a borrower-chosen amount back from Aave mid-term.
-    function withdrawFromAave(uint256 amount) external onlyActiveBorrower {
-        require(amount > 0, "Amount must be greater than zero");
-        IAavePool(registry.aavePool()).withdraw(asset, amount, address(this));
-        emit AaveWithdrawn(amount, block.timestamp);
+    /// @notice Withdraws a borrower-chosen amount of the UNDERLYING asset
+    ///         back from the yield venue mid-term.
+    function withdrawFromYield(uint256 amount) public onlyActiveBorrower {
+        require(amount > 0,        "Amount must be greater than zero");
+        require(yieldVenueKind > 0, "No yield position");
+
+        if (yieldVenueKind == 1) {
+            IAavePool(yieldVenue).withdraw(asset, amount, address(this));
+            emit AaveWithdrawn(amount, block.timestamp);
+        } else {
+            IERC4626(yieldVenue).withdraw(amount, address(this), address(this));
+        }
+
+        emit YieldWithdrawn(yieldVenueKind, amount, block.timestamp);
     }
+
+    /// @notice Deprecated aliases, kept so existing integrations and the
+    ///         published ABI keep working. Aave is now one venue among
+    ///         several rather than the only one.
+    function supplyToAave(uint256 amount) external { supplyToYield(amount); }
+    function withdrawFromAave(uint256 amount) external { withdrawFromYield(amount); }
 
     // --- Whitelisted action 2: Uniswap V3 directional swaps ---
 
@@ -395,7 +471,7 @@ contract Vault {
             require(msg.sender == borrower, "Only borrower can close early");
             require(depositPaid(),          "Deposit not yet paid");
         } else if (heldAssets.length > 0) {
-            uint256 graceEnd = deadline + registry.swapBackGracePeriod();
+            uint256 graceEnd = deadline + _effectiveGracePeriod();
             if (block.timestamp <= graceEnd) {
                 require(msg.sender == lender || msg.sender == borrower,
                     "Grace period: only lender or borrower may settle");
@@ -408,7 +484,7 @@ contract Vault {
         isSettled = true; // before external calls — reentrancy guard
 
         _forcedSwapBackAll();
-        _withdrawAllFromAave();
+        _withdrawAllFromYield();
         _distribute(early, bounty);
     }
 
@@ -534,19 +610,55 @@ contract Vault {
         }
     }
 
-    /// @dev Withdraws the vault's full Aave position, if any. Hardened:
-    ///      balance must genuinely decrease (the v1 stuck-funds fix, kept).
-    function _withdrawAllFromAave() internal {
-        address aToken = registry.aTokenOf(asset);
-        if (aToken == address(0) || aToken.code.length == 0) { return; }
+    /// @dev Withdraws the vault's full yield position, if any, from whichever
+    ///      venue it actually supplied to. Reads the SNAPSHOT rather than the
+    ///      registry, so a venue repointed mid-loan cannot strand funds.
+    ///      Hardened: balance must genuinely decrease (the v1 stuck-funds fix,
+    ///      kept, and it applies to both venues).
+    function _withdrawAllFromYield() internal {
+        if (yieldVenueKind == 0) { return; }
+        if (yieldPositionToken == address(0) || yieldPositionToken.code.length == 0) { return; }
 
-        uint256 before = IERC20(aToken).balanceOf(address(this));
+        uint256 before = IERC20(yieldPositionToken).balanceOf(address(this));
         if (before == 0) { return; }
 
-        IAavePool(registry.aavePool()).withdraw(asset, type(uint256).max, address(this));
+        if (yieldVenueKind == 1) {
+            // aToken rebases 1:1, so `before` is both the share count and the value.
+            IAavePool(yieldVenue).withdraw(asset, type(uint256).max, address(this));
+            emit AaveWithdrawn(before, block.timestamp);
+        } else {
+            // `before` is a SHARE count here; redeem burns all of them and
+            // returns however much underlying they are now worth.
+            IERC4626(yieldVenue).redeem(before, address(this), address(this));
+        }
 
-        require(IERC20(aToken).balanceOf(address(this)) < before, "Aave withdrawal did not reduce balance");
-        emit AaveWithdrawn(before, block.timestamp);
+        require(
+            IERC20(yieldPositionToken).balanceOf(address(this)) < before,
+            "Yield withdrawal did not reduce balance"
+        );
+        emit YieldWithdrawn(yieldVenueKind, before, block.timestamp);
+    }
+
+    /**
+     * @dev The swap-back grace this vault is actually entitled to.
+     *
+     *      Driven by what the vault HOLDS, not what it owes. The grace exists
+     *      to give the parties a window before keepers may force a swap-back
+     *      at a bad price, so the binding constraint is the tradability of the
+     *      asset being exited — and where several are held, the least
+     *      tradeable of them governs.
+     *
+     *      Registry values already include the global default, so the max is
+     *      never below it. A vault holding only continuously-traded crypto is
+     *      therefore never delayed by a rule that exists for equities.
+     */
+    function _effectiveGracePeriod() internal view returns (uint256) {
+        uint256 g = registry.swapBackGracePeriod();
+        for (uint256 i = 0; i < heldAssets.length; i++) {
+            uint256 assetGrace = registry.gracePeriodOf(heldAssets[i]);
+            if (assetGrace > g) { g = assetGrace; }
+        }
+        return g;
     }
 
     /// @dev Time-increasing keeper bounty: linear accrual from grace end,
@@ -569,6 +681,26 @@ contract Vault {
 
     function isExpired() external view returns (bool) {
         return block.timestamp > deadline && !isSettled;
+    }
+
+    /// @notice The vault's yield position valued in the UNDERLYING loan asset.
+    ///         Aave's aToken rebases 1:1 so its balance is already the value;
+    ///         ERC-4626 shares must be converted, since their whole point is
+    ///         to appreciate against the underlying.
+    function yieldPositionValue() external view returns (uint256) {
+        if (yieldVenueKind == 0 || yieldPositionToken == address(0)) { return 0; }
+
+        uint256 bal = IERC20(yieldPositionToken).balanceOf(address(this));
+        if (bal == 0) { return 0; }
+
+        return yieldVenueKind == 1 ? bal : IERC4626(yieldVenue).convertToAssets(bal);
+    }
+
+    /// @notice The grace period this vault would get if it settled now, in
+    ///         seconds — surfaced so the UI can show a borrower holding a
+    ///         24/5 asset why their window is longer.
+    function effectiveGracePeriod() external view returns (uint256) {
+        return _effectiveGracePeriod();
     }
 
     /// 0 = no loss (or unsettled); 1 = borrower-only; 2 = lender-impacted.

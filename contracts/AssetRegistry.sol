@@ -53,9 +53,32 @@ contract AssetRegistry {
     uint256 public bountyRatePerHourBps = 2;    // keeper bounty accrual: bps of principal per hour past grace end
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
 
+    /**
+     * @notice Where idle loan-asset funds may be parked to earn yield.
+     *
+     * @dev    Deliberately an interface standard rather than a named protocol.
+     *         Aave is not deployed on every chain Covenza targets, and binding
+     *         to one lending market would mean re-integrating for each new
+     *         venue. ERC4626 covers MetaMorpho, Yearn, and anything else that
+     *         implements the standard, on any chain, with one code path.
+     *
+     *         None is a first-class option, not a failure state: an asset with
+     *         no yield venue is still perfectly usable for lending and swaps.
+     */
+    enum YieldVenue { None, Aave, ERC4626 }
+
     struct AssetConfig {
-        bool    whitelisted;
-        address aToken;      // Aave V3 aToken for this asset (address(0) = no Aave support)
+        bool       whitelisted;
+        address    aToken;       // Aave V3 aToken for this asset (address(0) = no Aave support)
+        YieldVenue venue;
+        address    venueAddress; // ERC-4626 vault address; unused for Aave (which uses aavePool)
+        // Per-asset EXTENSION to the global swap-back grace, in seconds.
+        // Only ever lengthens it — see gracePeriodOf(). Exists for assets that
+        // are not continuously tradeable: tokenised equities trade 24/5, so a
+        // vault holding one whose deadline falls on a Friday cannot be forced
+        // out until markets reopen, and thin weekend liquidity is exactly when
+        // a forced swap-back would breach the TWAP tolerance and revert.
+        uint256    gracePeriod;
     }
 
     mapping(address => AssetConfig) public assetConfig;
@@ -71,6 +94,8 @@ contract AssetRegistry {
     event OperatorUpdated(address indexed previousOperator, address indexed newOperator);
     event AssetAdded(address indexed asset, address indexed aToken);
     event AssetRemoved(address indexed asset);
+    event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
+    event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
     event IntegrationAddressesUpdated(
         address aavePool,
         address swapRouter,
@@ -134,10 +159,57 @@ contract AssetRegistry {
      *                asset should not support Aave supply (swap-only).
      */
     function addAsset(address _asset, address _aToken) external onlyOperator {
+        // An aToken implies the Aave venue; its absence implies no venue.
+        // Preserved as the shorthand for the common case — addAssetWithVenue
+        // is the general form.
+        _addAsset(
+            _asset,
+            _aToken,
+            _aToken == address(0) ? YieldVenue.None : YieldVenue.Aave,
+            address(0),
+            0
+        );
+    }
+
+    /**
+     * @notice Whitelists an asset, specifying its yield venue and any grace
+     *         period extension explicitly.
+     * @param _asset        The ERC20 asset to whitelist.
+     * @param _aToken       Aave aToken, or address(0). Required when the venue
+     *                      is Aave — the vault reads its position through it.
+     * @param _venue        None, Aave, or ERC4626.
+     * @param _venueAddress The ERC-4626 vault. Must be address(0) for other venues.
+     * @param _gracePeriod  Seconds to extend the global swap-back grace by, for
+     *                      this asset. Zero for continuously tradeable assets.
+     */
+    function addAssetWithVenue(
+        address    _asset,
+        address    _aToken,
+        YieldVenue _venue,
+        address    _venueAddress,
+        uint256    _gracePeriod
+    ) external onlyOperator {
+        _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
+    }
+
+    function _addAsset(
+        address    _asset,
+        address    _aToken,
+        YieldVenue _venue,
+        address    _venueAddress,
+        uint256    _gracePeriod
+    ) internal {
         require(_asset != address(0), "Invalid asset address");
         require(!assetConfig[_asset].whitelisted, "Asset already whitelisted");
+        _validateVenue(_venue, _aToken, _venueAddress);
 
-        assetConfig[_asset] = AssetConfig({ whitelisted: true, aToken: _aToken });
+        assetConfig[_asset] = AssetConfig({
+            whitelisted:  true,
+            aToken:       _aToken,
+            venue:        _venue,
+            venueAddress: _venueAddress,
+            gracePeriod:  _gracePeriod
+        });
 
         if (!_everAdded[_asset]) {
             _everAdded[_asset] = true;
@@ -145,6 +217,51 @@ contract AssetRegistry {
         }
 
         emit AssetAdded(_asset, _aToken);
+        emit VenueUpdated(_asset, _venue, _venueAddress);
+        if (_gracePeriod > 0) { emit GracePeriodUpdated(_asset, _gracePeriod); }
+    }
+
+    function _validateVenue(YieldVenue _venue, address _aToken, address _venueAddress) internal pure {
+        if (_venue == YieldVenue.Aave) {
+            require(_aToken != address(0),       "Aave venue requires an aToken");
+            require(_venueAddress == address(0), "Aave venue takes no venue address");
+        } else if (_venue == YieldVenue.ERC4626) {
+            require(_venueAddress != address(0), "ERC4626 venue requires a vault address");
+        } else {
+            require(_venueAddress == address(0), "No venue takes no venue address");
+        }
+    }
+
+    /**
+     * @notice Repoints an asset's yield venue.
+     *
+     * @dev    SAFETY: vaults snapshot their venue at first supply and settle
+     *         against that snapshot, so changing this cannot strand an
+     *         in-flight position. It takes effect for vaults that have not yet
+     *         supplied. Same reasoning as the fee terms being snapshotted at
+     *         origination — live loans are never repriced underneath.
+     */
+    function setVenue(
+        address    _asset,
+        YieldVenue _venue,
+        address    _venueAddress
+    ) external onlyOperator {
+        require(_everAdded[_asset], "Unknown asset");
+        _validateVenue(_venue, assetConfig[_asset].aToken, _venueAddress);
+
+        assetConfig[_asset].venue        = _venue;
+        assetConfig[_asset].venueAddress = _venueAddress;
+
+        emit VenueUpdated(_asset, _venue, _venueAddress);
+    }
+
+    /// @notice Sets how much this asset extends the global swap-back grace by.
+    function setGracePeriod(address _asset, uint256 _gracePeriod) external onlyOperator {
+        require(_everAdded[_asset], "Unknown asset");
+        require(_gracePeriod <= 14 days, "Grace extension too long");
+
+        assetConfig[_asset].gracePeriod = _gracePeriod;
+        emit GracePeriodUpdated(_asset, _gracePeriod);
     }
 
     /**
@@ -227,6 +344,32 @@ contract AssetRegistry {
     ///         holding a removed asset can still settle.
     function aTokenOf(address _asset) external view returns (address) {
         return assetConfig[_asset].aToken;
+    }
+
+    /// @notice The asset's yield venue and, for ERC-4626, its vault address.
+    ///         Readable after whitelist removal, like aTokenOf, so in-flight
+    ///         vaults can still settle.
+    function venueOf(address _asset) external view returns (YieldVenue, address) {
+        AssetConfig storage c = assetConfig[_asset];
+        return (c.venue, c.venueAddress);
+    }
+
+    /**
+     * @notice The effective swap-back grace for a vault HOLDING this asset.
+     *
+     * @dev    Returns the global default extended by the asset's own period —
+     *         never less. Per-asset configuration can only ever lengthen the
+     *         window, which is the only direction that makes sense: the reason
+     *         an asset needs special handling is that it is HARDER to exit,
+     *         not easier. This also means a zero value is unambiguous ("no
+     *         extension") rather than overloaded to mean "inherit".
+     *
+     *         Note it is the HELD asset that governs, not the loan asset. The
+     *         constraint being managed is the tradability of whatever the
+     *         vault must force its way out of.
+     */
+    function gracePeriodOf(address _asset) external view returns (uint256) {
+        return swapBackGracePeriod + assetConfig[_asset].gracePeriod;
     }
 
     /// @notice Total number of assets ever added (including removed ones).
