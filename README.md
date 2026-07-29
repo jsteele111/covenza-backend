@@ -140,7 +140,7 @@ npx hardhat test
 npx hardhat run scripts/deploy-v2-infrastructure.js --network hardhat
 ```
 
-The web interface lives in a separate repository: **[covenza-frontend](https://github.com/jsteele111/covenza-frontend)** — React + Vite + wagmi/RainbowKit. Live at **[covenza.netlify.app](https://covenza.xyz/)**.
+The web interface lives in a separate repository: **[covenza-frontend](https://github.com/jsteele111/covenza-frontend)** — React + Vite + wagmi/RainbowKit. Live at **[covenza.xyz](https://covenza.xyz)**.
 
 ---
 
@@ -163,7 +163,7 @@ contracts/            Solidity sources
   interfaces/         Minimal IERC20
   libraries/          Vendored UniswapTwap helper
   mocks/              Test-only mocks (not deployed, not in audit scope)
-test/                 76 tests
+test/                 91 tests
 scripts/              Deployment, lifecycle-proof and settlement scripts
 ```
 
