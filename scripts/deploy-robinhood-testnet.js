@@ -1,0 +1,241 @@
+/**
+ * Deploys the Covenza stack to Robinhood Chain testnet, against the REAL
+ * Uniswap V3 put there by deploy-uniswap-testnet.js.
+ *
+ * Differs from deploy-v2-infrastructure.js in three ways that matter:
+ *
+ *   1. No mock Uniswap. Factory, router and pool come from
+ *      uniswap-testnet.json — real audited Uniswap V3 bytecode. This is the
+ *      whole point: the mock could not express observation cardinality, which
+ *      is how a fund-freeze bug survived 91 passing tests.
+ *
+ *   2. No Aave. It is not deployed on Robinhood Chain. AssetRegistry's
+ *      constructor still requires a non-zero pool address, so a placeholder
+ *      goes in and no asset is configured with the Aave venue. The interface
+ *      stays in the contracts, dormant, so Aave chains remain available.
+ *
+ *   3. twapWindow is 60, not 1800. A freshly warmed pool has only a couple of
+ *      minutes of observation history, and on a real chain you cannot fast-
+ *      forward time. 60 is the contract's floor and the mechanism is
+ *      identical — only the wait shortens.
+ *
+ * Usage:
+ *   npx hardhat run scripts/deploy-robinhood-testnet.js --network robinhoodTestnet
+ */
+
+const hre = require("hardhat");
+const fs = require("fs");
+const path = require("path");
+
+const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
+const TWAP_TOLERANCE_BPS       = 300;  // 3%
+const GRACE_PERIOD_SECONDS     = 90;   // demo-tuned; production default 36h
+const BOUNTY_RATE_PER_HOUR_BPS = 3000; // demo-tuned so a bounty is visible fast
+const BOUNTY_CAP_BPS           = 200;  // 2%
+const INSURANCE_DRAW_CAP_BPS   = 1000; // 10% of principal
+
+const VENUE_NONE = 0;
+const VENUE_4626 = 2;
+
+// Whatever the deployer has left after the Uniswap deployment needs to cover
+// VaultFactory, which is the expensive one — it embeds the full Vault
+// creation bytecode.
+const MIN_BALANCE = ethers => ethers.parseEther("0.0015");
+
+async function main() {
+  const { ethers } = hre;
+  const [deployer, borrower, keeper] = await ethers.getSigners();
+  const net = await ethers.provider.getNetwork();
+
+  if (net.chainId !== 46630n) {
+    throw new Error(`Expected Robinhood testnet (46630), got ${net.chainId}.`);
+  }
+
+  const uniPath = path.join(__dirname, "..", "uniswap-testnet.json");
+  if (!fs.existsSync(uniPath)) {
+    throw new Error("uniswap-testnet.json not found — run deploy-uniswap-testnet.js first.");
+  }
+  const uni = JSON.parse(fs.readFileSync(uniPath, "utf8"));
+
+  const balance = await ethers.provider.getBalance(deployer.address);
+
+  console.log("=".repeat(70));
+  console.log("Covenza -> Robinhood Chain testnet, against real Uniswap V3");
+  console.log("=".repeat(70));
+  console.log(`\nDeployer  ${deployer.address}`);
+  console.log(`Balance   ${ethers.formatEther(balance)} ETH`);
+  console.log(`\nUniswap factory  ${uni.uniswapFactory}`);
+  console.log(`SwapRouter02     ${uni.swapRouter}`);
+  console.log(`tUSDG            ${uni.tokens.tUSDG}`);
+  console.log(`tWETH            ${uni.tokens.tWETH}`);
+
+  if (balance < MIN_BALANCE(ethers)) {
+    throw new Error(
+      `Balance too low — VaultFactory alone is a large deployment. ` +
+      `Claim from the faucet and retry.`
+    );
+  }
+
+  const usdg = uni.tokens.tUSDG;
+  const weth = uni.tokens.tWETH;
+
+  // --- 1. KYCRegistry (fresh — nothing exists on this chain) -----------
+
+  const kyc = await (await ethers.getContractFactory("KYCRegistry", deployer))
+    .deploy(deployer.address, deployer.address);
+  await kyc.waitForDeployment();
+  console.log(`\nKYCRegistry     ${await kyc.getAddress()}`);
+
+  await (await kyc.verify(borrower.address)).wait();
+  console.log(`  verified borrower ${borrower.address}`);
+
+  // --- 2. ERC-4626 yield venue over tUSDG ------------------------------
+  //
+  // Stands in for a MetaMorpho vault until one is confirmed on this chain.
+  // Deploying it now means the 4626 path is exercised on-chain rather than
+  // only in the local suite — and it is the path that will actually be used
+  // in production, since Aave is not here.
+
+  const venue = await (await ethers.getContractFactory("MockERC4626", deployer)).deploy(usdg);
+  await venue.waitForDeployment();
+  const venueAddress = await venue.getAddress();
+  console.log(`\nERC-4626 venue  ${venueAddress} (over tUSDG)`);
+
+  // --- 3. InsurancePool -------------------------------------------------
+
+  const pool = await (await ethers.getContractFactory("InsurancePool", deployer))
+    .deploy(deployer.address, INSURANCE_DRAW_CAP_BPS);
+  await pool.waitForDeployment();
+  console.log(`InsurancePool   ${await pool.getAddress()}`);
+
+  // --- 4. AssetRegistry, pointed at REAL Uniswap -----------------------
+  //
+  // The Aave pool argument is a placeholder: the constructor rejects zero,
+  // but nothing reads it unless an asset is given the Aave venue, and none is.
+
+  const registry = await (await ethers.getContractFactory("AssetRegistry", deployer)).deploy(
+    deployer.address,
+    deployer.address,      // aavePool placeholder — Aave is not on this chain
+    uni.swapRouter,
+    uni.uniswapFactory,
+    weth
+  );
+  await registry.waitForDeployment();
+  console.log(`AssetRegistry   ${await registry.getAddress()}`);
+
+  // tUSDG earns yield through the 4626 venue; tWETH is swap-only. Neither
+  // carries a grace extension — both are continuously tradeable. Stock
+  // tokens are where extensions apply.
+  await (await registry.addAssetWithVenue(
+    usdg, ethers.ZeroAddress, VENUE_4626, venueAddress, 0
+  )).wait();
+  await (await registry.addAssetWithVenue(
+    weth, ethers.ZeroAddress, VENUE_NONE, ethers.ZeroAddress, 0
+  )).wait();
+  console.log("  whitelisted tUSDG (ERC-4626 venue) and tWETH (swap-only)");
+
+  await (await registry.setSettlementConfig(
+    TWAP_WINDOW_SECONDS, TWAP_TOLERANCE_BPS, GRACE_PERIOD_SECONDS,
+    BOUNTY_RATE_PER_HOUR_BPS, BOUNTY_CAP_BPS
+  )).wait();
+  console.log(`  settlement config set (twapWindow ${TWAP_WINDOW_SECONDS}s — see header)`);
+
+  // --- 5. VaultFactory ---------------------------------------------------
+
+  const treasury = process.env.TREASURY_ADDRESS || deployer.address;
+  if (!process.env.TREASURY_ADDRESS) {
+    console.log("\n  TREASURY_ADDRESS unset — protocol fees will go to the deployer.");
+  }
+
+  const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
+    await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury
+  );
+  await factory.waitForDeployment();
+  console.log(`\nVaultFactory    ${await factory.getAddress()}`);
+
+  await (await pool.setVaultFactory(await factory.getAddress())).wait();
+  console.log("  InsurancePool wired to factory");
+
+  // --- 6. Confirm the guard agrees with reality ------------------------
+  //
+  // The most valuable line of output here. canQuote() is what stops a
+  // borrower entering a position settlement could not exit, and this is it
+  // being evaluated against real Uniswap rather than against a mock.
+
+  console.log("\n" + "-".repeat(70));
+  console.log("Verifying the TWAP guard against the real pool:");
+
+  // canQuote is an internal library function with no external surface, so
+  // probe the pool with the exact call the library makes.
+  const poolAbi = ["function observe(uint32[]) view returns (int56[], uint160[])"];
+  const poolContract = await ethers.getContractAt(poolAbi, uni.pools[0].address);
+
+  for (const w of [TWAP_WINDOW_SECONDS, 1800]) {
+    try {
+      await poolContract.observe([w, 0]);
+      console.log(`  ${String(w).padStart(4)}s window: quotable`);
+    } catch {
+      console.log(`  ${String(w).padStart(4)}s window: NOT quotable — swaps at this window would be refused`);
+    }
+  }
+
+  // --- 7. Seed balances -------------------------------------------------
+
+  const Mock = await ethers.getContractFactory("MockERC20", deployer);
+  const usdgToken = Mock.attach(usdg);
+  const wethToken = Mock.attach(weth);
+
+  await (await usdgToken.mint(deployer.address, ethers.parseEther("100000"))).wait();
+  await (await usdgToken.mint(borrower.address, ethers.parseEther("1000"))).wait();
+  await (await wethToken.mint(borrower.address, ethers.parseEther("10"))).wait();
+  console.log("\nSeeded tUSDG/tWETH to deployer and borrower");
+
+  const seed = ethers.parseEther("2000");
+  await (await usdgToken.approve(await pool.getAddress(), seed)).wait();
+  await (await pool.fund(usdg, seed)).wait();
+  console.log("Insurance pool seeded with 2,000 tUSDG");
+
+  // --- 8. Persist --------------------------------------------------------
+
+  const addressesPath = path.join(__dirname, "..", "deployed-addresses.json");
+  const all = fs.existsSync(addressesPath)
+    ? JSON.parse(fs.readFileSync(addressesPath, "utf8"))
+    : {};
+
+  all.robinhoodTestnet = {
+    chainId: 46630,
+    kycRegistry:    await kyc.getAddress(),
+    assetRegistry:  await registry.getAddress(),
+    insurancePool:  await pool.getAddress(),
+    vaultFactory:   await factory.getAddress(),
+    treasury,
+    yieldVenue4626: venueAddress,
+    verifiedBorrower: borrower.address,
+    keeper: keeper ? keeper.address : null,
+    tokens: { tUSDG: usdg, tWETH: weth },
+    uniswap: {
+      factory: uni.uniswapFactory,
+      router: uni.swapRouter,
+      pool: uni.pools[0].address,
+      note: "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js",
+    },
+    twapWindow: TWAP_WINDOW_SECONDS,
+    deployedAt: new Date().toISOString(),
+  };
+
+  fs.writeFileSync(addressesPath, JSON.stringify(all, null, 2));
+
+  const spent = balance - (await ethers.provider.getBalance(deployer.address));
+
+  console.log("\n" + "=".repeat(70));
+  console.log("deployed-addresses.json updated (robinhoodTestnet)");
+  console.log(`Gas spent: ${ethers.formatEther(spent)} ETH`);
+  console.log(`Remaining: ${ethers.formatEther(await ethers.provider.getBalance(deployer.address))} ETH`);
+  console.log(`\nExplorer: https://explorer.testnet.chain.robinhood.com/address/${await factory.getAddress()}`);
+  console.log("=".repeat(70));
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exitCode = 1;
+});
