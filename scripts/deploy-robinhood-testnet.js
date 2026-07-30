@@ -38,8 +38,8 @@ const VENUE_NONE = 0;
 const VENUE_4626 = 2;
 
 // Whatever the deployer has left after the Uniswap deployment needs to cover
-// VaultFactory, which is the expensive one — it embeds the full Vault
-// creation bytecode.
+// the Vault implementation, which is now the largest single deployment here —
+// VaultFactory only clones it, so the factory itself is small.
 const MIN_BALANCE = ethers => ethers.parseEther("0.0015");
 
 async function main() {
@@ -147,16 +147,19 @@ async function main() {
     console.log("\n  TREASURY_ADDRESS unset — protocol fees will go to the deployer.");
   }
 
-  // UniswapTwap is a deployed library now, not inlined — VaultFactory
-  // embeds Vault, which delegatecalls into it, so the address must be
-  // linked at deploy time.
+  // Vaults are EIP-1167 clones of one implementation, so the factory no
+  // longer embeds Vault bytecode and needs no library link. The
+  // IMPLEMENTATION does — it delegatecalls UniswapTwap.
   const twapLib = await (await ethers.getContractFactory("UniswapTwap", deployer)).deploy();
   await twapLib.waitForDeployment();
-  const factory = await (await ethers.getContractFactory("VaultFactory", {
+  const vaultImpl = await (await ethers.getContractFactory("Vault", {
     signer: deployer,
     libraries: { UniswapTwap: await twapLib.getAddress() },
-  })).deploy(
-    await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury
+  })).deploy();
+  await vaultImpl.waitForDeployment();
+  const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
+    await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury,
+      await vaultImpl.getAddress()   // clone source
   );
   await factory.waitForDeployment();
   console.log(`\nVaultFactory    ${await factory.getAddress()}`);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@openzeppelin/contracts/proxy/Clones.sol";
+
 import "./Vault.sol";
 import "./KYCRegistry.sol";
 import "./AssetRegistry.sol";
@@ -124,22 +126,42 @@ contract VaultFactory {
 
     // --- Constructor ---
 
+    /**
+     * @notice The Vault implementation every vault is cloned from.
+     *
+     * @dev Passed in rather than deployed here, and that is the entire point.
+     *      `new Vault(...)` embedded Vault's full creation bytecode in this
+     *      contract, which took the factory to 25,106 bytes against the
+     *      24,576-byte EIP-170 limit — undeployable, and growing with every
+     *      addition to Vault. Referencing the type to call initialize() costs
+     *      nothing; constructing it cost kilobytes.
+     *
+     *      Fixed at construction. Making it mutable would let the owner
+     *      repoint every future vault to arbitrary code, which is a much
+     *      larger power than any other setter here grants.
+     */
+    address public immutable vaultImplementation;
+
     constructor(
         address _kycRegistry,
         address _assetRegistry,
         address _insurancePool,
-        address _treasury
+        address _treasury,
+        address _vaultImplementation
     ) {
-        require(_kycRegistry != address(0),   "Invalid KYC registry address");
-        require(_assetRegistry != address(0), "Invalid asset registry address");
-        require(_insurancePool != address(0), "Invalid insurance pool address");
-        require(_treasury != address(0),      "Invalid treasury address");
+        require(_kycRegistry != address(0),         "Invalid KYC registry address");
+        require(_assetRegistry != address(0),       "Invalid asset registry address");
+        require(_insurancePool != address(0),       "Invalid insurance pool address");
+        require(_treasury != address(0),            "Invalid treasury address");
+        require(_vaultImplementation != address(0), "Invalid vault implementation address");
+        require(_vaultImplementation.code.length > 0, "Vault implementation has no code");
 
-        kycRegistry   = KYCRegistry(_kycRegistry);
-        assetRegistry = AssetRegistry(_assetRegistry);
-        insurancePool = InsurancePool(_insurancePool);
-        treasury      = _treasury;
-        owner         = msg.sender;
+        kycRegistry         = KYCRegistry(_kycRegistry);
+        assetRegistry       = AssetRegistry(_assetRegistry);
+        insurancePool       = InsurancePool(_insurancePool);
+        treasury            = _treasury;
+        vaultImplementation = _vaultImplementation;
+        owner               = msg.sender;
     }
 
     // --- Modifiers ---
@@ -190,21 +212,29 @@ contract VaultFactory {
         require(_duration > 0,      "Duration must be greater than zero");
         require(_depositAmount > 0, "Deposit must be greater than zero");
 
-        // --- Deploy vault, snapshotting current fee terms ---
-        // The snapshot matters: a vault must never re-read the factory's
-        // live rate at settlement, or the owner could raise the rate after
-        // a loan is originated and retroactively take a larger cut.
-        Vault vault = new Vault(
-            _asset,
-            msg.sender,
-            _borrower,
-            _principal,
-            _aprBps,
-            _duration,
-            _useSeconds,
-            _depositAmount,
-            address(assetRegistry),
-            address(insurancePool),
+        // --- Clone a vault, snapshotting current fee terms ---
+        //
+        // The snapshot matters: a vault must never re-read the factory's live
+        // rate at settlement, or the owner could raise the rate after a loan is
+        // originated and retroactively take a larger cut.
+        //
+        // Clone and initialise atomically. Initialisation MUST happen in this
+        // same transaction — an uninitialised clone is claimable by whoever
+        // calls initialize() first, and there is no window here for that.
+        address vaultAddress = Clones.clone(vaultImplementation);
+        Vault(vaultAddress).initialize(
+            LoanTerms({
+                asset:         _asset,
+                lender:        msg.sender,
+                borrower:      _borrower,
+                principal:     _principal,
+                aprBps:        _aprBps,
+                duration:      _duration,
+                useSeconds:    _useSeconds,
+                depositAmount: _depositAmount,
+                registry:      address(assetRegistry),
+                insurancePool: address(insurancePool)
+            }),
             FeeConfig({
                 treasury:           treasury,
                 referrer:           _referrer,
@@ -213,7 +243,6 @@ contract VaultFactory {
                 minimumFeeBps:      minimumFeeBps
             })
         );
-        address vaultAddress = address(vault);
 
         // --- Fund vault with principal (pulled from the lender) ---
         require(
@@ -242,7 +271,7 @@ contract VaultFactory {
 
         emit VaultDeployed(
             vaultAddress, msg.sender, _borrower, _asset,
-            _principal, _depositAmount, _aprBps, skim, vault.deadline()
+            _principal, _depositAmount, _aprBps, skim, Vault(vaultAddress).deadline()
         );
 
         return vaultAddress;

@@ -68,14 +68,20 @@ describe("Annualised interest", function () {
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000);
 
+    // Vaults are EIP-1167 clones of one implementation, so the factory no
+    // longer embeds Vault bytecode and needs no library link. The
+    // IMPLEMENTATION does — it delegatecalls UniswapTwap.
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
-    const factory = await (await ethers.getContractFactory("VaultFactory", {
+    const vaultImpl = await (await ethers.getContractFactory("Vault", {
       signer: operator,
       libraries: { UniswapTwap: await twapLib.getAddress() },
-    })).deploy(
+    })).deploy();
+    await vaultImpl.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
-      treasury.address
+      treasury.address,
+      await vaultImpl.getAddress()   // clone source
     );
     await pool.setVaultFactory(await factory.getAddress());
 

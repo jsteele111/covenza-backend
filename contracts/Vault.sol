@@ -122,6 +122,31 @@ interface ISwapRouter {
  *         raise the rate after a loan is live and retroactively take a
  *         larger cut. Terms are fixed at the moment both parties commit.
  */
+/**
+ * @notice The loan's terms, passed to initialize() as one memory struct.
+ *
+ * @dev Same reason FeeConfig exists, one step further. Eleven separate
+ *      arguments fitted inside a constructor's frame, but initialize() is an
+ *      EXTERNAL call — the caller must hold every argument live on the stack
+ *      while making it, and VaultFactory.deployVault already has eight
+ *      parameters plus locals of its own. That combination overflowed.
+ *
+ *      A memory struct costs the caller a single stack slot: a pointer. So
+ *      what were eleven live values become two.
+ */
+struct LoanTerms {
+    address asset;
+    address lender;
+    address borrower;
+    uint256 principal;
+    uint256 aprBps;
+    uint256 duration;
+    bool    useSeconds;      // treat duration as seconds rather than days
+    uint256 depositAmount;
+    address registry;
+    address insurancePool;
+}
+
 struct FeeConfig {
     address treasury;             // protocol fee recipient
     address referrer;             // integrator that sourced this loan; address(0) if none
@@ -221,51 +246,69 @@ contract Vault {
     // --- Constructor ---
 
     /**
-     * @dev Deployed exclusively by VaultFactory, which transfers `_principal`
-     *      of `_asset` to this vault within the same transaction. The vault
-     *      trusts the factory for funding — the factory is the only
-     *      authorised deployer, and its code guarantees the transfer.
+     * @dev Locks this contract against initialisation.
+     *
+     *      Vaults are now minimal proxies (EIP-1167) cloned from a single
+     *      deployed implementation, because VaultFactory previously embedded
+     *      Vault's entire creation bytecode and had grown to 25,106 bytes
+     *      against the 24,576-byte EIP-170 limit — undeployable. Cloning makes
+     *      factory size constant no matter how large Vault becomes.
+     *
+     *      Clones do not run constructors, so every clone starts with
+     *      factory == address(0) and can be initialised exactly once. This
+     *      implementation gets a non-zero factory, so initialize() reverts on
+     *      it. Seizing the implementation could not affect existing clones
+     *      (their storage is their own) but leaving it open serves no purpose.
      */
-    constructor(
-        address _asset,
-        address _lender,
-        address _borrower,
-        uint256 _principal,
-        uint256 _aprBps,
-        uint256 _duration,
-        bool    _useSeconds,
-        uint256 _depositAmount,
-        address _registry,
-        address _insurancePool,
+    constructor() {
+        factory = address(this);
+    }
+
+    /**
+     * @notice Sets up a freshly cloned vault. Callable exactly once, by the
+     *         factory, in the same transaction as the clone.
+     *
+     * @dev Replaces the former constructor. The factory transfers `_principal`
+     *      of `_asset` to this vault within the same transaction — the vault
+     *      trusts the factory for funding, the factory is the only authorised
+     *      initialiser, and its code guarantees the transfer.
+     *
+     *      The `factory == address(0)` guard is both the re-initialisation
+     *      check and the storage it would otherwise need: an initialised vault
+     *      always has a factory, so no separate flag is required.
+     */
+    function initialize(
+        LoanTerms memory _terms,
         FeeConfig memory _feeConfig
-    ) {
-        require(_asset != address(0),         "Invalid asset address");
-        require(_lender != address(0),        "Invalid lender address");
-        require(_borrower != address(0),      "Invalid borrower address");
-        require(_principal > 0,               "Principal must be greater than zero");
-        require(_aprBps > 0,                  "APR must be greater than zero");
-        require(_duration > 0,                "Duration must be greater than zero");
-        require(_depositAmount > 0,           "Deposit must be greater than zero");
-        require(_registry != address(0),      "Invalid registry address");
-        require(_insurancePool != address(0), "Invalid insurance pool address");
+    ) external {
+        require(factory == address(0),               "Already initialised");
+        require(_terms.asset != address(0),          "Invalid asset address");
+        require(_terms.lender != address(0),         "Invalid lender address");
+        require(_terms.borrower != address(0),       "Invalid borrower address");
+        require(_terms.principal > 0,                "Principal must be greater than zero");
+        require(_terms.aprBps > 0,                   "APR must be greater than zero");
+        require(_terms.duration > 0,                 "Duration must be greater than zero");
+        require(_terms.depositAmount > 0,            "Deposit must be greater than zero");
+        require(_terms.registry != address(0),       "Invalid registry address");
+        require(_terms.insurancePool != address(0),  "Invalid insurance pool address");
 
         factory          = msg.sender;
-        asset            = _asset;
-        lender           = _lender;
-        borrower         = _borrower;
-        principal        = _principal;
-        aprBps           = _aprBps;
-        _requiredDeposit = _depositAmount;
+        asset            = _terms.asset;
+        lender           = _terms.lender;
+        borrower         = _terms.borrower;
+        principal        = _terms.principal;
+        aprBps           = _terms.aprBps;
+        _requiredDeposit = _terms.depositAmount;
 
         // Term is stored explicitly rather than derived from deadline, because
         // pro-rata accrual needs both the start and the length, and deriving
         // one from the other at settlement would mean trusting block.timestamp
         // arithmetic done twice.
         originatedAt     = block.timestamp;
-        term             = _useSeconds ? _duration : _duration * 1 days;
+        term             = _terms.useSeconds ? _terms.duration : _terms.duration * 1 days;
         deadline         = originatedAt + term;
-        registry         = AssetRegistry(_registry);
-        insurancePool    = InsurancePool(_insurancePool);
+        registry         = AssetRegistry(_terms.registry);
+        insurancePool    = InsurancePool(_terms.insurancePool);
 
         // Fee terms are snapshotted, not referenced. No require() here: a
         // zero treasury or zero rate simply means no protocol fee is taken,
@@ -276,7 +319,10 @@ contract Vault {
         referrerShareBps   = _feeConfig.referrerShareBps;
         minimumFeeBps      = _feeConfig.minimumFeeBps;
 
-        emit VaultInitialised(_lender, _borrower, _asset, _principal, _depositAmount, _aprBps, deadline);
+        emit VaultInitialised(
+            _terms.lender, _terms.borrower, _terms.asset,
+            _terms.principal, _terms.depositAmount, _terms.aprBps, deadline
+        );
     }
 
     // --- Deposit ---

@@ -105,19 +105,22 @@ async function main() {
   }
 
   // --- Deploy the new factory ---
-  // UniswapTwap is a deployed library now, not inlined — VaultFactory
-  // embeds Vault, which delegatecalls into it, so the address must be
-  // linked at deploy time.
+  // Vaults are EIP-1167 clones of one implementation, so the factory no
+  // longer embeds Vault bytecode and needs no library link. The
+  // IMPLEMENTATION does — it delegatecalls UniswapTwap.
   const twapLib = await (await hre.ethers.getContractFactory("UniswapTwap", deployer)).deploy();
   await twapLib.waitForDeployment();
-  const factory = await (await hre.ethers.getContractFactory("VaultFactory", {
+  const vaultImpl = await (await hre.ethers.getContractFactory("Vault", {
     signer: deployer,
     libraries: { UniswapTwap: await twapLib.getAddress() },
-  })).deploy(
+  })).deploy();
+  await vaultImpl.waitForDeployment();
+  const factory = await (await hre.ethers.getContractFactory("VaultFactory", deployer)).deploy(
     existing.kycRegistry,
     existing.assetRegistry,
     existing.insurancePool,
-    treasury
+    treasury,
+      await vaultImpl.getAddress()   // clone source
   );
   await factory.waitForDeployment();
   const factoryAddress = await factory.getAddress();

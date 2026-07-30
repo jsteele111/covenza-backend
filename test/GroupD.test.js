@@ -78,17 +78,20 @@ describe("Group D — guard rails and edge cases", function () {
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000);
 
-    // UniswapTwap is a deployed library now, not inlined — VaultFactory
-    // embeds Vault, which delegatecalls into it, so the address must be
-    // linked at deploy time.
+    // Vaults are EIP-1167 clones of one implementation, so the factory no
+    // longer embeds Vault bytecode and needs no library link. The
+    // IMPLEMENTATION does — it delegatecalls UniswapTwap.
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
-    const factory = await (await ethers.getContractFactory("VaultFactory", {
+    const vaultImpl = await (await ethers.getContractFactory("Vault", {
       signer: operator,
       libraries: { UniswapTwap: await twapLib.getAddress() },
-    })).deploy(
+    })).deploy();
+    await vaultImpl.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
-      operator.address                        // protocol fee treasury
+      operator.address,                       // protocol fee treasury
+      await vaultImpl.getAddress()            // clone source
     );
     await pool.setVaultFactory(await factory.getAddress());
 

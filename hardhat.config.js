@@ -27,24 +27,25 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        // Optimises for DEPLOYMENT SIZE over runtime gas. VaultFactory embeds
-        // the full Vault creation bytecode, so factory size is the binding
-        // constraint (24,576-byte Spurious Dragon limit, enforced on Arbitrum
-        // and Orbit chains too).
+        // Back to a runtime-gas bias now that size pressure is gone.
         //
-        // Dropped from 200 to 1 when the factory hit 25,106 bytes after the
-        // yield-venue and annualised-interest work. 1 is the most size-biased
-        // setting available.
+        // History worth keeping, because it explains two structural decisions
+        // in the contracts. VaultFactory used to embed Vault's entire creation
+        // bytecode via `new Vault(...)`, and reached 25,106 bytes against the
+        // 24,576-byte EIP-170 limit — undeployable. Dropping runs from 200 to 1
+        // recovered only 93 bytes, which made clear the optimizer was never the
+        // answer. What actually fixed it:
         //
-        // Worth knowing this is a delaying tactic, not a fix: every addition to
-        // Vault pushes the factory back toward the ceiling, and the risk-tier
-        // and exposure-cap work still to come is all Vault logic. The durable
-        // answer is a clone factory — deploy one Vault implementation and have
-        // the factory produce minimal proxies of it, which makes factory size
-        // constant. That needs Vault to become initialisable rather than
-        // constructor-configured, so it is a deliberate refactor rather than
-        // something to attempt while unblocking a test run.
-        runs: 1,
+        //   - UniswapTwap became a deployed library rather than inlined code,
+        //     moving the vendored tick math out of Vault  (-2,785 bytes)
+        //   - VaultFactory clones a Vault implementation instead of
+        //     constructing one, so it holds no Vault bytecode at all
+        //     (22,228 -> 6,320 bytes)
+        //
+        // Vault is now the contract to watch, at ~16.1KB. scripts/check-sizes.js
+        // reports headroom; `hardhat compile` does NOT enforce the limit, so an
+        // oversized contract compiles cleanly and fails only at deployment.
+        runs: 200,
       },
     },
   },
