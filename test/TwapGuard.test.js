@@ -84,7 +84,15 @@ describe("TWAP availability guard", function () {
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000);
 
-    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+    // UniswapTwap is a deployed library now, not inlined — VaultFactory
+    // embeds Vault, which delegatecalls into it, so the address must be
+    // linked at deploy time.
+    const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+    await twapLib.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", {
+      signer: operator,
+      libraries: { UniswapTwap: await twapLib.getAddress() },
+    })).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address
     );
@@ -96,8 +104,7 @@ describe("TWAP availability guard", function () {
       await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
       ethers.ZeroAddress
     );
-    const vault = (await ethers.getContractFactory("Vault", operator))
-      .attach(await factory.allVaults(0));
+    const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
 
     await weth.mint(borrower.address, DEPOSIT);
     await weth.connect(borrower).approve(await vault.getAddress(), DEPOSIT);

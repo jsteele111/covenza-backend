@@ -127,6 +127,7 @@ struct FeeConfig {
     address referrer;             // integrator that sourced this loan; address(0) if none
     uint256 protocolFeeRateBps;   // protocol fee, in bps of the loan's fee
     uint256 referrerShareBps;     // referrer's share of the protocol fee, in bps
+    uint256 minimumFeeBps;        // floor on the interest charge, in bps of principal
 }
 
 contract Vault {
@@ -144,7 +145,22 @@ contract Vault {
     address public borrower;
     uint256 public principal;
     uint256 public deposit;         // amount actually paid (0 until payDeposit)
-    uint256 public feeRateBps;
+    /**
+     * @notice Interest rate, ANNUALISED, in basis points. 300 = 3% per year.
+     *
+     * @dev    Renamed from feeRateBps in the move to annualised interest. The
+     *         old name described a flat charge applied regardless of duration,
+     *         which meant a 7-day loan and a 365-day loan at "3%" cost the
+     *         borrower the same amount — not how credit works anywhere.
+     *
+     *         Kept as a rename rather than an alias precisely because the
+     *         semantics changed. A feeRateBps() that returned an APR would be
+     *         actively misleading to anything still reading it.
+     */
+    uint256 public aprBps;
+
+    uint256 public originatedAt;   // when the clock started
+    uint256 public term;           // loan length in seconds; deadline = originatedAt + term
     uint256 public deadline;
     bool    public isSettled;
 
@@ -156,6 +172,7 @@ contract Vault {
     address public referrer;
     uint256 public protocolFeeRateBps;
     uint256 public referrerShareBps;
+    uint256 public minimumFeeBps;
 
     // --- Yield venue (snapshotted at first supply, never re-read) ---
     //
@@ -188,7 +205,7 @@ contract Vault {
     // --- Events ---
 
     event VaultInitialised(address indexed lender, address indexed borrower, address indexed asset,
-        uint256 principal, uint256 requiredDeposit, uint256 feeRateBps, uint256 deadline);
+        uint256 principal, uint256 requiredDeposit, uint256 aprBps, uint256 deadline);
     event DepositReceived(address indexed borrower, uint256 amount);
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, bool isSwapBack);
     event AaveSupplied(uint256 amount, uint256 timestamp);
@@ -214,7 +231,7 @@ contract Vault {
         address _lender,
         address _borrower,
         uint256 _principal,
-        uint256 _feeRateBps,
+        uint256 _aprBps,
         uint256 _duration,
         bool    _useSeconds,
         uint256 _depositAmount,
@@ -226,7 +243,7 @@ contract Vault {
         require(_lender != address(0),        "Invalid lender address");
         require(_borrower != address(0),      "Invalid borrower address");
         require(_principal > 0,               "Principal must be greater than zero");
-        require(_feeRateBps > 0,              "Fee rate must be greater than zero");
+        require(_aprBps > 0,                  "APR must be greater than zero");
         require(_duration > 0,                "Duration must be greater than zero");
         require(_depositAmount > 0,           "Deposit must be greater than zero");
         require(_registry != address(0),      "Invalid registry address");
@@ -237,10 +254,16 @@ contract Vault {
         lender           = _lender;
         borrower         = _borrower;
         principal        = _principal;
-        feeRateBps       = _feeRateBps;
+        aprBps           = _aprBps;
         _requiredDeposit = _depositAmount;
-        deadline         = _useSeconds ? block.timestamp + _duration
-                                       : block.timestamp + (_duration * 1 days);
+
+        // Term is stored explicitly rather than derived from deadline, because
+        // pro-rata accrual needs both the start and the length, and deriving
+        // one from the other at settlement would mean trusting block.timestamp
+        // arithmetic done twice.
+        originatedAt     = block.timestamp;
+        term             = _useSeconds ? _duration : _duration * 1 days;
+        deadline         = originatedAt + term;
         registry         = AssetRegistry(_registry);
         insurancePool    = InsurancePool(_insurancePool);
 
@@ -251,11 +274,57 @@ contract Vault {
         referrer           = _feeConfig.referrer;
         protocolFeeRateBps = _feeConfig.protocolFeeRateBps;
         referrerShareBps   = _feeConfig.referrerShareBps;
+        minimumFeeBps      = _feeConfig.minimumFeeBps;
 
-        emit VaultInitialised(_lender, _borrower, _asset, _principal, _depositAmount, _feeRateBps, deadline);
+        emit VaultInitialised(_lender, _borrower, _asset, _principal, _depositAmount, _aprBps, deadline);
     }
 
     // --- Deposit ---
+
+    // --- Interest ---
+
+    uint256 private constant YEAR = 365 days;
+
+    /// @notice Interest owed if the loan runs its full term. This is the
+    ///         figure the lender is quoted, and the basis for the insurance
+    ///         skim taken at origination.
+    function fullTermFee() public view returns (uint256) {
+        return (principal * aprBps * term) / (10000 * YEAR);
+    }
+
+    /**
+     * @notice Interest owed as of now — pro-rata on time actually elapsed,
+     *         floored, and never more than the full term's worth.
+     *
+     * @dev    Three properties, each deliberate:
+     *
+     *         PRO-RATA, because an annualised rate that charged a full year on
+     *         a one-week loan would make early settlement so punitive nobody
+     *         would ever use it.
+     *
+     *         FLOORED at minimumFeeBps of principal, because pure pro-rata
+     *         lets a borrower originate and settle in the same block having
+     *         paid essentially nothing for the capital they briefly held.
+     *
+     *         CAPPED at fullTermFee, so the floor can never charge more than
+     *         running the loan to term would have. Without that cap a short
+     *         loan's floor could exceed its own maximum interest, which is
+     *         incoherent — and it means the floor simply doesn't bite on very
+     *         short loans, where there is little to game anyway.
+     */
+    function accruedFee() public view returns (uint256) {
+        uint256 full = fullTermFee();
+
+        uint256 elapsed = block.timestamp - originatedAt;
+        if (elapsed >= term) { return full; }
+
+        uint256 pro = (principal * aprBps * elapsed) / (10000 * YEAR);
+
+        uint256 floor = (principal * minimumFeeBps) / 10000;
+        if (floor > full) { floor = full; }
+
+        return pro > floor ? pro : floor;
+    }
 
     function requiredDeposit() external view returns (uint256) { return _requiredDeposit; }
     function depositPaid()     public  view returns (bool)     { return deposit >= _requiredDeposit; }
@@ -520,7 +589,9 @@ contract Vault {
     ///      protocol revenue.
     function _distribute(bool early, uint256 bounty) internal {
         uint256 totalReturned = IERC20(asset).balanceOf(address(this));
-        uint256 fee          = (principal * feeRateBps) / 10000;
+        // Interest as of settlement, not the full term's worth. A borrower who
+        // closes on day 30 of a 365-day loan owes 30 days of interest.
+        uint256 fee          = accruedFee();
         uint256 lenderTarget = principal + fee;
 
         if (early) {

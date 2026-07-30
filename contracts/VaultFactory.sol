@@ -76,6 +76,25 @@ contract VaultFactory {
     uint256 public constant MAX_PROTOCOL_FEE_RATE_BPS = 2000;  // 20% of the loan fee
     uint256 public constant MAX_REFERRER_SHARE_BPS    = 5000;  // 50% of the protocol fee
 
+    // --- Minimum interest charge ---
+
+    /**
+     * @notice Floor on the interest a borrower owes, in bps of principal.
+     *
+     * @dev    Exists because interest is now annualised and accrues pro-rata,
+     *         which without a floor lets a borrower originate and settle in the
+     *         same block having paid essentially nothing for capital they did
+     *         genuinely hold.
+     *
+     *         The vault caps this at the loan's own full-term interest, so on
+     *         very short loans it simply does not bite — there is little to
+     *         extract from a loan whose entire term's interest is smaller than
+     *         the floor anyway.
+     */
+    uint256 public minimumFeeBps = 10;  // 0.1% of principal
+
+    uint256 public constant MAX_MINIMUM_FEE_BPS = 200;  // 2% of principal
+
     // --- Vault tracking ---
 
     address[] public allVaults;
@@ -91,7 +110,7 @@ contract VaultFactory {
         address asset,
         uint256 principal,
         uint256 depositRequired,
-        uint256 feeRateBps,
+        uint256 aprBps,
         uint256 insuranceSkim,
         uint256 deadline
     );
@@ -101,6 +120,7 @@ contract VaultFactory {
     event TreasuryUpdated(address indexed previousTreasury, address indexed newTreasury);
     event ProtocolFeeRateUpdated(uint256 previousBps, uint256 newBps);
     event ReferrerShareUpdated(uint256 previousBps, uint256 newBps);
+    event MinimumFeeUpdated(uint256 previousBps, uint256 newBps);
 
     // --- Constructor ---
 
@@ -140,7 +160,8 @@ contract VaultFactory {
      * @param _asset         The loan's denomination — must be whitelisted.
      * @param _borrower      Borrower's wallet address — must be KYC verified.
      * @param _principal     Loan principal, in the asset's own units.
-     * @param _feeRateBps    Fixed fee rate in basis points.
+     * @param _aprBps        ANNUALISED interest rate in basis points. 300 = 3%
+     *                       per year, accrued pro-rata over the loan's term.
      * @param _duration      Loan duration (days, or seconds if _useSeconds).
      * @param _useSeconds    True for testnet short durations.
      * @param _depositAmount Required deposit, in the same asset.
@@ -152,7 +173,7 @@ contract VaultFactory {
         address _asset,
         address _borrower,
         uint256 _principal,
-        uint256 _feeRateBps,
+        uint256 _aprBps,
         uint256 _duration,
         bool    _useSeconds,
         uint256 _depositAmount,
@@ -165,7 +186,7 @@ contract VaultFactory {
 
         // --- Basic validation ---
         require(_principal > 0,     "Principal must be greater than zero");
-        require(_feeRateBps > 0,    "Fee rate must be greater than zero");
+        require(_aprBps > 0,        "APR must be greater than zero");
         require(_duration > 0,      "Duration must be greater than zero");
         require(_depositAmount > 0, "Deposit must be greater than zero");
 
@@ -178,7 +199,7 @@ contract VaultFactory {
             msg.sender,
             _borrower,
             _principal,
-            _feeRateBps,
+            _aprBps,
             _duration,
             _useSeconds,
             _depositAmount,
@@ -188,7 +209,8 @@ contract VaultFactory {
                 treasury:           treasury,
                 referrer:           _referrer,
                 protocolFeeRateBps: protocolFeeRateBps,
-                referrerShareBps:   referrerShareBps
+                referrerShareBps:   referrerShareBps,
+                minimumFeeBps:      minimumFeeBps
             })
         );
         address vaultAddress = address(vault);
@@ -200,7 +222,7 @@ contract VaultFactory {
         );
 
         // --- Insurance skim: pull from lender, fund the pool ---
-        uint256 skim = quoteInsuranceSkim(_principal, _feeRateBps);
+        uint256 skim = quoteInsuranceSkim(_principal, _aprBps, _duration, _useSeconds);
         if (skim > 0) {
             require(
                 IERC20(_asset).transferFrom(msg.sender, address(this), skim),
@@ -220,7 +242,7 @@ contract VaultFactory {
 
         emit VaultDeployed(
             vaultAddress, msg.sender, _borrower, _asset,
-            _principal, _depositAmount, _feeRateBps, skim, vault.deadline()
+            _principal, _depositAmount, _aprBps, skim, vault.deadline()
         );
 
         return vaultAddress;
@@ -228,12 +250,41 @@ contract VaultFactory {
 
     // --- Quoting ---
 
-    /// @notice The insurance skim for a given principal and fee rate —
-    ///         the extra amount (beyond principal) the lender must approve.
-    function quoteInsuranceSkim(uint256 _principal, uint256 _feeRateBps)
-        public view returns (uint256)
-    {
-        uint256 fee = (_principal * _feeRateBps) / 10000;
+    /**
+     * @notice Interest for the FULL term at the given annualised rate.
+     *
+     * @dev    Duration is now part of the quote, which it was not when the fee
+     *         was flat. Both the skim and the protocol fee are percentages of
+     *         the interest, so both annualise for free once this does — no
+     *         change to either mechanism was needed.
+     */
+    function quoteFullTermFee(
+        uint256 _principal,
+        uint256 _aprBps,
+        uint256 _duration,
+        bool    _useSeconds
+    ) public pure returns (uint256) {
+        uint256 term = _useSeconds ? _duration : _duration * 1 days;
+        return (_principal * _aprBps * term) / (10000 * 365 days);
+    }
+
+    /**
+     * @notice The insurance skim for the given terms — the extra amount
+     *         beyond principal the lender must approve.
+     *
+     * @dev    Computed from the FULL-TERM interest, deliberately, even though
+     *         the realised interest may be lower if the borrower closes early.
+     *         The pool has to be funded for maximum exposure before any loss
+     *         can occur; over-collecting slightly is the safe direction, and
+     *         the excess stays in the reserve where it does useful work.
+     */
+    function quoteInsuranceSkim(
+        uint256 _principal,
+        uint256 _aprBps,
+        uint256 _duration,
+        bool    _useSeconds
+    ) public view returns (uint256) {
+        uint256 fee = quoteFullTermFee(_principal, _aprBps, _duration, _useSeconds);
         return (fee * insuranceSkimRateBps) / 10000;
     }
 
@@ -246,11 +297,14 @@ contract VaultFactory {
     ///         so a vault created before a rate change keeps its original
     ///         terms — read the vault's own protocolFeeRateBps for a loan
     ///         that already exists.
-    function quoteProtocolFee(uint256 _principal, uint256 _feeRateBps)
-        public view returns (uint256)
-    {
+    function quoteProtocolFee(
+        uint256 _principal,
+        uint256 _aprBps,
+        uint256 _duration,
+        bool    _useSeconds
+    ) public view returns (uint256) {
         if (treasury == address(0) || protocolFeeRateBps == 0) return 0;
-        uint256 fee = (_principal * _feeRateBps) / 10000;
+        uint256 fee = quoteFullTermFee(_principal, _aprBps, _duration, _useSeconds);
         return (fee * protocolFeeRateBps) / 10000;
     }
 
@@ -291,6 +345,15 @@ contract VaultFactory {
         uint256 previous = referrerShareBps;
         referrerShareBps = _newBps;
         emit ReferrerShareUpdated(previous, _newBps);
+    }
+
+    /// @notice Updates the minimum interest charge, capped at
+    ///         MAX_MINIMUM_FEE_BPS. Applies to NEW vaults only.
+    function setMinimumFeeBps(uint256 _newBps) external onlyOwner {
+        require(_newBps <= MAX_MINIMUM_FEE_BPS, "Exceeds maximum minimum fee");
+        uint256 previous = minimumFeeBps;
+        minimumFeeBps = _newBps;
+        emit MinimumFeeUpdated(previous, _newBps);
     }
 
     /// @notice Updates registry/pool references. All three set together.

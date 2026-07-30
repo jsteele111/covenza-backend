@@ -16,7 +16,7 @@ const FEE_BPS   = 300n;
 const FEE       = E("0.3");
 const SKIM      = E("0.06");
 const TARGET    = PRINCIPAL + FEE;
-const DURATION  = 7200;
+const DURATION  = 365 * 24 * 3600;      // one year — see atDeadline() below
 const GRACE     = 3600;
 const POOL_FEE  = 3000;
 
@@ -24,6 +24,20 @@ function tickFor(baseAddr, quoteAddr, magnitude) {
   return BigInt(baseAddr.toLowerCase()) < BigInt(quoteAddr.toLowerCase())
     ? magnitude
     : -magnitude;
+}
+
+// With interest annualised, the fee depends on ELAPSED time. Settling in the
+// same block as origination would accrue almost nothing, so the constants
+// above would all be wrong.
+//
+// Two things make them right again. The term is a full year, so
+// fullTermFee = principal * aprBps / 10000 — identical to the old flat
+// formula. And for early-close tests, this puts the settling block exactly ON
+// the deadline: still "early" (the check is block.timestamp <= deadline) but
+// with the whole term elapsed, so accrued interest equals the full-term
+// amount. Every expected value below therefore stands unchanged.
+async function atDeadline(vault) {
+  await time.setNextBlockTimestamp(await vault.deadline());
 }
 
 describe("Group D — guard rails and edge cases", function () {
@@ -64,7 +78,15 @@ describe("Group D — guard rails and edge cases", function () {
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000);
 
-    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+    // UniswapTwap is a deployed library now, not inlined — VaultFactory
+    // embeds Vault, which delegatecalls into it, so the address must be
+    // linked at deploy time.
+    const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+    await twapLib.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", {
+      signer: operator,
+      libraries: { UniswapTwap: await twapLib.getAddress() },
+    })).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       operator.address                        // protocol fee treasury
     );
@@ -80,8 +102,7 @@ describe("Group D — guard rails and edge cases", function () {
       await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
       ethers.ZeroAddress                      // no referrer
     );
-    const vault = (await ethers.getContractFactory("Vault", operator))
-      .attach(await factory.allVaults(0));
+    const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
 
     return { operator, lender, borrower, keeper, unverified, weth, usdx, aave, aTokenWeth,
              router, uniPool, kyc, registry, pool, factory, vault };
@@ -138,7 +159,7 @@ describe("Group D — guard rails and edge cases", function () {
     await expect(d.deployVault(w, borrower.address, 0, FEE_BPS, DURATION, true, DEPOSIT, Z))
       .to.be.revertedWith("Principal must be greater than zero");
     await expect(d.deployVault(w, borrower.address, PRINCIPAL, 0, DURATION, true, DEPOSIT, Z))
-      .to.be.revertedWith("Fee rate must be greater than zero");
+      .to.be.revertedWith("APR must be greater than zero");
     await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, 0, true, DEPOSIT, Z))
       .to.be.revertedWith("Duration must be greater than zero");
     await expect(d.deployVault(w, borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, 0, Z))
@@ -157,6 +178,7 @@ describe("Group D — guard rails and edge cases", function () {
     await kyc.revoke(borrower.address);
     // Borrower can still operate and close their existing loan.
     await vault.connect(borrower).supplyToAave(E("1"));
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
     expect(await vault.isSettled()).to.equal(true);
   });
@@ -193,6 +215,7 @@ describe("Group D — guard rails and edge cases", function () {
     const { vault, borrower } = await loadFixture(deployStackFixture);
     await expect(vault.connect(borrower).supplyToAave(E("1")))
       .to.be.revertedWith("Deposit not yet paid");
+    await atDeadline(vault);
     await expect(vault.connect(borrower).settle())
       .to.be.revertedWith("Deposit not yet paid");
   });
@@ -230,7 +253,10 @@ describe("Group D — guard rails and edge cases", function () {
 
   it("settle: double settlement is rejected", async function () {
     const { vault, borrower } = await loadFixture(fundedVaultFixture);
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
+    // No second atDeadline: setNextBlockTimestamp cannot go backwards, and the
+    // rejection here is about isSettled rather than anything time-dependent.
     await expect(vault.connect(borrower).settle())
       .to.be.revertedWith("Loan already settled");
   });

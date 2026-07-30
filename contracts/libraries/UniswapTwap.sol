@@ -25,6 +25,23 @@ interface IUniswapV3Pool {
         external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
 }
 
+/**
+ * @dev quote() and canQuote() are PUBLIC rather than internal, which changes
+ *      how this library is deployed and matters a great deal.
+ *
+ *      A library with only internal functions is inlined into every consumer.
+ *      That put the whole of the vendored tick math — getSqrtRatioAtTick's
+ *      twenty magic constants and mulDiv's assembly — inside Vault, and since
+ *      VaultFactory embeds Vault's full creation bytecode, inside the factory
+ *      too. The factory hit 25,013 bytes against the 24,576 EIP-170 limit and
+ *      could not be deployed at all.
+ *
+ *      Public functions make this a separately deployed contract that
+ *      consumers DELEGATECALL into, so the code exists once on chain instead of
+ *      once per consumer. Behaviour is identical — delegatecall executes in the
+ *      caller's context — at the cost of needing the library address linked at
+ *      deploy time.
+ */
 library UniswapTwap {
 
     /**
@@ -39,7 +56,7 @@ library UniswapTwap {
         uint24  fee,
         uint256 amountIn,
         uint32  window
-    ) internal view returns (uint256 amountOut) {
+    ) public view returns (uint256 amountOut) {
         require(window > 0, "TWAP window must be nonzero");
 
         address pool = IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee);
@@ -74,7 +91,7 @@ library UniswapTwap {
         address tokenOut,
         uint24  fee,
         uint32  window
-    ) internal view returns (bool) {
+    ) public view returns (bool) {
         if (window == 0) return false;
 
         address pool = IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee);

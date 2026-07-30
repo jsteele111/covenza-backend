@@ -188,7 +188,15 @@ async function main() {
     console.log("   deployment you intend to collect fees from.");
   }
 
-  const factory = await (await hre.ethers.getContractFactory("VaultFactory", deployer)).deploy(
+  // UniswapTwap is a deployed library now, not inlined — VaultFactory
+  // embeds Vault, which delegatecalls into it, so the address must be
+  // linked at deploy time.
+  const twapLib = await (await hre.ethers.getContractFactory("UniswapTwap", deployer)).deploy();
+  await twapLib.waitForDeployment();
+  const factory = await (await hre.ethers.getContractFactory("VaultFactory", {
+    signer: deployer,
+    libraries: { UniswapTwap: await twapLib.getAddress() },
+  })).deploy(
     kycRegistryAddress, await registry.getAddress(), await pool.getAddress(), treasury
   );
   await factory.waitForDeployment();

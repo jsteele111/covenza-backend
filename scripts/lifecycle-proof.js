@@ -140,7 +140,10 @@ async function main() {
   }
 
   async function originate(durationSeconds) {
-    const skim = await factory.quoteInsuranceSkim(PRINCIPAL, FEE_RATE_BPS);
+    // Duration is part of the quote now that interest is annualised — the
+    // skim is a percentage of the full-term interest, which depends on how
+    // long the loan runs.
+    const skim = await factory.quoteInsuranceSkim(PRINCIPAL, FEE_RATE_BPS, durationSeconds, true);
     await (await usdc.connect(lender).approve(await factory.getAddress(), PRINCIPAL + skim)).wait();
     const countBefore = await factory.totalVaults();
     const tx = await factory.connect(lender).deployVault(

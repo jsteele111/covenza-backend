@@ -147,7 +147,15 @@ async function main() {
     console.log("\n  TREASURY_ADDRESS unset — protocol fees will go to the deployer.");
   }
 
-  const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
+  // UniswapTwap is a deployed library now, not inlined — VaultFactory
+  // embeds Vault, which delegatecalls into it, so the address must be
+  // linked at deploy time.
+  const twapLib = await (await ethers.getContractFactory("UniswapTwap", deployer)).deploy();
+  await twapLib.waitForDeployment();
+  const factory = await (await ethers.getContractFactory("VaultFactory", {
+    signer: deployer,
+    libraries: { UniswapTwap: await twapLib.getAddress() },
+  })).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury
   );
   await factory.waitForDeployment();

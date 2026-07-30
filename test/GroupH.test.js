@@ -31,7 +31,7 @@ const FEE_BPS     = 300n;              // 3% -> fee 0.3, lender target 10.3
 const FEE         = E("0.3");
 const SKIM        = E("0.06");         // 20% of fee (factory default)
 const TARGET      = PRINCIPAL + FEE;
-const DURATION    = 7200;
+const DURATION    = 365 * 24 * 3600;    // one year — see atDeadline() below
 const GRACE       = 3600;
 const POOL_FEE    = 3000;
 
@@ -45,6 +45,20 @@ function tickFor(baseAddr, quoteAddr, magnitude) {
   return BigInt(baseAddr.toLowerCase()) < BigInt(quoteAddr.toLowerCase())
     ? magnitude
     : -magnitude;
+}
+
+// With interest annualised, the fee depends on ELAPSED time. Settling in the
+// same block as origination would accrue almost nothing, so the constants
+// above would all be wrong.
+//
+// Two things make them right again. The term is a full year, so
+// fullTermFee = principal * aprBps / 10000 — identical to the old flat
+// formula. And for early-close tests, this puts the settling block exactly ON
+// the deadline: still "early" (the check is block.timestamp <= deadline) but
+// with the whole term elapsed, so accrued interest equals the full-term
+// amount. Every expected value below therefore stands unchanged.
+async function atDeadline(vault) {
+  await time.setNextBlockTimestamp(await vault.deadline());
 }
 
 describe("Group H — protocol fee", function () {
@@ -88,7 +102,15 @@ describe("Group H — protocol fee", function () {
       .deploy(operator.address, 1000);
 
     // Fee left at the factory defaults: 10% of fee, 30% referrer share.
-    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+    // UniswapTwap is a deployed library now, not inlined — VaultFactory
+    // embeds Vault, which delegatecalls into it, so the address must be
+    // linked at deploy time.
+    const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+    await twapLib.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", {
+      signer: operator,
+      libraries: { UniswapTwap: await twapLib.getAddress() },
+    })).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address
     );
@@ -102,8 +124,7 @@ describe("Group H — protocol fee", function () {
         await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
         referrerAddr
       );
-      const vault = (await ethers.getContractFactory("Vault", operator))
-        .attach(await factory.allVaults(before));
+      const vault = await ethers.getContractAt("Vault", await factory.allVaults(before));
 
       await weth.mint(borrower.address, DEPOSIT);
       await weth.connect(borrower).approve(await vault.getAddress(), DEPOSIT);
@@ -122,6 +143,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, treasury, weth } = await loadFixture(baseFixture);
     const vault = await originate();
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     expect(await vault.settledProtocolFee()).to.equal(PROTOCOL_FEE);
@@ -132,6 +154,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, lender, weth } = await loadFixture(baseFixture);
     const vault = await originate();
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     // Exactly the same figure GroupB asserts with the fee disabled.
@@ -143,6 +166,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, weth } = await loadFixture(baseFixture);
     const vault = await originate();
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     // Residual is deposit 1.5 - fee 0.3 = 1.2, less the 0.03 protocol fee.
@@ -177,6 +201,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, treasury, referrer, weth } = await loadFixture(baseFixture);
     const vault = await originate(referrer.address);
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     expect(await vault.settledProtocolFee()).to.equal(TREASURY_CUT);
@@ -191,6 +216,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, treasury, referrer, weth } = await loadFixture(baseFixture);
     const vault = await originate(ethers.ZeroAddress);
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     expect(await vault.settledProtocolFee()).to.equal(PROTOCOL_FEE);
@@ -202,6 +228,7 @@ describe("Group H — protocol fee", function () {
     const { originate, borrower, treasury, referrer } = await loadFixture(baseFixture);
     const vault = await originate(referrer.address);
 
+    await atDeadline(vault);
     await expect(vault.connect(borrower).settle())
       .to.emit(vault, "ProtocolFeePaid")
       .withArgs(treasury.address, referrer.address, TREASURY_CUT, REFERRER_CUT);
@@ -248,6 +275,7 @@ describe("Group H — protocol fee", function () {
     // The vault keeps the terms it was created with.
     expect(await vault.protocolFeeRateBps()).to.equal(FEE_RATE_BPS);
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
     expect(await vault.settledProtocolFee()).to.equal(PROTOCOL_FEE);   // 0.03, not 0.06
     expect(await weth.balanceOf(treasury.address)).to.equal(PROTOCOL_FEE);
@@ -258,6 +286,7 @@ describe("Group H — protocol fee", function () {
     await factory.setProtocolFeeRateBps(0);
     const vault = await originate();
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     expect(await vault.settledProtocolFee()).to.equal(0);
@@ -309,9 +338,9 @@ describe("Group H — protocol fee", function () {
 
   it("quoteProtocolFee reports the borrower's add-on cost at the current rate", async function () {
     const { factory } = await loadFixture(baseFixture);
-    expect(await factory.quoteProtocolFee(PRINCIPAL, FEE_BPS)).to.equal(PROTOCOL_FEE);
+    expect(await factory.quoteProtocolFee(PRINCIPAL, FEE_BPS, DURATION, true)).to.equal(PROTOCOL_FEE);
 
     await factory.setProtocolFeeRateBps(0);
-    expect(await factory.quoteProtocolFee(PRINCIPAL, FEE_BPS)).to.equal(0);
+    expect(await factory.quoteProtocolFee(PRINCIPAL, FEE_BPS, DURATION, true)).to.equal(0);
   });
 });

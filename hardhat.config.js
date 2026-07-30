@@ -27,11 +27,24 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        // Low runs value optimises for DEPLOYMENT SIZE over runtime gas —
-        // the right trade here: VaultFactory embeds the full Vault creation
-        // bytecode, so factory size is the binding constraint (24,576-byte
-        // Spurious Dragon limit, enforced on Arbitrum too).
-        runs: 200,
+        // Optimises for DEPLOYMENT SIZE over runtime gas. VaultFactory embeds
+        // the full Vault creation bytecode, so factory size is the binding
+        // constraint (24,576-byte Spurious Dragon limit, enforced on Arbitrum
+        // and Orbit chains too).
+        //
+        // Dropped from 200 to 1 when the factory hit 25,106 bytes after the
+        // yield-venue and annualised-interest work. 1 is the most size-biased
+        // setting available.
+        //
+        // Worth knowing this is a delaying tactic, not a fix: every addition to
+        // Vault pushes the factory back toward the ceiling, and the risk-tier
+        // and exposure-cap work still to come is all Vault logic. The durable
+        // answer is a clone factory — deploy one Vault implementation and have
+        // the factory produce minimal proxies of it, which makes factory size
+        // constant. That needs Vault to become initialisable rather than
+        // constructor-configured, so it is a deliberate refactor rather than
+        // something to attempt while unblocking a test run.
+        runs: 1,
       },
     },
   },

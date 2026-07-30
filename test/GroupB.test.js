@@ -18,7 +18,7 @@ const FEE_BPS   = 300n;                 // 3% -> fee 0.3, lender target 10.3
 const FEE       = E("0.3");
 const SKIM      = E("0.06");            // 20% of fee (factory default)
 const TARGET    = PRINCIPAL + FEE;
-const DURATION  = 7200;                 // 2h loan (seconds mode)
+const DURATION  = 365 * 24 * 3600;      // one year, so full-term fee == the flat constants above
 const GRACE     = 3600;                 // 1h grace period
 const POOL_FEE  = 3000;
 
@@ -34,6 +34,20 @@ function tickFor(baseAddr, quoteAddr, magnitude) {
   return BigInt(baseAddr.toLowerCase()) < BigInt(quoteAddr.toLowerCase())
     ? magnitude
     : -magnitude;
+}
+
+// With interest annualised, the fee depends on ELAPSED time. Settling in the
+// same block as origination would accrue almost nothing, so the constants
+// above would all be wrong.
+//
+// Two things make them right again. The term is a full year, so
+// fullTermFee = principal * aprBps / 10000 — identical to the old flat
+// formula. And for early-close tests, this puts the settling block exactly ON
+// the deadline: still "early" (the check is block.timestamp <= deadline) but
+// with the whole term elapsed, so accrued interest equals the full-term
+// amount. Every expected value below therefore stands unchanged.
+async function atDeadline(vault) {
+  await time.setNextBlockTimestamp(await vault.deadline());
 }
 
 describe("Group B — Vault v2 lifecycle (integration)", function () {
@@ -79,7 +93,15 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000); // draw cap 10% of principal
 
-    const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+    // UniswapTwap is a deployed library now, not inlined — VaultFactory
+    // embeds Vault, which delegatecalls into it, so the address must be
+    // linked at deploy time.
+    const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+    await twapLib.waitForDeployment();
+    const factory = await (await ethers.getContractFactory("VaultFactory", {
+      signer: operator,
+      libraries: { UniswapTwap: await twapLib.getAddress() },
+    })).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       operator.address                        // protocol fee treasury
     );
@@ -97,8 +119,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
       await weth.getAddress(), borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
       ethers.ZeroAddress                      // no referrer
     );
-    const vault = (await ethers.getContractFactory("Vault", operator))
-      .attach(await factory.allVaults(0));
+    const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
 
     // --- Borrower pays deposit ---
     await weth.mint(borrower.address, DEPOSIT);
@@ -117,7 +138,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     expect(await weth.balanceOf(await vault.getAddress())).to.equal(PRINCIPAL + DEPOSIT);
     expect(await pool.reserveOf(await weth.getAddress())).to.equal(SKIM);
     expect(await pool.isRegisteredVault(await vault.getAddress())).to.equal(true);
-    expect(await factory.quoteInsuranceSkim(PRINCIPAL, FEE_BPS)).to.equal(SKIM);
+    expect(await factory.quoteInsuranceSkim(PRINCIPAL, FEE_BPS, DURATION, true)).to.equal(SKIM);
   });
 
   // --- Deposit invariant ---
@@ -192,6 +213,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await aave.simulateYield(wethAddr, await vault.getAddress(), E("0.5"));
     await weth.mint(await aave.getAddress(), E("0.5"));
 
+    await atDeadline(vault);
     await vault.connect(borrower).settle();
 
     expect(await weth.balanceOf(lender.address)).to.equal(TARGET);
@@ -208,6 +230,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await router.setRate(await usdx.getAddress(), await weth.getAddress(), 8, 10);
     await uniPool.setAvgTick(tickFor(await usdx.getAddress(), await weth.getAddress(), -2232));
 
+    await atDeadline(vault);
     await expect(vault.connect(borrower).settle())
       .to.be.revertedWith("Cannot close early at a loss beyond deposit");
   });
