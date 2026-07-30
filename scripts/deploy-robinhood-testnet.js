@@ -157,12 +157,15 @@ async function main() {
     libraries: { UniswapTwap: await twapLib.getAddress() },
   })).deploy();
   await vaultImpl.waitForDeployment();
+  console.log(`\nUniswapTwap lib ${await twapLib.getAddress()}`);
+  console.log(`Vault impl      ${await vaultImpl.getAddress()} (clone source, never initialised)`);
+
   const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury,
-      await vaultImpl.getAddress()   // clone source
+    await vaultImpl.getAddress()
   );
   await factory.waitForDeployment();
-  console.log(`\nVaultFactory    ${await factory.getAddress()}`);
+  console.log(`VaultFactory    ${await factory.getAddress()}`);
 
   await (await pool.setVaultFactory(await factory.getAddress())).wait();
   console.log("  InsurancePool wired to factory");
@@ -219,6 +222,11 @@ async function main() {
     assetRegistry:  await registry.getAddress(),
     insurancePool:  await pool.getAddress(),
     vaultFactory:   await factory.getAddress(),
+    // Recorded because redeploying only the factory later needs both, and
+    // because the implementation is what a verifier should be pointed at —
+    // clones carry no code of their own for an explorer to show.
+    vaultImplementation: await vaultImpl.getAddress(),
+    uniswapTwapLibrary:  await twapLib.getAddress(),
     treasury,
     yieldVenue4626: venueAddress,
     verifiedBorrower: borrower.address,

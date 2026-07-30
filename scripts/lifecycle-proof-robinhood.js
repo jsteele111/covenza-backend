@@ -36,10 +36,38 @@ const E = (n) => hre.ethers.parseEther(String(n));
 const PRINCIPAL   = E(100);
 const DEPOSIT     = E(15);
 const FEE_BPS     = 300n;          // 3% of principal
-const DURATION    = 150;           // seconds — short so the proof completes
+// Two durations, because the stages want opposite things from the deadline.
+//
+// Stages 1–3 settle EARLY, so their deadline only has to outlast setup. That
+// is four transactions — deployVault, mint, approve, payDeposit — each with a
+// round trip to a public RPC that has already produced header timeouts today.
+// A 150s term expired mid-setup and payDeposit reverted with "Deadline has
+// passed", so this is deliberately generous; it costs nothing, since nothing
+// waits on it.
+//
+// Stage 4 needs the deadline to actually pass, so it stays short — and it is
+// the only stage that pays for that in real waiting.
+const DURATION_SETUP  = 900;
+const DURATION_EXPIRE = 150;
 const POOL_FEE    = 3000;          // the tier with a pool
 const ABSENT_FEE  = 500;           // no pool at this tier — guard should refuse
-const SWAP_AMOUNT = E(20);
+/**
+ * Kept small RELATIVE TO POOL DEPTH, and that constraint is load-bearing.
+ *
+ * settle() requires the forced swap-back to return at least twapQuote less the
+ * tolerance. twapQuote is derived from the MARGINAL price, but a swap executes
+ * at an AVERAGE price — worse by its own impact. So a borrower's swap-in moves
+ * the price, the TWAP converges on that new price, and swapping back returns
+ * roughly the original amount less two fees: below a bar that has since risen.
+ *
+ * At 20 tUSDG against this pool that gap measured 19.88 delivered versus 19.92
+ * required — a fifth of a percent short, and settle() reverted. 5 tUSDG cuts
+ * the impact roughly fourfold and clears it.
+ *
+ * The protocol-level answer is the position cap in Phase 4.5, not a wider
+ * tolerance: widening it is exactly what weakens manipulation resistance.
+ */
+const SWAP_AMOUNT = E(5);
 
 function sleep(s) {
   console.log(`   …waiting ${s}s`);
@@ -148,10 +176,17 @@ async function main() {
   console.log(`tolerance       ${await registry.twapToleranceBps()} bps`);
   console.log(`grace           ${await registry.swapBackGracePeriod()}s`);
 
+  // Pool depth governs how much price impact a forced swap-back suffers, and
+  // therefore whether it clears the TWAP tolerance. Printed up front because a
+  // badly skewed pool is the likeliest reason a stage fails for reasons that
+  // have nothing to do with the protocol.
+  console.log(`\npool tUSDG      ${ethers.formatEther(await usdg.balanceOf(d.uniswap.pool))}`);
+  console.log(`pool tWETH      ${ethers.formatEther(await weth.balanceOf(d.uniswap.pool))}`);
+
   // ------------------------------------------------------------------
   // Helper: originate a funded vault with the deposit already paid
   // ------------------------------------------------------------------
-  async function originate(label) {
+  async function originate(label, durationSeconds = DURATION_SETUP) {
     const fee = (PRINCIPAL * FEE_BPS) / 10000n;
     const need = PRINCIPAL + fee;  // covers principal + the insurance skim
 
@@ -160,7 +195,7 @@ async function main() {
 
     const before = await factory.totalVaults();
     await (await factory.deployVault(
-      d.tokens.tUSDG, borrower.address, PRINCIPAL, FEE_BPS, DURATION, true, DEPOSIT,
+      d.tokens.tUSDG, borrower.address, PRINCIPAL, FEE_BPS, durationSeconds, true, DEPOSIT,
       ethers.ZeroAddress
     )).wait();
 
@@ -270,12 +305,20 @@ async function main() {
   console.log("\n  Selling tWETH into the pool to move spot AGAINST the vault…");
   await (await weth.mint(lender.address, DUMP)).wait();
   await (await weth.approve(d.uniswap.router, DUMP)).wait();
+
+  // Measure what the dump earns, so it can be reversed afterwards. Without
+  // that, each run leaves the pool more lopsided than the last and eventually
+  // the forced swap-back's own price impact breaches the TWAP tolerance —
+  // which is what broke Stage 4 rather than anything wrong with the protocol.
+  const usdgBeforeDump = await usdg.balanceOf(lender.address);
   await (await router.exactInputSingle({
     tokenIn: d.tokens.tWETH, tokenOut: d.tokens.tUSDG, fee: POOL_FEE,
     recipient: lender.address, amountIn: DUMP,
     amountOutMinimum: 0n, sqrtPriceLimitX96: 0n,
   })).wait();
-  console.log(`  dumped ${ethers.formatEther(DUMP)} tWETH — spot down, TWAP still lagging`);
+  const dumpProceeds = (await usdg.balanceOf(lender.address)) - usdgBeforeDump;
+  console.log(`  dumped ${ethers.formatEther(DUMP)} tWETH for ${ethers.formatEther(dumpProceeds)} tUSDG`);
+  console.log("  spot down, TWAP still lagging");
 
   let reverted = false;
   try {
@@ -313,6 +356,26 @@ async function main() {
   console.log(`  insurance draw   ${ethers.formatEther(await vaultB.settledInsuranceDraw())}`);
   console.log(`  loss severity    ${await vaultB.lossSeverity()}  (0 none, 1 borrower, 2 lender)`);
 
+  // --- Restore the pool before moving on ---------------------------------
+  //
+  // Buying the dumped tWETH back returns spot to roughly where it started,
+  // less two lots of the 0.3% fee. Stage 4 is about the keeper tier, not about
+  // trading into a wrecked pool, and leaving the damage in place also makes
+  // this script fail on its own next run.
+  console.log("\n  Reversing the dump so Stage 4 starts from a healthy pool…");
+  await (await usdg.mint(lender.address, dumpProceeds)).wait();
+  await (await usdg.approve(d.uniswap.router, dumpProceeds)).wait();
+  await (await router.exactInputSingle({
+    tokenIn: d.tokens.tUSDG, tokenOut: d.tokens.tWETH, fee: POOL_FEE,
+    recipient: lender.address, amountIn: dumpProceeds,
+    amountOutMinimum: 0n, sqrtPriceLimitX96: 0n,
+  })).wait();
+  console.log(`  pool now holds ${ethers.formatEther(await usdg.balanceOf(d.uniswap.pool))} tUSDG`);
+  console.log(`                 ${ethers.formatEther(await weth.balanceOf(d.uniswap.pool))} tWETH`);
+
+  // Let the oracle absorb the restored price before Stage 4 settles against it.
+  await sleep(window + 15);
+
   // ==================================================================
   // Stage 4 — post-grace keeper tier
   // ==================================================================
@@ -323,7 +386,8 @@ async function main() {
     console.log("STAGE 4 — post-grace settlement by a third-party keeper");
     line();
 
-    const vaultC = await originate("Vault C");
+    // Short term here on purpose — this is the stage that needs to expire.
+    const vaultC = await originate("Vault C", DURATION_EXPIRE);
 
     // Stage 3 dumped 400 tWETH, so the pool is a long way from where it
     // started. Quoting fresh is the only thing that survives that.
@@ -333,8 +397,8 @@ async function main() {
     )).wait();
 
     const grace = Number(await registry.swapBackGracePeriod());
-    console.log(`\n  Waiting out deadline (${DURATION}s) + grace (${grace}s)…`);
-    await sleep(DURATION + grace + 30);
+    console.log(`\n  Waiting out deadline (${DURATION_EXPIRE}s) + grace (${grace}s)…`);
+    await sleep(DURATION_EXPIRE + grace + 30);
 
     const keeperBefore = await retry(() => usdg.balanceOf(keeper.address), "read keeper balance");
     await retry(() => vaultC.connect(keeper).settle().then((t) => t.wait()), "settle vault C");
