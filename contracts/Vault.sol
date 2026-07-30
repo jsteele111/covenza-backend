@@ -76,13 +76,35 @@ interface IERC4626 {
     function convertToAssets(uint256 shares) external view returns (uint256);
 }
 
+/**
+ * @dev This is **SwapRouter02**, not the original SwapRouter.
+ *
+ *      The two differ by exactly one field: v1's ExactInputSingleParams
+ *      carries a `deadline`, SwapRouter02's does not (it moved deadline
+ *      handling into multicall). Because the parameter is a struct, that one
+ *      field changes the tuple signature and therefore the FUNCTION SELECTOR:
+ *
+ *        v1  exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))
+ *        02  exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+ *
+ *      So calling one with the other's struct does not misprice — it finds no
+ *      matching function and reverts. Every swap, permanently.
+ *
+ *      Robinhood Chain deployed SwapRouter02 (0xcaf681a6…5cb2) and no v1
+ *      router, so SwapRouter02 is what this must target. Uniswap's own
+ *      deployment docs warn that addresses and versions no longer track
+ *      across chains; this is that warning biting.
+ *
+ *      Dropping `deadline` costs nothing here: the vault passed
+ *      block.timestamp, which is a no-op deadline that can never expire
+ *      within the transaction evaluating it.
+ */
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24  fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -422,7 +444,6 @@ contract Vault {
                 tokenOut: tokenOut,
                 fee:      poolFee,
                 recipient: address(this),
-                deadline:  block.timestamp,
                 amountIn:  amountIn,
                 amountOutMinimum: minAmountOut,
                 sqrtPriceLimitX96: 0
@@ -599,7 +620,7 @@ contract Vault {
                 uint256 out = ISwapRouter(router).exactInputSingle(
                     ISwapRouter.ExactInputSingleParams({
                         tokenIn: held, tokenOut: asset, fee: feeTier,
-                        recipient: address(this), deadline: block.timestamp,
+                        recipient: address(this),
                         amountIn: bal, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
                     })
                 );

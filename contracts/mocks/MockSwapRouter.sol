@@ -23,12 +23,15 @@ import "../interfaces/IERC20.sol";
  */
 contract MockSwapRouter {
 
+    // Mirrors **SwapRouter02**, which is what Robinhood Chain deployed — no
+    // `deadline` field. See the ISwapRouter comment in Vault.sol: the missing
+    // field changes the function selector, so a mock shaped like v1 would
+    // pass tests while mainnet reverted on every swap.
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24  fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
