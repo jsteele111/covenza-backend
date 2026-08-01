@@ -90,6 +90,16 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100); // 2% tol, 1h grace, 2bps/hr, 1% cap
 
+    // Tier limits disabled for this suite. These tests predate the risk tiers
+    // and assert settlement mechanics, not risk policy — same reasoning as
+    // setProtocolFeeRateBps(0). Left enabled, the volatility deposit floor
+    // alone would reject every fixture: a one-year loan against 60% assumed
+    // volatility requires a 100% deposit, which is the model being correct
+    // rather than the fixtures being wrong.
+    for (const t of [0, 1, 2]) {
+      await registry.setTierConfig(t, 0, 0, 365 * 24 * 3600, 10000, 0);
+    }
+
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000); // draw cap 10% of principal
 
@@ -109,6 +119,13 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
       await vaultImpl.getAddress()            // clone source
     );
     await pool.setVaultFactory(await factory.getAddress());
+
+    // The lender skim now defaults to ZERO — the insurance pool is funded by the
+    // borrower's per-tier premium instead, and charging both sides would
+    // double-fund it. Re-enabled here because these suites assert skim
+    // behaviour specifically, and the mechanism is retained as a dial rather
+    // than deleted.
+    await factory.setInsuranceSkimRateBps(2000);
 
     // This suite predates the protocol fee and asserts exact borrower payouts
     // throughout. Disabling the fee keeps those assertions valid as a clean

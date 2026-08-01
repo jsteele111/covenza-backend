@@ -145,6 +145,9 @@ struct LoanTerms {
     uint256 depositAmount;
     address registry;
     address insurancePool;
+    // Highest risk tier the borrower may swap into. Snapshotted, so an
+    // operator re-tagging assets later cannot widen a live loan's mandate.
+    uint8   maxTier;
 }
 
 struct FeeConfig {
@@ -186,6 +189,35 @@ contract Vault {
 
     uint256 public originatedAt;   // when the clock started
     uint256 public term;           // loan length in seconds; deadline = originatedAt + term
+
+    /**
+     * @notice Highest AssetRegistry.RiskTier this borrower may hold.
+     *
+     * @dev    Closes the gap between who sets terms and who chooses exposure.
+     *         The lender fixes the deposit and APR at origination; the borrower
+     *         picks what to swap into afterwards. Without a ceiling, a lender
+     *         who priced for WETH can find themselves backing a memecoin
+     *         position — a risk they had no opportunity to price.
+     */
+    uint8 public maxTier;
+
+    /**
+     * @notice Insurance premium, in the loan asset, payable by the BORROWER
+     *         alongside their deposit.
+     *
+     * @dev    Moved from the lender for two reasons. Credit enhancement is
+     *         borrower-funded almost everywhere it exists — mortgage insurance,
+     *         guarantee fees, letters of credit — because the party seeking
+     *         capital pays for whatever makes their credit acceptable. And it
+     *         makes the lender's yield clean: previously a lender quoting 12%
+     *         netted 9.6% after the skim, which is a hidden haircut on the
+     *         headline figure and the worst possible friction to put on the
+     *         scarce side of the market.
+     *
+     *         Priced on the FULL term and snapshotted here, so a later change
+     *         to tier pricing cannot reprice a live loan.
+     */
+    uint256 public insurancePremium;
     uint256 public deadline;
     bool    public isSettled;
 
@@ -235,6 +267,8 @@ contract Vault {
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, bool isSwapBack);
     event AaveSupplied(uint256 amount, uint256 timestamp);
     event AaveWithdrawn(uint256 amount, uint256 timestamp);
+    event InsurancePremiumPaid(address indexed borrower, uint256 amount);
+    event Cancelled(address indexed lender, uint256 principalReturned, uint256 timestamp);
     event YieldSupplied(uint8 indexed venue, uint256 amount, uint256 timestamp);
     event YieldWithdrawn(uint8 indexed venue, uint256 amount, uint256 timestamp);
     event ForcedSwapBack(address indexed heldAsset, uint256 amountIn, uint256 amountOut);
@@ -309,6 +343,15 @@ contract Vault {
         deadline         = originatedAt + term;
         registry         = AssetRegistry(_terms.registry);
         insurancePool    = InsurancePool(_terms.insurancePool);
+        maxTier          = _terms.maxTier;
+
+        // Keyed to the CEILING the lender granted, not the loan's own asset.
+        // What is being insured is whatever the borrower is permitted to hold.
+        insurancePremium =
+            (principal
+             * AssetRegistry(_terms.registry).insurancePremiumBpsForTier(
+                   AssetRegistry.RiskTier(_terms.maxTier))
+             * term) / (10000 * YEAR);
 
         // Fee terms are snapshotted, not referenced. No require() here: a
         // zero treasury or zero rate simply means no protocol fee is taken,
@@ -383,11 +426,61 @@ contract Vault {
         require(!isSettled,                  "Loan already settled");
         require(block.timestamp <= deadline, "Deadline has passed");
 
+        // Deposit and insurance premium arrive together, but only the deposit
+        // is recorded as `deposit` — the premium leaves immediately and must
+        // never count toward the segregation invariant or the payout maths.
         deposit = _requiredDeposit;
-        bool ok = IERC20(asset).transferFrom(borrower, address(this), _requiredDeposit);
+
+        bool ok = IERC20(asset).transferFrom(
+            borrower, address(this), _requiredDeposit + insurancePremium
+        );
         require(ok, "Deposit transfer failed");
 
         emit DepositReceived(borrower, _requiredDeposit);
+
+        // Forwarded now, not at settlement. If the premium accrued to
+        // settlement, a loan ending in a loss might never pay it — correlating
+        // claim events with premium failures, which is the one property an
+        // insurance fund cannot have.
+        if (insurancePremium > 0) {
+            require(
+                IERC20(asset).approve(address(insurancePool), insurancePremium),
+                "Premium approval failed"
+            );
+            insurancePool.fund(asset, insurancePremium);
+            emit InsurancePremiumPaid(borrower, insurancePremium);
+        }
+    }
+
+    /**
+     * @notice Returns principal to the lender when the borrower never funded.
+     *
+     * @dev Without this, an unfunded vault could still be settled after its
+     *      deadline: it holds only principal, the lender is owed principal plus
+     *      interest, and the shortfall is covered by an INSURANCE DRAW. The
+     *      shared pool would subsidise a loan that never started — trivial over
+     *      a 150-second term, 3% of principal over a year, and paid for by
+     *      every other lender who funded the pool.
+     *
+     *      Callable by anyone. There is no discretion here — the borrower did
+     *      not turn up, and the money goes back where it came from.
+     */
+    function cancel() external {
+        require(!isSettled,                  "Loan already settled");
+        require(!depositPaid(),              "Deposit was paid - settle instead");
+        require(block.timestamp > deadline,  "Deadline has not passed");
+
+        isSettled = true;   // before the transfer — reentrancy guard
+
+        uint256 balance = IERC20(asset).balanceOf(address(this));
+        settledTotalReturned = balance;
+        settledLenderPayout  = balance;
+
+        if (balance > 0) {
+            require(IERC20(asset).transfer(lender, balance), "Refund to lender failed");
+        }
+
+        emit Cancelled(lender, balance, block.timestamp);
     }
 
     // --- Deposit segregation invariant ---
@@ -518,12 +611,86 @@ contract Vault {
             "No TWAP history for this pair and fee tier"
         );
 
+        // The lender's risk mandate. Read live from the registry but compared
+        // against a ceiling snapshotted at origination, so re-tagging an asset
+        // can tighten a live loan but never loosen it.
+        require(
+            uint8(registry.tierOf(tokenOut)) <= maxTier,
+            "Asset exceeds this vault's risk mandate"
+        );
+
         _enforceDepositInvariant(amountIn);
 
         uint256 amountOut = _executeSwap(asset, tokenOut, amountIn, minAmountOut, poolFee);
         _trackHeldAsset(tokenOut, poolFee);
 
+        _enforceEntryImpact(tokenOut, amountIn, amountOut, poolFee);
+        _enforceExposureCap(tokenOut, poolFee);
+
         emit SwapExecuted(asset, tokenOut, amountIn, amountOut, false);
+    }
+
+    /**
+     * @dev Refuses a position large enough to move the price against its own
+     *      settlement.
+     *
+     *      Found on testnet, not in theory. settle() requires the forced
+     *      swap-back to return at least the TWAP-implied value less tolerance.
+     *      But twapQuote derives from the MARGINAL price while a swap executes
+     *      at an AVERAGE price, worse by its own impact. So a borrower's
+     *      swap-in moves the price, the TWAP converges on the new level, and
+     *      swapping back returns roughly the original cost less two fees —
+     *      beneath a bar that has since risen.
+     *
+     *      Measured: a 20-token position delivered 19.88 against 19.92
+     *      required, and the vault could not be settled by anyone until the
+     *      price moved. A borrower could do this to themselves accidentally.
+     *
+     *      Comparing execution against TWAP measures exactly the impact that
+     *      causes it. The cap wants to be roughly half the settlement tolerance
+     *      less the fee, since a round trip pays impact twice.
+     */
+    function _enforceEntryImpact(
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint24  poolFee
+    ) internal view {
+        uint256 maxImpactBps = registry.maxEntryImpactBps();
+        if (maxImpactBps == 0) { return; }
+
+        uint256 twapOut = UniswapTwap.quote(
+            registry.uniswapFactory(), asset, tokenOut, poolFee, amountIn, registry.twapWindow()
+        );
+
+        require(
+            amountOut >= (twapOut * (10000 - maxImpactBps)) / 10000,
+            "Position too large for this pool's depth"
+        );
+    }
+
+    /**
+     * @dev Caps how much of the principal may sit in any single asset.
+     *
+     *      Valued through the TWAP rather than counted as amount-swapped-in, so
+     *      it measures the position the vault actually holds. A cumulative
+     *      spend counter would turn the cap into a lifetime budget — a borrower
+     *      who entered and fully exited could not re-enter, which is not what a
+     *      concentration limit means.
+     */
+    function _enforceExposureCap(address tokenOut, uint24 poolFee) internal view {
+        uint256 capBps = registry.maxExposureBpsFor(tokenOut);
+        if (capBps >= 10000) { return; }
+
+        uint256 held = IERC20(tokenOut).balanceOf(address(this));
+        uint256 value = UniswapTwap.quote(
+            registry.uniswapFactory(), tokenOut, asset, poolFee, held, registry.twapWindow()
+        );
+
+        require(
+            value <= (principal * capBps) / 10000,
+            "Exceeds exposure cap for this asset"
+        );
     }
 
     /// @notice Explicit swap-back entry point: converts `heldAsset` back to
@@ -606,13 +773,20 @@ contract Vault {
         if (early) {
             require(msg.sender == borrower, "Only borrower can close early");
             require(depositPaid(),          "Deposit not yet paid");
-        } else if (heldAssets.length > 0) {
-            uint256 graceEnd = deadline + _effectiveGracePeriod();
-            if (block.timestamp <= graceEnd) {
-                require(msg.sender == lender || msg.sender == borrower,
-                    "Grace period: only lender or borrower may settle");
-            } else if (msg.sender != lender && msg.sender != borrower) {
-                bounty = _accruedBounty(graceEnd);
+        } else {
+            // An unfunded vault must not reach _distribute(), where the lender's
+            // interest shortfall would be met by an insurance draw. cancel()
+            // returns the principal and draws nothing.
+            require(depositPaid(), "Deposit was never paid - use cancel()");
+
+            if (heldAssets.length > 0) {
+                uint256 graceEnd = deadline + _effectiveGracePeriod();
+                if (block.timestamp <= graceEnd) {
+                    require(msg.sender == lender || msg.sender == borrower,
+                        "Grace period: only lender or borrower may settle");
+                } else if (msg.sender != lender && msg.sender != borrower) {
+                    bounty = _accruedBounty(graceEnd);
+                }
             }
         }
         // No foreign assets + past deadline: open to anyone immediately, no bounty (v1 behaviour).

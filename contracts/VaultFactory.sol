@@ -55,7 +55,21 @@ contract VaultFactory {
     ///         at origination, in bps of the fee (e.g. 2000 = 20% of the
     ///         fee). Launch value is a placeholder pending VaR calibration
     ///         (Build-Readiness Spec section 6).
-    uint256 public insuranceSkimRateBps = 2000;
+    /**
+     * @dev Zero by default: the insurance pool is now funded by the BORROWER
+     *      via a per-tier premium collected at payDeposit, and charging both
+     *      sides would double-fund it.
+     *
+     *      The mechanism is retained rather than deleted, deliberately. The
+     *      premium prices a risk nobody has loss data for yet, so if borrowers
+     *      will not bear it — or will not bear all of it — this is a dial back
+     *      toward lender funding that costs one transaction rather than a
+     *      redeploy. Both can run together at any split.
+     *
+     *      Worth deleting once the premium has proven itself, since a disabled
+     *      code path is audit surface that nothing exercises.
+     */
+    uint256 public insuranceSkimRateBps = 0;
 
     // --- Protocol fee configuration ---
 
@@ -201,6 +215,53 @@ contract VaultFactory {
         uint256 _depositAmount,
         address _referrer
     ) external returns (address) {
+        // Speculative is the most PERMISSIVE ceiling, which preserves existing
+        // behaviour exactly: before tiers there was no ceiling at all. Callers
+        // wanting the protection use deployVaultWithTier and say so.
+        return _deployVault(
+            _asset, _borrower, _principal, _aprBps, _duration, _useSeconds,
+            _depositAmount, _referrer, uint8(AssetRegistry.RiskTier.Speculative)
+        );
+    }
+
+    /**
+     * @notice Originates a loan with an explicit risk ceiling.
+     *
+     * @param _maxTier Highest AssetRegistry.RiskTier the borrower may swap
+     *                 into. 0 = BlueChip only, 1 = up to Standard, 2 = any.
+     *
+     * @dev This is the form a lender should use. Without a ceiling, terms are
+     *      priced at origination while exposure is chosen afterwards by someone
+     *      else — a lender quoting for WETH can end up backing a memecoin.
+     */
+    function deployVaultWithTier(
+        address _asset,
+        address _borrower,
+        uint256 _principal,
+        uint256 _aprBps,
+        uint256 _duration,
+        bool    _useSeconds,
+        uint256 _depositAmount,
+        address _referrer,
+        uint8   _maxTier
+    ) external returns (address) {
+        return _deployVault(
+            _asset, _borrower, _principal, _aprBps, _duration, _useSeconds,
+            _depositAmount, _referrer, _maxTier
+        );
+    }
+
+    function _deployVault(
+        address _asset,
+        address _borrower,
+        uint256 _principal,
+        uint256 _aprBps,
+        uint256 _duration,
+        bool    _useSeconds,
+        uint256 _depositAmount,
+        address _referrer,
+        uint8   _maxTier
+    ) internal returns (address) {
 
         // --- Gates ---
         require(kycRegistry.isVerified(_borrower),     "Borrower is not KYC verified");
@@ -211,6 +272,30 @@ contract VaultFactory {
         require(_aprBps > 0,        "APR must be greater than zero");
         require(_duration > 0,      "Duration must be greater than zero");
         require(_depositAmount > 0, "Deposit must be greater than zero");
+
+        // --- Risk limits, keyed to the ceiling the lender granted ---
+        //
+        // Both bind on _maxTier rather than on the loan asset. At origination
+        // the borrower has not chosen what to hold, only what they are allowed
+        // to hold, and it is that permission the lender is underwriting.
+        {
+            AssetRegistry.RiskTier tier = AssetRegistry.RiskTier(_maxTier);
+            uint256 termSeconds = _useSeconds ? _duration : _duration * 1 days;
+
+            require(
+                termSeconds <= assetRegistry.maxTermForTier(tier),
+                "Term exceeds the maximum for this risk tier"
+            );
+
+            // Risk scales with sqrt(time), so the floor rises with term. A
+            // 30-day loan against 60% volatility needs ~33%; the same asset
+            // over 7 days needs ~15%.
+            uint256 floorBps = assetRegistry.minimumDepositBpsForTier(tier, termSeconds);
+            require(
+                _depositAmount >= (_principal * floorBps) / 10000,
+                "Deposit below the volatility floor for this tier and term"
+            );
+        }
 
         // --- Clone a vault, snapshotting current fee terms ---
         //
@@ -233,7 +318,8 @@ contract VaultFactory {
                 useSeconds:    _useSeconds,
                 depositAmount: _depositAmount,
                 registry:      address(assetRegistry),
-                insurancePool: address(insurancePool)
+                insurancePool: address(insurancePool),
+                maxTier:       _maxTier
             }),
             FeeConfig({
                 treasury:           treasury,
@@ -278,6 +364,23 @@ contract VaultFactory {
     }
 
     // --- Quoting ---
+
+    /**
+     * @notice Smallest deposit that will be accepted for these terms, in the
+     *         asset's own units. Quote this before originating.
+     */
+    function quoteMinimumDeposit(
+        uint256 _principal,
+        uint8   _maxTier,
+        uint256 _duration,
+        bool    _useSeconds
+    ) public view returns (uint256) {
+        uint256 termSeconds = _useSeconds ? _duration : _duration * 1 days;
+        uint256 floorBps = assetRegistry.minimumDepositBpsForTier(
+            AssetRegistry.RiskTier(_maxTier), termSeconds
+        );
+        return (_principal * floorBps) / 10000;
+    }
 
     /**
      * @notice Interest for the FULL term at the given annualised rate.

@@ -54,6 +54,90 @@ contract AssetRegistry {
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
 
     /**
+     * @notice How dangerous an asset is to be HOLDING when settlement forces a
+     *         swap back out of it.
+     *
+     * @dev    The tier drives four things, and the reason it drives four rather
+     *         than one is worth recording.
+     *
+     *         Modelling a 30-day loan against WETH at 64% annualised
+     *         volatility: with a 20% deposit the lender is untouched until the
+     *         asset falls 19%, which is only 1.15 standard deviations away — not
+     *         a tail event. One loan in eight reaches the lender, and expected
+     *         loss works out at 10.6% ANNUALISED. No plausible interest rate
+     *         covers that.
+     *
+     *         Raising the deposit to 30% cuts expected loss to 1.8%. A ten-point
+     *         change in deposit moved the risk by a factor of six, which no
+     *         interest rate achieves. Hence: deposits are the control, rates are
+     *         the compensation.
+     *
+     *         The same arithmetic at 200% volatility gives an expected loss of
+     *         113% of principal per year at a 20% deposit, and only becomes
+     *         sane around a 75% deposit — which is 1.33x leverage, at which
+     *         point the borrower should simply buy the asset. So above roughly
+     *         100% volatility, meaningful leverage is not lendable at any price.
+     *         That is a LISTING decision, not a pricing one, and it is what
+     *         this enum exists to express.
+     */
+    enum RiskTier { BlueChip, Standard, Speculative }
+
+    /**
+     * @notice Per-tier risk parameters.
+     *
+     * @dev    maxTermSeconds matters more than it looks. Risk scales with the
+     *         SQUARE ROOT of time, so the same asset can be uninsurable over 30
+     *         days and perfectly viable over 7 — measured: a 200%-volatility
+     *         asset at a 50% deposit gives 1.8% expected loss over a week and
+     *         37% over a month. Term limits belong beside deposit floors, not
+     *         as an afterthought.
+     */
+    struct TierConfig {
+        uint256 assumedVolBps;       // annualised sigma; 6000 = 60%
+        uint256 minDepositBps;       // absolute floor, bps of principal
+        uint256 maxTermSeconds;      // longest permitted loan against this tier
+        uint256 maxExposureBps;      // most of principal that may sit in one such asset
+        uint256 insurancePremiumBps; // annualised, bps of principal
+    }
+
+    mapping(RiskTier => TierConfig) public tierConfig;
+
+    /**
+     * @notice Coefficient in the volatility deposit floor, in bps. 18000 = 1.8.
+     *
+     * @dev    Calibrated so a 30-day loan at 64% volatility requires ~33%
+     *         deposit (the model says 30% suffices, so this errs conservative),
+     *         and a 7-day loan at 200% volatility requires ~50% (which the model
+     *         agrees with exactly).
+     *
+     *         Erring high is correct for a floor. It is also correct given that
+     *         the model assumes lognormal returns while crypto has fatter tails,
+     *         so every computed expected loss is UNDERSTATED — the error runs in
+     *         the unsafe direction.
+     */
+    uint256 public depositCoeffBps = 18000;
+
+    /**
+     * @notice How far a swap's execution may fall below the TWAP before it is
+     *         refused, in bps. Zero disables the check.
+     *
+     * @dev    Bounds position size by pool depth without needing to reason
+     *         about liquidity directly — execution versus TWAP measures impact
+     *         exactly.
+     *
+     *         Sized against twapToleranceBps, because a round trip pays impact
+     *         twice and fees twice. At a 300bps settlement tolerance and 30bps
+     *         of fees each way, entry impact above roughly 120bps makes the
+     *         return leg unaffordable. 100 leaves margin.
+     *
+     *         Set separately rather than folded into setSettlementConfig, whose
+     *         five-value atomic signature is relied on by existing deployments.
+     */
+    uint256 public maxEntryImpactBps = 100;
+
+    uint256 private constant YEAR = 365 days;
+
+    /**
      * @notice Where idle loan-asset funds may be parked to earn yield.
      *
      * @dev    Deliberately an interface standard rather than a named protocol.
@@ -72,6 +156,7 @@ contract AssetRegistry {
         address    aToken;       // Aave V3 aToken for this asset (address(0) = no Aave support)
         YieldVenue venue;
         address    venueAddress; // ERC-4626 vault address; unused for Aave (which uses aavePool)
+        RiskTier   tier;
         // Per-asset EXTENSION to the global swap-back grace, in seconds.
         // Only ever lengthens it — see gracePeriodOf(). Exists for assets that
         // are not continuously tradeable: tokenised equities trade 24/5, so a
@@ -96,6 +181,10 @@ contract AssetRegistry {
     event AssetRemoved(address indexed asset);
     event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
+    event TierUpdated(address indexed asset, RiskTier tier);
+    event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
+        uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
+    event DepositCoeffUpdated(uint256 previousBps, uint256 newBps);
     event IntegrationAddressesUpdated(
         address aavePool,
         address swapRouter,
@@ -134,6 +223,13 @@ contract AssetRegistry {
 
         emit OperatorUpdated(address(0), _operator);
         emit IntegrationAddressesUpdated(_aavePool, _swapRouter, _uniswapFactory, _weth);
+
+        // Launch defaults. Volatilities are placeholders until measured on
+        // chain (see the deferred observe()-derived sigma work); everything
+        // else follows from them via the model in the RiskTier comment.
+        _setTierConfig(RiskTier.BlueChip,    6000, 1000, 365 days, 10000, 100);
+        _setTierConfig(RiskTier.Standard,   10000, 2000,  90 days,  5000, 250);
+        _setTierConfig(RiskTier.Speculative, 20000, 4000,   7 days,  2500, 600);
     }
 
     // --- Modifiers ---
@@ -203,11 +299,18 @@ contract AssetRegistry {
         require(!assetConfig[_asset].whitelisted, "Asset already whitelisted");
         _validateVenue(_venue, _aToken, _venueAddress);
 
+        // Preserve any tier already assigned. Re-adding a previously removed
+        // asset overwrites the whole struct, and silently resetting a
+        // Speculative asset to BlueChip would quietly widen every mandate that
+        // referenced it.
+        RiskTier existingTier = assetConfig[_asset].tier;
+
         assetConfig[_asset] = AssetConfig({
             whitelisted:  true,
             aToken:       _aToken,
             venue:        _venue,
             venueAddress: _venueAddress,
+            tier:         existingTier,
             gracePeriod:  _gracePeriod
         });
 
@@ -253,6 +356,77 @@ contract AssetRegistry {
         assetConfig[_asset].venueAddress = _venueAddress;
 
         emit VenueUpdated(_asset, _venue, _venueAddress);
+    }
+
+    /**
+     * @notice Tags an asset with its risk tier.
+     *
+     * @dev    Separate from addAsset rather than a parameter of it, so adding
+     *         the tier system does not change existing call sites. Assets
+     *         default to BlueChip (enum zero) and must be tagged deliberately.
+     *
+     *         That default is permissive, which is a considered trade: the
+     *         whitelist is already operator-curated, so nothing reaches this
+     *         function without a deliberate listing decision. An untagged asset
+     *         being maximally CONSTRAINED would instead mean every existing
+     *         deployment silently stopped working.
+     */
+    function setTier(address _asset, RiskTier _tier) external onlyOperator {
+        require(_everAdded[_asset], "Unknown asset");
+        assetConfig[_asset].tier = _tier;
+        emit TierUpdated(_asset, _tier);
+    }
+
+    /// @notice Updates a tier's risk parameters. Applies to NEW loans only —
+    ///         vaults snapshot what they need at origination.
+    function setTierConfig(
+        RiskTier _tier,
+        uint256 _assumedVolBps,
+        uint256 _minDepositBps,
+        uint256 _maxTermSeconds,
+        uint256 _maxExposureBps,
+        uint256 _insurancePremiumBps
+    ) external onlyOperator {
+        _setTierConfig(_tier, _assumedVolBps, _minDepositBps, _maxTermSeconds,
+                       _maxExposureBps, _insurancePremiumBps);
+    }
+
+    function _setTierConfig(
+        RiskTier _tier,
+        uint256 _assumedVolBps,
+        uint256 _minDepositBps,
+        uint256 _maxTermSeconds,
+        uint256 _maxExposureBps,
+        uint256 _insurancePremiumBps
+    ) internal {
+        require(_minDepositBps  <= 10000, "Deposit floor above 100%");
+        require(_maxExposureBps <= 10000, "Exposure cap above 100%");
+        require(_maxTermSeconds > 0,      "Max term must be nonzero");
+
+        tierConfig[_tier] = TierConfig({
+            assumedVolBps:       _assumedVolBps,
+            minDepositBps:       _minDepositBps,
+            maxTermSeconds:      _maxTermSeconds,
+            maxExposureBps:      _maxExposureBps,
+            insurancePremiumBps: _insurancePremiumBps
+        });
+
+        emit TierConfigUpdated(_tier, _assumedVolBps, _minDepositBps,
+                               _maxTermSeconds, _maxExposureBps, _insurancePremiumBps);
+    }
+
+    /// @notice Updates the entry impact ceiling. Zero disables the check.
+    function setMaxEntryImpactBps(uint256 _newBps) external onlyOperator {
+        require(_newBps <= 1000, "Entry impact cap too loose");
+        maxEntryImpactBps = _newBps;
+    }
+
+    /// @notice Updates the volatility coefficient in the deposit floor.
+    function setDepositCoeffBps(uint256 _newBps) external onlyOperator {
+        require(_newBps > 0 && _newBps <= 50000, "Coefficient out of range");
+        uint256 previous = depositCoeffBps;
+        depositCoeffBps = _newBps;
+        emit DepositCoeffUpdated(previous, _newBps);
     }
 
     /// @notice Sets how much this asset extends the global swap-back grace by.
@@ -370,6 +544,104 @@ contract AssetRegistry {
      */
     function gracePeriodOf(address _asset) external view returns (uint256) {
         return swapBackGracePeriod + assetConfig[_asset].gracePeriod;
+    }
+
+    /// @notice The asset's risk tier. Readable after whitelist removal, like
+    ///         aTokenOf, so in-flight vaults can still settle.
+    function tierOf(address _asset) external view returns (RiskTier) {
+        return assetConfig[_asset].tier;
+    }
+
+    /**
+     * @notice Minimum deposit for a loan of this term against this asset, in
+     *         bps of principal.
+     *
+     *         minDeposit = max( tierFloor,  coeff × sigma × sqrt(term / year) )
+     *
+     * @dev    The square root is the whole point. Risk scales with sqrt(T), not
+     *         T, because price movement compounds as a random walk — so a term
+     *         four times longer carries only twice the volatility.
+     *
+     *         Worked, for a 30-day loan against a 60%-volatility asset:
+     *           sqrt(30/365)               = 0.2867
+     *           1.8 × 0.60 × 0.2867        = 0.3096  ->  3096 bps
+     *         Against the same asset over 7 days:
+     *           1.8 × 0.60 × 0.1385        = 0.1496  ->  1496 bps
+     *
+     *         Fixed-point handling: sqrt(term/YEAR) is computed as
+     *         sqrt(term × 1e36 / YEAR), which yields the root scaled by 1e18
+     *         and keeps full precision through the multiply.
+     */
+    function minimumDepositBpsForTier(RiskTier _tier, uint256 _termSeconds)
+        public view returns (uint256)
+    {
+        TierConfig storage cfg = tierConfig[_tier];
+
+        uint256 sqrtTermScaled = _sqrt((_termSeconds * 1e36) / YEAR);
+        uint256 volFloor =
+            (depositCoeffBps * cfg.assumedVolBps * sqrtTermScaled) / (10000 * 1e18);
+
+        if (volFloor > 10000) { volFloor = 10000; }
+        return volFloor > cfg.minDepositBps ? volFloor : cfg.minDepositBps;
+    }
+
+    /**
+     * @notice The same figure for a specific asset, for display.
+     *
+     * @dev    NOT what governs origination. At origination the borrower has not
+     *         chosen what to hold — only the ceiling they are permitted — so
+     *         the binding floor comes from the vault's maxTier, not from the
+     *         loan's denomination. A USDG loan that permits Speculative
+     *         exposure carries Speculative risk.
+     *
+     *         This overload answers "what would holding THIS asset require",
+     *         which is a useful thing to show a borrower and the wrong thing to
+     *         enforce.
+     */
+    function minimumDepositBps(address _asset, uint256 _termSeconds)
+        external view returns (uint256)
+    {
+        return minimumDepositBpsForTier(assetConfig[_asset].tier, _termSeconds);
+    }
+
+    /// @notice Longest loan permitted for a given risk ceiling.
+    function maxTermForTier(RiskTier _tier) external view returns (uint256) {
+        return tierConfig[_tier].maxTermSeconds;
+    }
+
+    /// @notice Longest loan permitted against this asset.
+    function maxTermFor(address _asset) external view returns (uint256) {
+        return tierConfig[assetConfig[_asset].tier].maxTermSeconds;
+    }
+
+    /// @notice Most of a loan's principal that may sit in this one asset.
+    function maxExposureBpsFor(address _asset) external view returns (uint256) {
+        return tierConfig[assetConfig[_asset].tier].maxExposureBps;
+    }
+
+    /// @notice Annualised insurance premium for holding this asset, in bps of
+    ///         principal. Charged to the borrower, priced on the full term.
+    function insurancePremiumBpsFor(address _asset) external view returns (uint256) {
+        return tierConfig[assetConfig[_asset].tier].insurancePremiumBps;
+    }
+
+    /// @notice The same figure keyed to a risk ceiling. This is what a vault
+    ///         charges, since the premium insures what the borrower MAY hold
+    ///         rather than what the loan is denominated in.
+    function insurancePremiumBpsForTier(RiskTier _tier) external view returns (uint256) {
+        return tierConfig[_tier].insurancePremiumBps;
+    }
+
+    /// @dev Babylonian square root. Vendored rather than imported so the
+    ///      registry keeps no external dependency for four lines of arithmetic.
+    function _sqrt(uint256 x) private pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
     }
 
     /// @notice Total number of assets ever added (including removed ones).

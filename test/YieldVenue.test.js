@@ -93,6 +93,16 @@ describe("Yield venue and per-asset grace", function () {
     );
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
 
+    // Tier limits disabled for this suite. These tests predate the risk tiers
+    // and assert settlement mechanics, not risk policy — same reasoning as
+    // setProtocolFeeRateBps(0). Left enabled, the volatility deposit floor
+    // alone would reject every fixture: a one-year loan against 60% assumed
+    // volatility requires a 100% deposit, which is the model being correct
+    // rather than the fixtures being wrong.
+    for (const t of [0, 1, 2]) {
+      await registry.setTierConfig(t, 0, 0, 365 * 24 * 3600, 10000, 0);
+    }
+
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000);
 
