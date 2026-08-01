@@ -194,16 +194,27 @@ async function main() {
     await (await usdg.approve(d.vaultFactory, need)).wait();
 
     const before = await factory.totalVaults();
-    await (await factory.deployVault(
+
+    // WithTier, and BlueChip specifically. The plain deployVault defaults to
+    // Speculative, whose 40% deposit floor and short maximum term would reject
+    // these terms outright — correctly, since that tier exists for assets this
+    // proof is not using.
+    await (await factory.deployVaultWithTier(
       d.tokens.tUSDG, borrower.address, PRINCIPAL, FEE_BPS, durationSeconds, true, DEPOSIT,
-      ethers.ZeroAddress
+      ethers.ZeroAddress, 0
     )).wait();
 
     const vaultAddr = await factory.allVaults(before);
     const vault = await ethers.getContractAt("Vault", vaultAddr);
 
-    await (await usdg.mint(borrower.address, DEPOSIT)).wait();
-    await (await usdg.connect(borrower).approve(vaultAddr, DEPOSIT)).wait();
+    // payDeposit pulls the deposit AND the insurance premium together, so the
+    // approval has to cover both. The premium is tiny at these terms — 1%
+    // annualised over 900 seconds — but a short approval reverts regardless.
+    const premium = await vault.insurancePremium();
+    const owed = DEPOSIT + premium;
+
+    await (await usdg.mint(borrower.address, owed)).wait();
+    await (await usdg.connect(borrower).approve(vaultAddr, owed)).wait();
     await (await vault.connect(borrower).payDeposit()).wait();
 
     console.log(`\n${label}`);

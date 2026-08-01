@@ -79,6 +79,33 @@ async function main() {
   const usdg = uni.tokens.tUSDG;
   const weth = uni.tokens.tWETH;
 
+  // --- Prerequisites must actually exist ---------------------------------
+  //
+  // A call to an address with no code SUCCEEDS with empty returndata. So a
+  // vanished token silently accepts mint() and approve() as no-ops, and the
+  // failure only surfaces later where a bool return is decoded — which is how
+  // a wiped testnet presented as "Funding transfer failed" three steps
+  // downstream of the actual problem.
+  //
+  // Robinhood Chain testnet HAS been reset at least once, taking every
+  // deployed contract with it. Check before doing any work.
+  for (const [label, addr] of [
+    ["Uniswap factory", uni.uniswapFactory],
+    ["SwapRouter02",    uni.swapRouter],
+    ["tUSDG",           usdg],
+    ["tWETH",           weth],
+    ["pool",            uni.pools[0].address],
+  ]) {
+    if ((await ethers.provider.getCode(addr)).length <= 2) {
+      throw new Error(
+        `${label} at ${addr} has no code.\n\n` +
+        `Everything in uniswap-testnet.json is gone — the testnet has been reset.\n` +
+        `Re-run scripts/deploy-uniswap-testnet.js first, then this script.`
+      );
+    }
+  }
+  console.log("\nPrerequisites verified — Uniswap and tokens still deployed.");
+
   // --- 1. KYCRegistry (fresh — nothing exists on this chain) -----------
 
   const kyc = await (await ethers.getContractFactory("KYCRegistry", deployer))
@@ -139,6 +166,28 @@ async function main() {
     BOUNTY_RATE_PER_HOUR_BPS, BOUNTY_CAP_BPS
   )).wait();
   console.log(`  settlement config set (twapWindow ${TWAP_WINDOW_SECONDS}s — see header)`);
+
+  // --- Risk tiers ---
+  //
+  // Launch defaults are in the constructor; these override them for a testnet
+  // where terms are measured in minutes. The deposit floor scales with
+  // sqrt(term), so at 900 seconds the volatility component is ~0.6% and the
+  // absolute floor governs — without one, a testnet loan would need no deposit
+  // at all and the settlement paths would never be exercised properly.
+  //
+  // Maximum terms stay short deliberately: they are what makes a volatile
+  // asset lendable, and testnet is where that should be visible.
+  await (await registry.setTierConfig(0, 6000, 1000,  30 * 86400, 10000, 100)).wait();
+  await (await registry.setTierConfig(1, 10000, 2000,  7 * 86400,  5000, 250)).wait();
+  await (await registry.setTierConfig(2, 20000, 4000,      86400,  2500, 600)).wait();
+  console.log("  tier config set (BlueChip / Standard / Speculative)");
+
+  // Both test tokens are blue chip here — they are mock ERC-20s against a pool
+  // we control, so the tier reflects how they behave rather than what they are
+  // named after.
+  await (await registry.setTier(usdg, 0)).wait();
+  await (await registry.setTier(weth, 0)).wait();
+  console.log("  tUSDG and tWETH tagged BlueChip");
 
   // --- 5. VaultFactory ---------------------------------------------------
 
