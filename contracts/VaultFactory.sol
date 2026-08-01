@@ -218,10 +218,18 @@ contract VaultFactory {
         // Speculative is the most PERMISSIVE ceiling, which preserves existing
         // behaviour exactly: before tiers there was no ceiling at all. Callers
         // wanting the protection use deployVaultWithTier and say so.
-        return _deployVault(
-            _asset, _borrower, _principal, _aprBps, _duration, _useSeconds,
-            _depositAmount, _referrer, uint8(AssetRegistry.RiskTier.Speculative)
-        );
+        return _deployVault(OriginationParams({
+            lender:        msg.sender,
+            asset:         _asset,
+            borrower:      _borrower,
+            principal:     _principal,
+            aprBps:        _aprBps,
+            duration:      _duration,
+            useSeconds:    _useSeconds,
+            depositAmount: _depositAmount,
+            referrer:      _referrer,
+            maxTier:       uint8(AssetRegistry.RiskTier.Speculative)
+        }));
     }
 
     /**
@@ -245,42 +253,62 @@ contract VaultFactory {
         address _referrer,
         uint8   _maxTier
     ) external returns (address) {
-        return _deployVault(
-            _asset, _borrower, _principal, _aprBps, _duration, _useSeconds,
-            _depositAmount, _referrer, _maxTier
-        );
+        return _deployVault(OriginationParams({
+            lender:        msg.sender,
+            asset:         _asset,
+            borrower:      _borrower,
+            principal:     _principal,
+            aprBps:        _aprBps,
+            duration:      _duration,
+            useSeconds:    _useSeconds,
+            depositAmount: _depositAmount,
+            referrer:      _referrer,
+            maxTier:       _maxTier
+        }));
     }
 
-    function _deployVault(
-        address _asset,
-        address _borrower,
-        uint256 _principal,
-        uint256 _aprBps,
-        uint256 _duration,
-        bool    _useSeconds,
-        uint256 _depositAmount,
-        address _referrer,
-        uint8   _maxTier
-    ) internal returns (address) {
+    /**
+     * @dev Everything origination needs, as one struct.
+     *
+     *      The lender is explicit rather than taken from msg.sender, because a
+     *      mandate fill is called by the BORROWER — the lender consented in
+     *      advance by publishing the mandate and approving this factory. Ten
+     *      separate parameters would also overflow the stack, which is the same
+     *      reason LoanTerms and FeeConfig exist.
+     */
+    struct OriginationParams {
+        address lender;
+        address asset;
+        address borrower;
+        uint256 principal;
+        uint256 aprBps;
+        uint256 duration;
+        bool    useSeconds;
+        uint256 depositAmount;
+        address referrer;
+        uint8   maxTier;
+    }
+
+    function _deployVault(OriginationParams memory p) internal returns (address) {
 
         // --- Gates ---
-        require(kycRegistry.isVerified(_borrower),     "Borrower is not KYC verified");
-        require(assetRegistry.isWhitelisted(_asset),   "Loan asset is not whitelisted");
+        require(kycRegistry.isVerified(p.borrower),     "Borrower is not KYC verified");
+        require(assetRegistry.isWhitelisted(p.asset),   "Loan asset is not whitelisted");
 
         // --- Basic validation ---
-        require(_principal > 0,     "Principal must be greater than zero");
-        require(_aprBps > 0,        "APR must be greater than zero");
-        require(_duration > 0,      "Duration must be greater than zero");
-        require(_depositAmount > 0, "Deposit must be greater than zero");
+        require(p.principal > 0,     "Principal must be greater than zero");
+        require(p.aprBps > 0,        "APR must be greater than zero");
+        require(p.duration > 0,      "Duration must be greater than zero");
+        require(p.depositAmount > 0, "Deposit must be greater than zero");
 
         // --- Risk limits, keyed to the ceiling the lender granted ---
         //
-        // Both bind on _maxTier rather than on the loan asset. At origination
+        // Both bind on p.maxTier rather than on the loan asset. At origination
         // the borrower has not chosen what to hold, only what they are allowed
         // to hold, and it is that permission the lender is underwriting.
         {
-            AssetRegistry.RiskTier tier = AssetRegistry.RiskTier(_maxTier);
-            uint256 termSeconds = _useSeconds ? _duration : _duration * 1 days;
+            AssetRegistry.RiskTier tier = AssetRegistry.RiskTier(p.maxTier);
+            uint256 termSeconds = p.useSeconds ? p.duration : p.duration * 1 days;
 
             require(
                 termSeconds <= assetRegistry.maxTermForTier(tier),
@@ -292,7 +320,7 @@ contract VaultFactory {
             // over 7 days needs ~15%.
             uint256 floorBps = assetRegistry.minimumDepositBpsForTier(tier, termSeconds);
             require(
-                _depositAmount >= (_principal * floorBps) / 10000,
+                p.depositAmount >= (p.principal * floorBps) / 10000,
                 "Deposit below the volatility floor for this tier and term"
             );
         }
@@ -309,21 +337,21 @@ contract VaultFactory {
         address vaultAddress = Clones.clone(vaultImplementation);
         Vault(vaultAddress).initialize(
             LoanTerms({
-                asset:         _asset,
-                lender:        msg.sender,
-                borrower:      _borrower,
-                principal:     _principal,
-                aprBps:        _aprBps,
-                duration:      _duration,
-                useSeconds:    _useSeconds,
-                depositAmount: _depositAmount,
+                asset:         p.asset,
+                lender:        p.lender,
+                borrower:      p.borrower,
+                principal:     p.principal,
+                aprBps:        p.aprBps,
+                duration:      p.duration,
+                useSeconds:    p.useSeconds,
+                depositAmount: p.depositAmount,
                 registry:      address(assetRegistry),
                 insurancePool: address(insurancePool),
-                maxTier:       _maxTier
+                maxTier:       p.maxTier
             }),
             FeeConfig({
                 treasury:           treasury,
-                referrer:           _referrer,
+                referrer:           p.referrer,
                 protocolFeeRateBps: protocolFeeRateBps,
                 referrerShareBps:   referrerShareBps,
                 minimumFeeBps:      minimumFeeBps
@@ -332,19 +360,19 @@ contract VaultFactory {
 
         // --- Fund vault with principal (pulled from the lender) ---
         require(
-            IERC20(_asset).transferFrom(msg.sender, vaultAddress, _principal),
+            IERC20(p.asset).transferFrom(p.lender, vaultAddress, p.principal),
             "Principal transfer failed"
         );
 
         // --- Insurance skim: pull from lender, fund the pool ---
-        uint256 skim = quoteInsuranceSkim(_principal, _aprBps, _duration, _useSeconds);
+        uint256 skim = quoteInsuranceSkim(p.principal, p.aprBps, p.duration, p.useSeconds);
         if (skim > 0) {
             require(
-                IERC20(_asset).transferFrom(msg.sender, address(this), skim),
+                IERC20(p.asset).transferFrom(p.lender, address(this), skim),
                 "Skim transfer failed"
             );
-            require(IERC20(_asset).approve(address(insurancePool), skim), "Skim approval failed");
-            insurancePool.fund(_asset, skim);
+            require(IERC20(p.asset).approve(address(insurancePool), skim), "Skim approval failed");
+            insurancePool.fund(p.asset, skim);
         }
 
         // --- Register vault with the pool (enables shortfall draws) ---
@@ -352,12 +380,12 @@ contract VaultFactory {
 
         // --- Record vault ---
         allVaults.push(vaultAddress);
-        vaultsByBorrower[_borrower].push(vaultAddress);
-        vaultsByLender[msg.sender].push(vaultAddress);
+        vaultsByBorrower[p.borrower].push(vaultAddress);
+        vaultsByLender[p.lender].push(vaultAddress);
 
         emit VaultDeployed(
-            vaultAddress, msg.sender, _borrower, _asset,
-            _principal, _depositAmount, _aprBps, skim, Vault(vaultAddress).deadline()
+            vaultAddress, p.lender, p.borrower, p.asset,
+            p.principal, p.depositAmount, p.aprBps, skim, Vault(vaultAddress).deadline()
         );
 
         return vaultAddress;
@@ -440,6 +468,361 @@ contract VaultFactory {
         return (fee * protocolFeeRateBps) / 10000;
     }
 
+    // =====================================================================
+    // Mandates
+    // =====================================================================
+    //
+    // A lender publishes terms they will accept; a borrower fills them. Capital
+    // stays in the lender's wallet until a fill, so nothing is locked up
+    // waiting — which is the friction that otherwise kills the scarce side of
+    // a two-sided market.
+    //
+    // WHY THIS LIVES IN THE FACTORY rather than a separate book contract: the
+    // vault records msg.sender as its lender. A separate contract filling on a
+    // lender's behalf would either become the lender of record — so settlement
+    // pays the book instead of the lender — or need privileged authority to
+    // originate against anyone's allowance. Keeping it here removes the
+    // question entirely.
+    //
+    // THE PRICING IS A FORMULA, NOT A RANGE, and that is the central decision.
+    // A mandate quoting "11-15% APR, 7-90 days, 15-40% deposit" is not a range
+    // of acceptable terms; it is the lender's WORST terms with decoration
+    // around them, because every borrower will take 11% at 90 days on a 15%
+    // deposit. A formula prices every point on the surface, so the lender is
+    // indifferent across it rather than exposed at one corner.
+
+    struct Mandate {
+        address lender;
+        address asset;
+        uint256 minPrincipal;
+        uint256 maxPrincipal;
+        uint256 minTermSeconds;
+        uint256 maxTermSeconds;
+        uint256 expiry;
+        uint256 nonce;              // lender's nonce when published; cancel-all bumps it
+        uint8   maxTier;            // risk ceiling granted to the borrower
+        bool    cancelled;
+        address permittedBorrower;  // address(0) = open to any verified borrower
+
+        // --- pricing surface ---
+        uint256 baseAprBps;                 // at the mandate's minimum term and deposit
+        uint256 termPremiumBpsPerDay;       // added per day of term
+        uint256 depositCreditBpsPerPoint;   // subtracted per whole % of deposit above the minimum
+        uint256 minDepositBps;              // the mandate's own floor, on top of the tier's
+        uint256 minAprBps;                  // the formula can never price below this
+    }
+
+    /// @dev Published as one struct: eleven-plus arguments would overflow the
+    ///      stack for the same reason LoanTerms exists.
+    struct MandateTerms {
+        address asset;
+        uint256 minPrincipal;
+        uint256 maxPrincipal;
+        uint256 minTermSeconds;
+        uint256 maxTermSeconds;
+        uint256 validForSeconds;
+        uint8   maxTier;
+        address permittedBorrower;
+        uint256 baseAprBps;
+        uint256 termPremiumBpsPerDay;
+        uint256 depositCreditBpsPerPoint;
+        uint256 minDepositBps;
+        uint256 minAprBps;
+    }
+
+    Mandate[] internal _mandates;
+
+    /// @notice Bumped by cancelAllMandates. Every mandate carries the nonce it
+    ///         was published under, so raising it invalidates all of them at
+    ///         once — one transaction when a lender needs to withdraw from the
+    ///         market, rather than one per mandate.
+    mapping(address => uint256) public lenderNonce;
+
+    /**
+     * @notice Longest a mandate may remain valid.
+     *
+     * @dev Expiry is mandatory, and this caps how far it can be pushed out.
+     *      A standing offer is an option written to the market for free: it
+     *      will be exercised precisely when it is worst for the lender —
+     *      when rates have moved, when volatility spikes and non-liquidating
+     *      leverage becomes most valuable. Expiry is what makes INACTION safe,
+     *      which matters because a lender cannot watch the market continuously
+     *      and an adversary only has to act once.
+     */
+    uint256 public maxMandateDuration = 7 days;
+
+    event MandatePublished(uint256 indexed id, address indexed lender, address indexed asset,
+        uint256 maxPrincipal, uint256 expiry, uint8 maxTier);
+    event MandateCancelled(uint256 indexed id, address indexed lender);
+    event MandateFilled(uint256 indexed id, address indexed lender, address indexed borrower,
+        address vault, uint256 principal, uint256 aprBps);
+    event AllMandatesCancelled(address indexed lender, uint256 newNonce);
+    event MaxMandateDurationUpdated(uint256 previous, uint256 newValue);
+
+    // --- Publishing ---
+
+    function publishMandate(MandateTerms calldata t) external returns (uint256 id) {
+        require(assetRegistry.isWhitelisted(t.asset),     "Loan asset is not whitelisted");
+        require(t.minPrincipal > 0,                       "Minimum principal must be nonzero");
+        require(t.maxPrincipal >= t.minPrincipal,         "Maximum below minimum principal");
+        require(t.minTermSeconds > 0,                     "Minimum term must be nonzero");
+        require(t.maxTermSeconds >= t.minTermSeconds,     "Maximum below minimum term");
+        require(t.validForSeconds > 0,                    "Mandate must have a lifetime");
+        require(t.validForSeconds <= maxMandateDuration,  "Mandate lifetime too long");
+        require(t.baseAprBps > 0,                         "Base APR must be nonzero");
+        require(t.minAprBps > 0,                          "Minimum APR must be nonzero");
+        require(t.minAprBps <= t.baseAprBps,              "Minimum APR above base");
+        require(t.minDepositBps <= 10000,                 "Deposit floor above 100%");
+        require(
+            t.maxTermSeconds <= assetRegistry.maxTermForTier(AssetRegistry.RiskTier(t.maxTier)),
+            "Maximum term exceeds the tier's limit"
+        );
+
+        // Written field-by-field into storage rather than built as a memory
+        // struct literal. Sixteen fields constructed at once overflows the
+        // stack — the same limit that produced LoanTerms and FeeConfig — and
+        // assigning through a storage pointer avoids the memory copy entirely.
+        id = _mandates.length;
+        _mandates.push();
+        Mandate storage m = _mandates[id];
+
+        m.lender                   = msg.sender;
+        m.asset                    = t.asset;
+        m.minPrincipal             = t.minPrincipal;
+        m.maxPrincipal             = t.maxPrincipal;
+        m.minTermSeconds           = t.minTermSeconds;
+        m.maxTermSeconds           = t.maxTermSeconds;
+        m.expiry                   = block.timestamp + t.validForSeconds;
+        m.nonce                    = lenderNonce[msg.sender];
+        m.maxTier                  = t.maxTier;
+        m.permittedBorrower        = t.permittedBorrower;
+        m.baseAprBps               = t.baseAprBps;
+        m.termPremiumBpsPerDay     = t.termPremiumBpsPerDay;
+        m.depositCreditBpsPerPoint = t.depositCreditBpsPerPoint;
+        m.minDepositBps            = t.minDepositBps;
+        m.minAprBps                = t.minAprBps;
+        // cancelled defaults to false
+
+        emit MandatePublished(id, msg.sender, t.asset, t.maxPrincipal, m.expiry, t.maxTier);
+    }
+
+    function cancelMandate(uint256 id) external {
+        require(id < _mandates.length,             "No such mandate");
+        require(_mandates[id].lender == msg.sender, "Not your mandate");
+        _mandates[id].cancelled = true;
+        emit MandateCancelled(id, msg.sender);
+    }
+
+    /// @notice Invalidates every mandate this lender has published, in one
+    ///         transaction. The point is that withdrawing from the market
+    ///         during a rate move must be cheap — if it is not, lenders leave
+    ///         stale mandates standing rather than pay to remove them, and the
+    ///         book fills with mispriced liquidity.
+    function cancelAllMandates() external {
+        lenderNonce[msg.sender] += 1;
+        emit AllMandatesCancelled(msg.sender, lenderNonce[msg.sender]);
+    }
+
+    // --- Pricing and validity ---
+
+    /// @notice True if this mandate could be filled at all right now. Does not
+    ///         consider the lender's balance or allowance — see
+    ///         quoteMandateFillable for that.
+    function isMandateLive(uint256 id) public view returns (bool) {
+        if (id >= _mandates.length) return false;
+        Mandate storage m = _mandates[id];
+        return !m.cancelled
+            && block.timestamp <= m.expiry
+            && m.nonce == lenderNonce[m.lender];
+    }
+
+    /**
+     * @notice The APR this mandate charges for a given term and deposit.
+     *
+     *         apr = base
+     *             + termPremiumPerDay x days
+     *             - depositCredit x (deposit% - mandate minimum%)
+     *
+     *         floored at minAprBps.
+     *
+     * @dev Longer term costs more; a larger deposit costs less. Both are the
+     *      borrower's choice, and both are priced — so there is no corner of
+     *      the mandate that is cheap relative to the rest.
+     */
+    function quoteMandateApr(uint256 id, uint256 termSeconds, uint256 depositBps)
+        public view returns (uint256)
+    {
+        Mandate storage m = _mandates[id];
+
+        uint256 apr = m.baseAprBps + (m.termPremiumBpsPerDay * termSeconds) / 1 days;
+
+        if (depositBps > m.minDepositBps) {
+            uint256 credit = (m.depositCreditBpsPerPoint * (depositBps - m.minDepositBps)) / 100;
+            apr = credit >= apr ? 0 : apr - credit;
+        }
+
+        return apr < m.minAprBps ? m.minAprBps : apr;
+    }
+
+    /// @notice How much of this mandate could actually be drawn right now —
+    ///         the lesser of what the lender has approved, what they hold, and
+    ///         what the mandate offers.
+    ///
+    /// @dev An allowance is not a commitment; it can be revoked at any moment
+    ///      for free. A book that displays intended size rather than this
+    ///      becomes a book of liquidity that cannot be taken.
+    function quoteMandateFillable(uint256 id) public view returns (uint256) {
+        if (!isMandateLive(id)) return 0;
+        Mandate storage m = _mandates[id];
+
+        uint256 allowance = IERC20(m.asset).allowance(m.lender, address(this));
+        uint256 balance   = IERC20(m.asset).balanceOf(m.lender);
+
+        uint256 available = allowance < balance ? allowance : balance;
+        return available < m.maxPrincipal ? available : m.maxPrincipal;
+    }
+
+    function totalMandates() external view returns (uint256) {
+        return _mandates.length;
+    }
+
+    // --- Filling ---
+
+    /**
+     * @notice Fills a mandate. Called by the BORROWER, who picks the size,
+     *         term and deposit; the mandate's formula prices the result.
+     *
+     * @dev Everything happens here or nothing does. The lender's principal, the
+     *      borrower's deposit and the insurance premium all move in this one
+     *      transaction, and the vault is left fully funded rather than waiting
+     *      on a second call that may never come.
+     *
+     *      That matters because the mandate flow reverses who initiates. In a
+     *      direct origination the lender acts and the borrower funds afterwards
+     *      — an unfunded vault is the borrower's problem, and cancel() returns
+     *      the principal. Here the borrower acts, so a non-atomic fill would
+     *      let anyone lock a lender's capital until the deadline for the price
+     *      of gas, across every mandate on the book.
+     */
+    function fillMandate(
+        uint256 id,
+        uint256 principal,
+        uint256 duration,
+        bool    useSeconds,
+        uint256 deposit
+    ) external returns (address vaultAddress) {
+        require(isMandateLive(id), "Mandate is not live");
+
+        uint256 apr;
+        address asset;
+        address lender;
+
+        // Scoped so the mandate pointer and the validation locals are dead
+        // before origination, which needs the stack.
+        {
+            Mandate storage m = _mandates[id];
+            asset  = m.asset;
+            lender = m.lender;
+
+            require(
+                m.permittedBorrower == address(0) || m.permittedBorrower == msg.sender,
+                "Not the permitted borrower for this mandate"
+            );
+            require(
+                principal >= m.minPrincipal && principal <= m.maxPrincipal,
+                "Principal outside the mandate's bounds"
+            );
+
+            uint256 termSeconds = useSeconds ? duration : duration * 1 days;
+            require(
+                termSeconds >= m.minTermSeconds && termSeconds <= m.maxTermSeconds,
+                "Term outside the mandate's bounds"
+            );
+
+            uint256 depositBps = (deposit * 10000) / principal;
+            require(depositBps >= m.minDepositBps, "Deposit below the mandate's minimum");
+
+            apr = quoteMandateApr(id, termSeconds, depositBps);
+        }
+
+        vaultAddress = _deployVault(OriginationParams({
+            lender:        lender,
+            asset:         asset,
+            borrower:      msg.sender,
+            principal:     principal,
+            aprBps:        apr,
+            duration:      duration,
+            useSeconds:    useSeconds,
+            depositAmount: deposit,
+            referrer:      address(0),
+            maxTier:       _mandates[id].maxTier
+        }));
+
+        _fundBorrowerSide(vaultAddress, asset, deposit);
+
+        emit MandateFilled(id, lender, msg.sender, vaultAddress, principal, apr);
+    }
+
+    /**
+     * @dev Moves the borrower's money in. Split out because fillMandate's stack
+     *      is already carrying the mandate's terms.
+     *
+     *      The premium is read FROM THE VAULT rather than recomputed here.
+     *      Vault.initialize derives it from the registry, and a second
+     *      implementation of the same formula in this contract would be a
+     *      standing invitation for the two to disagree.
+     */
+    function _fundBorrowerSide(address vaultAddress, address asset, uint256 deposit) internal {
+        require(
+            IERC20(asset).transferFrom(msg.sender, vaultAddress, deposit),
+            "Deposit transfer failed"
+        );
+        Vault(vaultAddress).creditDeposit();
+
+        uint256 premium = Vault(vaultAddress).insurancePremium();
+        if (premium > 0) {
+            require(
+                IERC20(asset).transferFrom(msg.sender, address(this), premium),
+                "Premium transfer failed"
+            );
+            require(
+                IERC20(asset).approve(address(insurancePool), premium),
+                "Premium approval failed"
+            );
+            insurancePool.fund(asset, premium);
+        }
+    }
+
+    /// @notice What a borrower must approve this factory for before filling —
+    ///         deposit plus premium, in the loan asset.
+    function quoteFillCost(uint256 id, uint256 principal, uint256 duration, bool useSeconds, uint256 deposit)
+        external view returns (uint256 depositOwed, uint256 premiumOwed)
+    {
+        uint256 termSeconds = useSeconds ? duration : duration * 1 days;
+        uint256 premiumBps = assetRegistry.insurancePremiumBpsForTier(
+            AssetRegistry.RiskTier(_mandates[id].maxTier)
+        );
+        return (deposit, (principal * premiumBps * termSeconds) / (10000 * 365 days));
+    }
+
+    /**
+     * @notice Reads a mandate.
+     *
+     * @dev The array is internal with this getter in front of it, rather than
+     *      public, because Solidity's generated getter for a public array of a
+     *      sixteen-field struct returns sixteen separate values — and pushing
+     *      sixteen returns onto the stack overflows it. Returning a memory
+     *      struct costs one pointer instead.
+     *
+     *      Same limit that produced LoanTerms and FeeConfig, reached from a
+     *      different direction: there the problem was passing many arguments,
+     *      here it is returning many values.
+     */
+    function mandate(uint256 id) external view returns (Mandate memory) {
+        require(id < _mandates.length, "No such mandate");
+        return _mandates[id];
+    }
+
     // --- Admin functions ---
 
     function setInsuranceSkimRateBps(uint256 _newBps) external onlyOwner {
@@ -477,6 +860,16 @@ contract VaultFactory {
         uint256 previous = referrerShareBps;
         referrerShareBps = _newBps;
         emit ReferrerShareUpdated(previous, _newBps);
+    }
+
+    /// @notice Caps how long a mandate may stay valid. Shorter is safer: a
+    ///         standing offer is an option written for free, and expiry is
+    ///         what bounds how stale it can become.
+    function setMaxMandateDuration(uint256 _seconds) external onlyOwner {
+        require(_seconds > 0 && _seconds <= 30 days, "Duration out of range");
+        uint256 previous = maxMandateDuration;
+        maxMandateDuration = _seconds;
+        emit MaxMandateDurationUpdated(previous, _seconds);
     }
 
     /// @notice Updates the minimum interest charge, capped at

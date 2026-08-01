@@ -9,4 +9,11 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
+
+    /// @dev Added for mandate fillability. A lender's capital stays in their
+    ///      own wallet until a fill, so what can actually be drawn is
+    ///      min(allowance, balance) — and an allowance can be revoked for
+    ///      free at any moment, which is precisely why it has to be read
+    ///      rather than assumed.
+    function allowance(address owner, address spender) external view returns (uint256);
 }

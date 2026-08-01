@@ -453,6 +453,34 @@ contract Vault {
     }
 
     /**
+     * @notice Marks the deposit paid when the factory has already transferred
+     *         it in. Used only by mandate fills.
+     *
+     * @dev Exists so a fill can be ATOMIC. In the mandate flow the borrower
+     *      initiates, which reverses the usual risk: the lender's principal is
+     *      committed the moment the vault exists, and a borrower who simply
+     *      walks away would lock that capital until the deadline. A griefer
+     *      could do that to every mandate on the book for the cost of gas.
+     *
+     *      So the factory moves both sides in one transaction and calls this.
+     *      The balance check is what makes it safe to trust: the deposit cannot
+     *      be credited unless the funds are demonstrably present, whatever the
+     *      caller claims.
+     */
+    function creditDeposit() external {
+        require(msg.sender == factory, "Only the factory may credit a deposit");
+        require(deposit == 0,          "Deposit already paid");
+        require(!isSettled,            "Loan already settled");
+        require(
+            IERC20(asset).balanceOf(address(this)) >= principal + _requiredDeposit,
+            "Deposit has not been received"
+        );
+
+        deposit = _requiredDeposit;
+        emit DepositReceived(borrower, _requiredDeposit);
+    }
+
+    /**
      * @notice Returns principal to the lender when the borrower never funded.
      *
      * @dev Without this, an unfunded vault could still be settled after its
