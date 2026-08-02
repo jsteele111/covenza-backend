@@ -25,10 +25,17 @@ const REGISTRY_ADDRESS = networkAddresses.kycRegistry;
 const artifactPath = path.join(__dirname, "..", "artifacts", "contracts", "KYCRegistry.sol", "KYCRegistry.json");
 const { abi } = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
 
-// --- Provider: supports both localhost and Arbitrum Sepolia ---
+// --- Provider ---
+//
+// Robinhood testnet was missing here, so a request made while the app was on
+// chain 46630 was answered from whichever OTHER network this defaulted to —
+// reporting on a registry the caller was not using. It refused a wallet as
+// "already verified" that was not verified on the chain in question.
 const RPC_URLS = {
   localhost: "http://127.0.0.1:8545",
   arbitrumSepolia: process.env.ARBITRUM_SEPOLIA_RPC_URL,
+  robinhoodTestnet: process.env.ROBINHOOD_TESTNET_RPC_URL,
+  robinhoodMainnet: process.env.ROBINHOOD_MAINNET_RPC_URL,
 };
 
 const RPC_URL = RPC_URLS[NETWORK];
@@ -96,8 +103,26 @@ app.post("/verify", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Mock KYC verifier service running at http://localhost:${PORT}`);
   console.log(`Network:  ${NETWORK}`);
   console.log(`Registry: ${REGISTRY_ADDRESS}`);
+  console.log(`Signing:  ${verifierWallet.address}`);
+
+  // The registry accepts a signature only if the signing key is a recognised
+  // attester. Saying so at startup turns a silent, confusing rejection at
+  // submission time into a line the operator can act on before testing.
+  try {
+    const recognised = await registry.isRecognisedAttester(verifierWallet.address);
+    if (recognised) {
+      console.log("Status:   signing key IS a recognised attester.");
+    } else {
+      console.log("Status:   signing key is NOT recognised — attestations will be refused.");
+      console.log("          Register it with:");
+      console.log(`            ACTION=add KEY=${verifierWallet.address} NAME="Testnet mock signer" URL="https://example.invalid" \\`);
+      console.log(`              npx hardhat run scripts/manage-attesters.js --network ${NETWORK}`);
+    }
+  } catch {
+    console.log("Status:   registry predates recognised attesters (no isRecognisedAttester).");
+  }
 });

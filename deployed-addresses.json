@@ -38,7 +38,7 @@
   },
   "robinhoodTestnet": {
     "chainId": 46630,
-    "kycRegistry": "0x93e1c4F4b0cD3F6A3feB7B6C056466535881a38e",
+    "kycRegistry": "0x2A921Bd852CA4E22ef73A7772706771A1e4586E1",
     "assetRegistry": "0x71FFe1CA1D087c2b72F661CB7F75172ce25badfd",
     "insurancePool": "0xcC56F8560678ebd2a8708D5181C11e3a3faFed07",
     "vaultFactory": "0xdD04fd410B2Ea44E44931C8fdb8248B6B96BA8F5",
@@ -63,6 +63,8 @@
     "uniswapTwapLib": "0xaB5f05Ae0B69bDd920d8B411938292dDA8bC0539",
     "previousVaultFactory": "0x283fc22aCEBCE5cB673B32ccbD77Fe732C4eB0E2",
     "factoryUpgradedAt": "2026-08-01T23:56:35.826Z",
-    "factoryVersion": "phase 4 — risk tiers, borrower-funded premium, mandates"
+    "factoryVersion": "phase 4 — risk tiers, borrower-funded premium, mandates",
+    "previousKycRegistry": "0x93e1c4F4b0cD3F6A3feB7B6C056466535881a38e",
+    "kycUpgradedAt": "2026-08-02T06:11:23.190Z"
   }
 }
