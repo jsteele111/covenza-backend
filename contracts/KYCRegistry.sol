@@ -42,7 +42,41 @@ contract KYCRegistry is ERC721 {
     // --- State variables ---
 
     address public operator;     // address authorised to verify/revoke wallets manually
-    address public verifierKey;  // address whose signature attests to a successful KYC check
+
+    /**
+     * @notice Signing keys whose attestations this registry will accept.
+     *
+     * @dev    Replaces a single `verifierKey`. The change is not about
+     *         convenience: with one key, Covenza necessarily ISSUED the
+     *         attestation, which made it a participant in the KYC process and
+     *         an obvious holder of whatever sat behind it. With a curated set,
+     *         Covenza only RECOGNISES attestations that identity providers
+     *         issued independently — it never performs a check, never sees a
+     *         document, and never learns who anyone is.
+     *
+     *         Curating the set is the whole of the trust decision, and it is
+     *         as consequential as whitelisting an asset: a recognised attester
+     *         can admit anyone to the protocol.
+     */
+    struct Attester {
+        bool    recognised;
+        string  name;       // human-readable, for the operator UI and for audit
+        // Where an unverified borrower should go to get checked. On chain
+        // rather than in a frontend config because this string IS the product
+        // of the listing decision — recognising a provider and telling people
+        // where to find them are the same act, and splitting them means the
+        // list and the links drift apart the first time one is added.
+        string  url;
+        uint256 addedAt;
+    }
+
+    mapping(address => Attester) public attesters;
+    address[] private _attesterList;
+
+    /// @notice Which attester's signature verified each wallet. Kept so that a
+    ///         compromised or delisted attester's admissions can be found and
+    ///         reviewed, rather than being indistinguishable from the rest.
+    mapping(address => address) public attestedBy;
 
     mapping(address => bool)    public isVerified;    // verified status per address
     mapping(address => uint256) public verifiedAt;    // timestamp of verification
@@ -59,16 +93,18 @@ contract KYCRegistry is ERC721 {
         address indexed newOperator
     );
 
-    event VerifierKeyUpdated(
-        address indexed previousKey,
-        address indexed newKey
-    );
+    event AttesterAdded(address indexed key, string name, string url);
+    event AttesterRemoved(address indexed key);
 
     event AddressVerified(
         address indexed wallet,
         uint256 timestamp,
         bool viaSignature
     );
+
+    /// @dev Emitted alongside AddressVerified when the route was a signature,
+    ///      naming the attester. Separate so the existing event keeps its shape.
+    event AttestationAccepted(address indexed wallet, address indexed attester);
 
     event AddressRevoked(
         address indexed wallet,
@@ -89,9 +125,12 @@ contract KYCRegistry is ERC721 {
         require(_operator != address(0), "Invalid operator address");
         require(_verifierKey != address(0), "Invalid verifier key address");
         operator = _operator;
-        verifierKey = _verifierKey;
         emit OperatorUpdated(address(0), _operator);
-        emit VerifierKeyUpdated(address(0), _verifierKey);
+
+        // The constructor still takes a single key so existing deployment
+        // scripts are unaffected; it is registered as the first recognised
+        // attester rather than being privileged.
+        _addAttester(_verifierKey, "Initial attester", "");
     }
 
     // --- Modifiers ---
@@ -128,9 +167,70 @@ contract KYCRegistry is ERC721 {
         );
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(structHash);
         address signer = digest.recover(_signature);
-        require(signer == verifierKey, "Invalid verifier signature");
+        require(attesters[signer].recognised, "Signature is not from a recognised attester");
 
+        attestedBy[_wallet] = signer;
         _setVerified(_wallet, true);
+        emit AttestationAccepted(_wallet, signer);
+    }
+
+    // --- Attester management ---
+
+    /**
+     * @notice Recognises an identity provider's signing key.
+     *
+     * @dev    SAFETY: this is the protocol's most consequential admin action.
+     *         A recognised attester can admit any wallet, and the registry has
+     *         no way to check that a real check happened — it verifies only
+     *         that the signature came from a key on this list. Curation is the
+     *         entire control.
+     *
+     *         Deliberately does NOT retroactively affect anyone: adding an
+     *         attester admits nobody by itself, and removing one leaves
+     *         existing verifications standing. Wallets a delisted attester
+     *         admitted are findable through attestedBy and can be revoked
+     *         individually. Mass revocation is not offered because it would be
+     *         an unbounded loop, and because delisting a provider for a
+     *         commercial reason is not the same as doubting every check they
+     *         ever performed.
+     */
+    function addAttester(
+        address _key,
+        string calldata _name,
+        string calldata _url
+    ) external onlyOperator {
+        _addAttester(_key, _name, _url);
+    }
+
+    function removeAttester(address _key) external onlyOperator {
+        require(attesters[_key].recognised, "Not a recognised attester");
+        attesters[_key].recognised = false;
+        emit AttesterRemoved(_key);
+    }
+
+    function _addAttester(address _key, string memory _name, string memory _url) internal {
+        require(_key != address(0), "Invalid attester address");
+        require(!attesters[_key].recognised, "Attester already recognised");
+
+        if (attesters[_key].addedAt == 0) { _attesterList.push(_key); }
+        attesters[_key] = Attester({
+            recognised: true,
+            name: _name,
+            url: _url,
+            addedAt: block.timestamp
+        });
+        emit AttesterAdded(_key, _name, _url);
+    }
+
+    /// @notice Every key ever recognised, including delisted ones. Callers
+    ///         should read `attesters(key).recognised` for current status —
+    ///         the list is history, not the whitelist.
+    function allAttesters() external view returns (address[] memory) {
+        return _attesterList;
+    }
+
+    function isRecognisedAttester(address _key) external view returns (bool) {
+        return attesters[_key].recognised;
     }
 
     // --- Manual fallback path (operator-controlled, as before) ---
@@ -183,11 +283,21 @@ contract KYCRegistry is ERC721 {
      *         KYC provider's key later without any other contract changes.
      * @param _newVerifierKey The new verifier key address.
      */
-    function setVerifierKey(address _newVerifierKey) external onlyOperator {
-        require(_newVerifierKey != address(0), "Invalid verifier key");
-        address previous = verifierKey;
-        verifierKey = _newVerifierKey;
-        emit VerifierKeyUpdated(previous, _newVerifierKey);
+    /**
+     * @notice Rotates a single attester key: recognises the new one and
+     *         delists the old.
+     *
+     * @dev    Kept because key rotation is a routine operational event and
+     *         doing it as add-then-remove leaves a window in which both keys
+     *         are live. The name carries across, since it is the same provider.
+     */
+    function rotateAttester(address _oldKey, address _newKey) external onlyOperator {
+        require(attesters[_oldKey].recognised, "Not a recognised attester");
+        string memory name = attesters[_oldKey].name;
+        string memory url  = attesters[_oldKey].url;
+        attesters[_oldKey].recognised = false;
+        emit AttesterRemoved(_oldKey);
+        _addAttester(_newKey, name, url);
     }
 
     // --- Internal ---

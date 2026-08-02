@@ -1,28 +1,76 @@
-require("dotenv").config();
-const { ethers } = require("ethers");
+/**
+ * Lists the identity providers whose attestations this registry accepts.
+ *
+ * Replaces a check against a single `verifierKey`. Covenza no longer issues
+ * attestations — it recognises attestations issued independently by providers
+ * on this list — so the meaningful question is no longer "is our key correct"
+ * but "who can currently admit a borrower".
+ *
+ * Also drops the hardcoded Arbitrum Sepolia address the old version carried;
+ * it reads deployed-addresses.json for whichever network is selected, which
+ * is the only version that stays true after a redeploy.
+ *
+ * All reads. Costs nothing.
+ *
+ * Usage:
+ *   npx hardhat run scripts/check-verifier-key.js --network robinhoodTestnet
+ */
 
-const KYC_REGISTRY_ADDRESS = "0x5B6C57cA408dD1bbE9cbdeB0cbb6e923E01a584D";
-const EXPECTED_VERIFIER_KEY = "0x00a5Bc38649a654f11a6a68033ae1B6c2c203cC8";
+const hre = require("hardhat");
+const fs = require("fs");
+const path = require("path");
 
-const ABI = [
-  "function verifierKey() view returns (address)",
+const REGISTRY_ABI = [
   "function operator() view returns (address)",
+  "function allAttesters() view returns (address[])",
+  "function attesters(address) view returns (bool recognised, string name, string url, uint256 addedAt)",
 ];
 
 async function main() {
-  const provider = new ethers.JsonRpcProvider(process.env.ARBITRUM_SEPOLIA_RPC_URL);
-  const registry = new ethers.Contract(KYC_REGISTRY_ADDRESS, ABI, provider);
+  const { ethers } = hre;
 
-  const onChainVerifierKey = await registry.verifierKey();
-  const onChainOperator = await registry.operator();
+  const deployed = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "deployed-addresses.json"), "utf8")
+  )[hre.network.name];
 
-  console.log("On-chain verifierKey:", onChainVerifierKey);
-  console.log("Expected verifierKey:", EXPECTED_VERIFIER_KEY);
-  console.log("Match:", onChainVerifierKey.toLowerCase() === EXPECTED_VERIFIER_KEY.toLowerCase());
-  console.log("On-chain operator:", onChainOperator);
+  if (!deployed?.kycRegistry) {
+    throw new Error(`No kycRegistry recorded for ${hre.network.name}.`);
+  }
+
+  const registry = await ethers.getContractAt(REGISTRY_ABI, deployed.kycRegistry);
+
+  console.log("=".repeat(70));
+  console.log(`KYC registry ${deployed.kycRegistry}`);
+  console.log(`Operator     ${await registry.operator()}`);
+  console.log("=".repeat(70));
+
+  const keys = await registry.allAttesters();
+  if (keys.length === 0) {
+    console.log("\nNo attesters have ever been registered — nobody can be verified.");
+    return;
+  }
+
+  console.log("\n--- attesters ---");
+  let live = 0;
+  for (const key of keys) {
+    const a = await registry.attesters(key);
+    if (a.recognised) live++;
+    const added = new Date(Number(a.addedAt) * 1000).toISOString().slice(0, 10);
+    console.log(
+      `  ${a.recognised ? "LIVE    " : "delisted"}  ${key}  ${a.name} (added ${added})`
+    );
+    if (a.url) console.log(`  ${" ".repeat(52)}${a.url}`);
+  }
+
+  console.log(`\n${live} of ${keys.length} recognised.`);
+  if (live === 0) {
+    console.log("No live attester — no new borrower can be verified by signature.");
+  }
+  console.log("\nDelisted keys are still listed because the list is history: wallets");
+  console.log("they admitted stay verified, and attestedBy(wallet) records which key.");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
+main().catch((e) => {
+  console.error(e.shortMessage || e.message);
+  process.exitCode = 1;
 });
