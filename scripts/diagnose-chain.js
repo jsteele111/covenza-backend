@@ -108,6 +108,73 @@ async function main() {
     if (!addr) continue;
     console.log(`  allowance -> ${label.padEnd(12)} ${ethers.formatEther(await usdg.allowance(deployer.address, addr))}`);
   }
+
+  // --- Is the deployed factory the CURRENT factory? --------------------
+  //
+  // Code being present at an address says only that something is deployed
+  // there, not that it is what this repo now compiles. The saved factory was
+  // deployed before tiers and mandates existed, and every frontend read
+  // against a function it does not have fails in a way that looks like an RPC
+  // problem rather than a stale deployment.
+  //
+  // Probed by calling one function per generation. A present-but-old contract
+  // has no matching selector, so the call hits a fallback that does not exist
+  // and reverts — which is the signal.
+
+  if (deployed.vaultFactory) {
+    console.log("\n--- deployed factory generation ---");
+    const probes = [
+      ["vault registry   (v2 base)",  "function totalVaults() view returns (uint256)"],
+      ["clone factory    (task 41)",  "function vaultImplementation() view returns (address)"],
+      // Note: this one reaches through to the AssetRegistry, so a failure
+      // here means "factory or registry is stale", not the factory alone.
+      // The registry is probed separately below to tell them apart.
+      ["risk tiers       (phase 3)",  "function quoteMinimumDeposit(uint256,uint8,uint256,bool) view returns (uint256)"],
+      ["mandates         (phase 4)",  "function totalMandates() view returns (uint256)"],
+      ["mandate lifetime (phase 4)",  "function maxMandateDuration() view returns (uint256)"],
+    ];
+
+    let stale = false;
+    for (const [label, sig] of probes) {
+      const name = sig.slice(9, sig.indexOf("("));
+      const c = await ethers.getContractAt([sig], deployed.vaultFactory);
+      const args = name === "quoteMinimumDeposit" ? [0n, 0, 0n, true] : [];
+      try {
+        const out = await c[name](...args);
+        console.log(`  ${label}  present  (${out})`);
+      } catch {
+        console.log(`  ${label}  ABSENT   <-- deployed factory predates this`);
+        stale = true;
+      }
+    }
+
+    if (deployed.assetRegistry) {
+      const regProbes = [
+        ["tier config      (phase 3)", "function tierConfig(uint8) view returns (uint256,uint256,uint256,uint256,uint256)", [0]],
+        ["deposit floor    (phase 3)", "function minimumDepositBpsForTier(uint8,uint256) view returns (uint256)", [0, 86400]],
+        ["yield venue      (phase 1)", "function venueOf(address) view returns (uint8,address)", [uni.tokens.tUSDG]],
+      ];
+      for (const [label, sig, args] of regProbes) {
+        const name = sig.slice(9, sig.indexOf("("));
+        const c = await ethers.getContractAt([sig], deployed.assetRegistry);
+        try {
+          await c[name](...args);
+          console.log(`  ${label}  present`);
+        } catch {
+          console.log(`  ${label}  ABSENT   <-- deployed registry predates this`);
+          stale = true;
+        }
+      }
+    }
+
+    if (stale) {
+      console.log("\n  The deployed stack is older than this repo. Redeploy Covenza");
+      console.log("  before testing — the Uniswap deployment above is independent");
+      console.log("  and can be reused if its code is present.");
+    } else {
+      console.log("\n  Deployed stack matches this repo's ABI surface.");
+    }
+  }
 }
 
 main().catch((e) => {

@@ -1,17 +1,26 @@
-// Redeploys ONLY the VaultFactory, for the v2.1 protocol fee upgrade.
+// Redeploys the VaultFactory, the Vault implementation and the TWAP library,
+// reusing the KYC registry, asset registry and insurance pool in place.
 //
 // Usage:
 //   npx hardhat run scripts/redeploy-factory-v21.js --network hardhat          (dry run)
-//   npx hardhat run scripts/redeploy-factory-v21.js --network arbitrumSepolia
+//   npx hardhat run scripts/redeploy-factory-v21.js --network robinhoodTestnet
 //
-// WHY FACTORY-ONLY: the v2.1 change touches Vault.sol and VaultFactory.sol
-// and nothing else. KYCRegistry, AssetRegistry and InsurancePool are
-// byte-identical to what is already deployed, so redeploying them would
-// throw away live state for no reason — the borrower's KYC verification,
-// the whitelisted assets and settlement config, and most importantly the
-// insurance pool's accumulated reserve. Vault.sol is not deployed directly;
-// its bytecode is embedded in the factory, so a new factory is sufficient
-// to put the new vault logic in service.
+// Originally written for the v2.1 protocol fee upgrade; it is the general
+// script for any change confined to Vault.sol and VaultFactory.sol. As of
+// Phase 4 that includes risk tiers, the borrower-funded insurance premium,
+// and the mandate system.
+//
+// WHY NOT A FULL REDEPLOY: KYCRegistry, AssetRegistry and InsurancePool hold
+// live state that a redeploy would discard for nothing — the borrower's KYC
+// verification, the whitelist and per-asset settlement config, and the
+// insurance pool's accumulated reserve. Confirm they are current first with
+// diagnose-chain.js, which probes each one's ABI generation; this script
+// assumes they are and only replaces what sits above them.
+//
+// The Vault implementation is redeployed alongside the factory even though
+// the factory does not embed it. Clones delegate to whatever implementation
+// the factory was given, so leaving a stale one in place would produce a
+// factory that knows about tiers and mandates originating vaults that do not.
 //
 // WHAT CARRIES OVER
 //   KYCRegistry    - unchanged. Verified borrowers stay verified.
@@ -146,13 +155,19 @@ async function main() {
   }
 
   // --- Persist ---
+  // The implementation and library addresses are recorded, not just the
+  // factory. Without them a later diagnosis cannot tell which vault logic the
+  // clones actually run, and clones carry no reference of their own that is
+  // readable off-chain without knowing the EIP-1167 layout.
   const updated = {
     ...existing,
     vaultFactory: factoryAddress,
+    vaultImplementation: await vaultImpl.getAddress(),
+    uniswapTwapLib: await twapLib.getAddress(),
     treasury: treasury,
     previousVaultFactory: existing.vaultFactory,
     factoryUpgradedAt: new Date().toISOString(),
-    factoryVersion: "v2.1 — protocol fee",
+    factoryVersion: "phase 4 — risk tiers, borrower-funded premium, mandates",
   };
   allAddresses[hre.network.name] = updated;
   fs.writeFileSync(addressesPath, JSON.stringify(allAddresses, null, 2));
@@ -160,14 +175,15 @@ async function main() {
 
   console.log("\n" + "─".repeat(60));
   console.log("Verify:\n");
-  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress} ${existing.kycRegistry} ${existing.assetRegistry} ${existing.insurancePool} ${treasury}`);
+  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress} ${existing.kycRegistry} ${existing.assetRegistry} ${existing.insurancePool} ${treasury} ${await vaultImpl.getAddress()}`);
 
   console.log("\nNext steps:");
-  console.log("  1. npx hardhat run scripts/lifecycle-proof.js --network " + hre.network.name);
-  console.log("     (repopulates vault history and proves the fee on-chain)");
-  console.log("  2. Update the frontend's contracts.js vaultFactory address to:");
-  console.log("     " + factoryAddress);
-  console.log("  3. Update the frontend ABI for the 8-argument deployVault.");
+  console.log("  1. npx hardhat run scripts/diagnose-chain.js --network " + hre.network.name);
+  console.log("     (confirms the new factory reports the mandate surface)");
+  console.log("  2. In the FRONTEND repo, update src/config/contracts.js:");
+  console.log("       vaultFactory:   " + factoryAddress);
+  console.log("       vaultImpl:      " + (await vaultImpl.getAddress()));
+  console.log("       uniswapTwapLib: " + (await twapLib.getAddress()));
 }
 
 main().catch((error) => {

@@ -35,5 +35,34 @@
     "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
     "factoryUpgradedAt": "2026-07-29T05:31:01.892Z",
     "factoryVersion": "v2.1 — protocol fee"
+  },
+  "robinhoodTestnet": {
+    "chainId": 46630,
+    "kycRegistry": "0x93e1c4F4b0cD3F6A3feB7B6C056466535881a38e",
+    "assetRegistry": "0x71FFe1CA1D087c2b72F661CB7F75172ce25badfd",
+    "insurancePool": "0xcC56F8560678ebd2a8708D5181C11e3a3faFed07",
+    "vaultFactory": "0xdD04fd410B2Ea44E44931C8fdb8248B6B96BA8F5",
+    "vaultImplementation": "0x316D69E3CC1581c711A6C0063E922f2Aa041ccC9",
+    "uniswapTwapLibrary": "0xFBe83c6B4c135d5c64C5A72394120C7dEFec18EF",
+    "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
+    "yieldVenue4626": "0x7bd0860C36be9d101483920d6c8230Dd0fcf713E",
+    "verifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
+    "keeper": "0x26c6fba1774EA978482c0D9CDd1560641DB401c0",
+    "tokens": {
+      "tUSDG": "0xF727a9E9813d884bfFf2Be906633f4C5C963DC99",
+      "tWETH": "0x3981D4CC453ebc7F5eeC503fF00Da34BF5e65F5C"
+    },
+    "uniswap": {
+      "factory": "0xC509Ed62cf655AD8eFd33a1B6Ba4724E38621680",
+      "router": "0x70Ce56aFf68cD3C5352c66C665B37258915b3F14",
+      "pool": "0x44A3024740aCDFe744500A606a8B3552717B5B76",
+      "note": "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js"
+    },
+    "twapWindow": 60,
+    "deployedAt": "2026-08-01T10:20:59.672Z",
+    "uniswapTwapLib": "0xaB5f05Ae0B69bDd920d8B411938292dDA8bC0539",
+    "previousVaultFactory": "0x283fc22aCEBCE5cB673B32ccbD77Fe732C4eB0E2",
+    "factoryUpgradedAt": "2026-08-01T23:56:35.826Z",
+    "factoryVersion": "phase 4 — risk tiers, borrower-funded premium, mandates"
   }
 }
