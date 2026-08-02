@@ -1,0 +1,28 @@
+{
+  "chainId": "46630",
+  "deployedAt": "2026-08-01T10:19:17.887Z",
+  "note": "Real Uniswap V3 from @uniswap/v3-core artifacts. Test-network only.",
+  "uniswapFactory": "0xC509Ed62cf655AD8eFd33a1B6Ba4724E38621680",
+  "swapRouter": "0x70Ce56aFf68cD3C5352c66C665B37258915b3F14",
+  "liquidityHelper": "0x5ee183d0DCDdc6047251e00ccc114788638f9E46",
+  "pools": [
+    {
+      "token0": "0xF727a9E9813d884bfFf2Be906633f4C5C963DC99",
+      "token1": "0x3981D4CC453ebc7F5eeC503fF00Da34BF5e65F5C",
+      "fee": 3000,
+      "address": "0x44A3024740aCDFe744500A606a8B3552717B5B76"
+    },
+    {
+      "address": "0x505FF9155637e72d8Ec9C2d71b848dc23A35705E",
+      "pair": "tUSDG/tAAPL",
+      "fee": 3000,
+      "price": "255"
+    }
+  ],
+  "tokens": {
+    "tUSDG": "0xF727a9E9813d884bfFf2Be906633f4C5C963DC99",
+    "tWETH": "0x3981D4CC453ebc7F5eeC503fF00Da34BF5e65F5C",
+    "tAAPL": "0x422307E3f960B609EFd54841DD9979b1ad987c7e"
+  },
+  "recommendedTwapWindow": 60
+}
