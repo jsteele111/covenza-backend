@@ -64,10 +64,21 @@ async function main() {
       console.log(`  ${addr} — still active (not expired), skipping.`);
       continue;
     }
+    // The grace period, and therefore the bounty, only exist for vaults
+    // HOLDING a foreign asset — those are the ones whose forced swap-back
+    // needs a market to be open. A cash-only vault past its deadline is open
+    // to anyone immediately and pays nothing. Reporting "bounty applies" on
+    // those was simply false, and would have had a keeper expecting payment.
+    const held = Number(await vault.heldAssetCount());
     const graceEnd = Number(deadline) + graceSeconds;
-    const tier3 = now > graceEnd;
+    const tier3 = held > 0 && now > graceEnd;
+    const label = held === 0
+      ? "no foreign assets — open to anyone, no bounty"
+      : tier3
+      ? "past grace — bounty applies"
+      : "in grace — lender or borrower only";
     stuck.push({ addr, vault, tier3 });
-    console.log(`  ${addr} — EXPIRED, unsettled${tier3 ? " (past grace — tier 3, bounty applies)" : " (still in grace period)"}`);
+    console.log(`  ${addr} — EXPIRED, unsettled (${label})`);
   }
 
   if (stuck.length === 0) {
@@ -101,7 +112,15 @@ async function main() {
       console.log("  Transaction sent, waiting for confirmation...");
       const receipt = await tx.wait();
       console.log("  ✅ Settled. Tx:", receipt.hash);
-      console.log("     https://sepolia.arbiscan.io/tx/" + receipt.hash);
+      // Hardcoded to Arbitrum Sepolia, which produced links to a chain the
+      // transaction was never on. Explorer follows the network now.
+      const explorers = {
+        robinhoodTestnet: "https://explorer.testnet.chain.robinhood.com/tx/",
+        robinhoodMainnet: "https://robinhoodchain.blockscout.com/tx/",
+        arbitrumSepolia:  "https://sepolia.arbiscan.io/tx/",
+      };
+      const explorer = explorers[hre.network.name];
+      if (explorer) { console.log("     " + explorer + receipt.hash); }
 
       const [totalReturned, lenderPayout, borrowerPayout, insuranceDraw, bounty, severity] =
         await Promise.all([
