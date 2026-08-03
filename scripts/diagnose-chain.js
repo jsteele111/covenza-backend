@@ -132,6 +132,11 @@ async function main() {
       ["risk tiers       (phase 3)",  "function quoteMinimumDeposit(uint256,uint8,uint256,bool) view returns (uint256)"],
       ["mandates         (phase 4)",  "function totalMandates() view returns (uint256)"],
       ["mandate lifetime (phase 4)",  "function maxMandateDuration() view returns (uint256)"],
+      // Added after the timelock work shipped and this script did not notice:
+      // it probes a fixed list, so a generation it has never heard of reads as
+      // healthy. Every new admin surface belongs here or the check quietly
+      // stops meaning anything.
+      ["timelock         (review)",   "function timelockDelay() view returns (uint256)"],
     ];
 
     let stale = false;
@@ -153,6 +158,7 @@ async function main() {
         ["tier config      (phase 3)", "function tierConfig(uint8) view returns (uint256,uint256,uint256,uint256,uint256)", [0]],
         ["deposit floor    (phase 3)", "function minimumDepositBpsForTier(uint8,uint256) view returns (uint256)", [0, 86400]],
         ["yield venue      (phase 1)", "function venueOf(address) view returns (uint8,address)", [uni.tokens.tUSDG]],
+        ["tier history     (review)",  "function tierHistoryLength(address) view returns (uint256)", [uni.tokens.tUSDG]],
       ];
       for (const [label, sig, args] of regProbes) {
         const name = sig.slice(9, sig.indexOf("("));
@@ -164,6 +170,20 @@ async function main() {
           console.log(`  ${label}  ABSENT   <-- deployed registry predates this`);
           stale = true;
         }
+      }
+    }
+
+    // The insurance pool holds the reserve, so a stale one is worth naming
+    // separately rather than folding into a general verdict.
+    if (deployed.insurancePool) {
+      try {
+        const p = await ethers.getContractAt(
+          ["function timelockDelay() view returns (uint256)"], deployed.insurancePool
+        );
+        console.log(`  pool timelock    (review)  present  (${await p.timelockDelay()}s)`);
+      } catch {
+        console.log("  pool timelock    (review)  ABSENT   <-- adminWithdraw is instant");
+        stale = true;
       }
     }
 

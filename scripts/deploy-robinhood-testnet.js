@@ -126,7 +126,7 @@ async function main() {
   // --- 1. KYCRegistry (fresh — nothing exists on this chain) -----------
 
   const kyc = await (await ethers.getContractFactory("KYCRegistry", deployer))
-    .deploy(deployer.address, deployer.address);
+    .deploy(deployer.address, deployer.address, TIMELOCK_DELAY);
   await kyc.waitForDeployment();
   console.log(`\nKYCRegistry     ${await kyc.getAddress()}`);
 
