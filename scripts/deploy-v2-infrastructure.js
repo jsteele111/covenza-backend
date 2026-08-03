@@ -52,6 +52,7 @@ const hre = require("hardhat");
 const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
+const { guardProductionConfig, guardNoYieldVenues } = require("./lib/production-guards");
 
 // --- Demo-tuned settlement config ---
 // NOT production values. Shortened so the full three-tier lifecycle proof
@@ -78,6 +79,14 @@ const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS || "";
 const POOL_FEE = 3000; // Uniswap V3 0.3% tier, used for the USDC<->USDT pool
 
 async function main() {
+
+  // Refuses a mainnet deployment carrying testnet values. Every one of them is
+  // a legal value the contracts accept, which is exactly why nothing else
+  // catches it.
+  guardProductionConfig(hre.network.name, {
+    timelockDelay: TIMELOCK_DELAY,
+    twapWindow: TWAP_WINDOW_SECONDS,
+  });
   const [deployer] = await hre.ethers.getSigners();
 
   const addressesPath = path.join(__dirname, "..", "deployed-addresses.json");

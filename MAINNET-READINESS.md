@@ -5,9 +5,14 @@
 **Status:** not ready for real money. Nothing here is unfixable; two items are
 structural and the rest are a week of work plus an audit.
 
-**Progress:** items 1, 2, 4 and 6 are addressed in code. Item 3 is a deployment
-decision, 5 is a deploy-script guard still to write, 7 and 8 are blocked, 9 is
-an audit. Fixes are marked inline.
+**Progress:** items 1, 2, 4, 5 and 6 are addressed in code, and 3 is now
+partially enforced by a deploy guard. Items 7 and 8 are blocked; 9 is an audit.
+Fixes are marked inline.
+
+Item 5's fix caught something the review did not: `TIMELOCK_DELAY` defaults to
+zero, introduced by the fix for items 2, 4 and 6 an hour earlier. Shipped to
+mainnet it would have deployed timelocks that queue and execute in the same
+block. A fix creating the next finding is the ordinary case, not a surprise.
 
 This is a self-review, not an independent audit, and self-review has a known
 failure mode: the person who wrote the bug is the person deciding whether it is
@@ -94,7 +99,13 @@ removing the power.
 
 ---
 
-## 3. Everything is one key — CRITICAL
+## 3. Everything is one key — CRITICAL — **PARTIALLY GUARDED**
+
+> The deploy guard refuses production when the operator is the deploying EOA.
+> That catches the laziest version. It cannot check that the operator is a
+> multisig rather than another EOA, so this remains a deployment discipline
+> question rather than something code can settle.
+
 
 Today, on testnet, `0x6C9317…3a68` is simultaneously:
 
@@ -139,7 +150,15 @@ difficulty. The malicious one does not.
 ---
 
 ## 5. A 60-second TWAP is manipulable, and it is one config line from
-production — HIGH
+production — HIGH — **FIXED**
+
+> `scripts/lib/production-guards.js` refuses a production deploy carrying a
+> TWAP window under 1800s, a timelock under 24h, an operator equal to the
+> deployer, or any asset with a yield venue set. Reports every problem at once.
+> Overridable via `ALLOW_UNSAFE_PRODUCTION=1`, which prints what is waived.
+> Ten tests, because the guard is the only thing between a legal default and a
+> live deployment.
+
 
 `setSettlementConfig` enforces `_twapWindow >= 60`. Testnet runs at exactly 60.
 The intended production value is 1800.

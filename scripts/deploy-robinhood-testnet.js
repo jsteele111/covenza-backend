@@ -34,6 +34,7 @@ const hre = require("hardhat");
 const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
+const { guardProductionConfig, guardNoYieldVenues } = require("./lib/production-guards");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
 const TWAP_TOLERANCE_BPS       = 300;  // 3%
@@ -51,6 +52,14 @@ const VENUE_4626 = 2;
 const MIN_BALANCE = ethers => ethers.parseEther("0.0015");
 
 async function main() {
+
+  // Refuses a mainnet deployment carrying testnet values. Every one of them is
+  // a legal value the contracts accept, which is exactly why nothing else
+  // catches it.
+  guardProductionConfig(hre.network.name, {
+    timelockDelay: TIMELOCK_DELAY,
+    twapWindow: TWAP_WINDOW_SECONDS,
+  });
   const { ethers } = hre;
   const [deployer, borrower, keeper] = await ethers.getSigners();
   const net = await ethers.provider.getNetwork();
