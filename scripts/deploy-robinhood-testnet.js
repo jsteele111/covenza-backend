@@ -125,8 +125,25 @@ async function main() {
 
   // --- 1. KYCRegistry (fresh — nothing exists on this chain) -----------
 
+  // ATTESTER_KEY is the identity provider's signing key. Defaulting it to the
+  // deployer makes Covenza its own identity provider — able to admit any
+  // wallet with a signature it produces itself, which is the arrangement the
+  // attester redesign exists to remove. That default was fixed in
+  // upgrade-kyc-registry.js and reintroduced here, because the fix went into
+  // one script rather than everywhere the constructor is called.
+  //
+  // Tolerated on testnet, where the mock signer has to come from somewhere,
+  // but it is announced rather than silent — and the production guard refuses
+  // it outright.
+  const attesterKey = process.env.ATTESTER_KEY || deployer.address;
+  if (attesterKey.toLowerCase() === deployer.address.toLowerCase()) {
+    console.log("\n  NOTE: no ATTESTER_KEY set — the deployer is the initial attester.");
+    console.log("  Covenza can attest for itself until this key is delisted.");
+    console.log("  Delist it once a real provider is recognised.");
+  }
+
   const kyc = await (await ethers.getContractFactory("KYCRegistry", deployer))
-    .deploy(deployer.address, deployer.address, TIMELOCK_DELAY);
+    .deploy(deployer.address, attesterKey, TIMELOCK_DELAY);
   await kyc.waitForDeployment();
   console.log(`\nKYCRegistry     ${await kyc.getAddress()}`);
 

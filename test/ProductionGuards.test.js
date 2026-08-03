@@ -64,6 +64,16 @@ describe("Production deployment guards", function () {
     ).to.throw(/operator is the deploying EOA/);
   });
 
+  it("Refuses an initial attester that is the deploying key", function () {
+    // This regressed once already: fixed in upgrade-kyc-registry.js, then
+    // reintroduced by a different deploy script's default. Asserting it here
+    // means the next script to get it wrong fails a test rather than shipping.
+    const addr = "0x2222222222222222222222222222222222222222";
+    expect(() =>
+      guardProductionConfig("robinhoodMainnet", { ...SAFE, attesterKey: addr, deployer: addr })
+    ).to.throw(/initial attester is the deploying key/);
+  });
+
   it("Reports every problem at once, not just the first", function () {
     // Fixing one thing and rerunning to discover the next is how a deployment
     // at the end of a long day goes wrong.

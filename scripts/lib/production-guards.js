@@ -72,6 +72,18 @@ function guardProductionConfig(networkName, cfg = {}) {
     );
   }
 
+  // Covenza recognising its own key means it can admit any wallet with a
+  // signature it produced — the exact arrangement the attester redesign
+  // removed. It came back through a deploy script's default, so it is checked
+  // here rather than trusted to stay fixed.
+  if (cfg.attesterKey && cfg.deployer &&
+      cfg.attesterKey.toLowerCase() === cfg.deployer.toLowerCase()) {
+    problems.push(
+      "the initial attester is the deploying key. Covenza would be its own " +
+      "identity provider, able to verify any wallet without a check."
+    );
+  }
+
   if (problems.length === 0) { return; }
 
   const message =
