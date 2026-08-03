@@ -79,7 +79,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
 
     // --- Protocol contracts ---
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator))
-      .deploy(operator.address, operator.address);
+      .deploy(operator.address, operator.address, 0);
     await kyc.verify(borrower.address);
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
@@ -101,7 +101,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     }
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
-      .deploy(operator.address, 1000); // draw cap 10% of principal
+      .deploy(operator.address, 1000, 0); // draw cap 10% of principal
 
     // Vaults are EIP-1167 clones of one implementation, so the factory no
     // longer embeds Vault bytecode and needs no library link. The
@@ -117,7 +117,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       operator.address,                       // protocol fee treasury
       await vaultImpl.getAddress()            // clone source
-    );
+    , 0);
     await pool.setVaultFactory(await factory.getAddress());
 
     // The lender skim now defaults to ZERO — the insurance pool is funded by the

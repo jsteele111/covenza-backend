@@ -30,6 +30,10 @@ const path = require("path");
 const ATTESTER_NAME = process.env.ATTESTER_NAME || "Testnet mock signer";
 const ATTESTER_URL  = process.env.ATTESTER_URL  || "";
 
+// Zero on testnet so the flow can be exercised in one sitting. Mainnet should
+// pass a real delay — the value is immutable once deployed, deliberately.
+const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
+
 async function main() {
   const { ethers } = hre;
   const [deployer] = await ethers.getSigners();
@@ -92,7 +96,7 @@ async function main() {
   console.log(`Attester key       ${verifierKey}${carriedKey ? " (carried from old registry)" : " (from ATTESTER_KEY)"}`);
 
   const Registry = await ethers.getContractFactory("KYCRegistry");
-  const registry = await Registry.deploy(deployer.address, verifierKey);
+  const registry = await Registry.deploy(deployer.address, verifierKey, TIMELOCK_DELAY);
   await registry.waitForDeployment();
   const registryAddress = await registry.getAddress();
   console.log(`\nNew registry       ${registryAddress}`);
@@ -101,7 +105,13 @@ async function main() {
   // it properly — an attester nobody can identify cannot be audited, and one
   // with no URL leaves an unverified borrower nowhere to go.
   await (await registry.removeAttester(verifierKey)).wait();
-  await (await registry.addAttester(verifierKey, ATTESTER_NAME, ATTESTER_URL)).wait();
+  await (await registry.queueAddAttester(verifierKey, ATTESTER_NAME, ATTESTER_URL)).wait();
+  if (TIMELOCK_DELAY > 0) {
+    console.log(`\nAttester announced but held for ${TIMELOCK_DELAY}s. Re-run manage-attesters`);
+    console.log("with ACTION=add once it matures, or deploy with a zero delay for testnet.");
+  } else {
+    await (await registry.addAttester(verifierKey, ATTESTER_NAME, ATTESTER_URL)).wait();
+  }
   console.log(`Attester           ${ATTESTER_NAME}${ATTESTER_URL ? ` — ${ATTESTER_URL}` : " (no URL)"}`);
 
   await (await factory.setRegistries(

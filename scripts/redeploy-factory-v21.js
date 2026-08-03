@@ -40,8 +40,17 @@
 // draw at settlement. Nothing is stranded by this upgrade.
 
 const hre = require("hardhat");
+
 const fs = require("fs");
 const path = require("path");
+
+// Timelock delay applied to risk-increasing admin actions: administrative
+// withdrawal from the insurance pool, repointing the factory's registries, and
+// recognising a new identity provider. Zero on testnet so flows can be
+// exercised in one sitting; mainnet must pass a real delay. The value is
+// IMMUTABLE once deployed — an operator able to shorten it could shorten it to
+// zero, act, and restore.
+const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 
 // Set TREASURY_ADDRESS in .env. Falls back to the deployer with a warning.
 const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS || "";
@@ -129,7 +138,8 @@ async function main() {
     existing.assetRegistry,
     existing.insurancePool,
     treasury,
-      await vaultImpl.getAddress()   // clone source
+    await vaultImpl.getAddress(),  // clone source
+    TIMELOCK_DELAY
   );
   await factory.waitForDeployment();
   const factoryAddress = await factory.getAddress();

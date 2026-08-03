@@ -157,7 +157,7 @@ describe("Group A — InsurancePool", function () {
     const [operator, factorySigner, vaultSigner, other] = await ethers.getSigners();
 
     const Pool = await ethers.getContractFactory("InsurancePool", operator);
-    const pool = await Pool.deploy(operator.address, DRAW_CAP_BPS);
+    const pool = await Pool.deploy(operator.address, DRAW_CAP_BPS, 0);
 
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const usdc = await Mock.deploy("Mock USDC", "USDC", 6);
@@ -177,8 +177,8 @@ describe("Group A — InsurancePool", function () {
   it("Should reject deployment with out-of-bounds draw cap", async function () {
     const [operator] = await ethers.getSigners();
     const Pool = await ethers.getContractFactory("InsurancePool");
-    await expect(Pool.deploy(operator.address, 0)).to.be.revertedWith("Draw cap must be 1-10000 bps");
-    await expect(Pool.deploy(operator.address, 10001)).to.be.revertedWith("Draw cap must be 1-10000 bps");
+    await expect(Pool.deploy(operator.address, 0, 0)).to.be.revertedWith("Draw cap must be 1-10000 bps");
+    await expect(Pool.deploy(operator.address, 10001, 0)).to.be.revertedWith("Draw cap must be 1-10000 bps");
   });
 
   it("Should accept funding and track the reserve per asset", async function () {
@@ -276,11 +276,117 @@ describe("Group A — InsurancePool", function () {
       pool.adminWithdraw(usdcAddr, operator.address, 300_000_000n)
     ).to.be.revertedWith("Amount exceeds reserve");
 
+    // Withdrawal is now two-step. This fixture uses a zero delay, so the
+    // wait is instant — but the QUEUE is still mandatory, which is the part
+    // that makes an attempt visible before it lands.
+    await pool.queueAdminWithdraw(usdcAddr, operator.address, 150_000_000n);
     await expect(pool.adminWithdraw(usdcAddr, operator.address, 150_000_000n))
       .to.emit(pool, "AdminWithdrawal")
       .withArgs(usdcAddr, operator.address, 150_000_000n);
 
     expect(await pool.reserveOf(usdcAddr)).to.equal(50_000_000n);
+  });
+
+  it("Should refuse an administrative withdrawal that was never announced", async function () {
+    const { pool, usdc, operator, other } = await loadFixture(deployPoolFixture);
+    const usdcAddr = await usdc.getAddress();
+    await pool.connect(other).fund(usdcAddr, 200_000_000n);
+
+    await expect(
+      pool.adminWithdraw(usdcAddr, operator.address, 100_000_000n)
+    ).to.be.revertedWith("Action was not queued");
+  });
+
+  it("Should bind the announcement to its exact arguments", async function () {
+    const { pool, usdc, operator, other } = await loadFixture(deployPoolFixture);
+    const usdcAddr = await usdc.getAddress();
+    await pool.connect(other).fund(usdcAddr, 200_000_000n);
+
+    await pool.queueAdminWithdraw(usdcAddr, operator.address, 10_000_000n);
+
+    // Approving a small withdrawal to one address must not authorise a larger
+    // one, or the same one somewhere else. Otherwise the delay buys nothing:
+    // an operator announces something innocuous and executes something else.
+    await expect(
+      pool.adminWithdraw(usdcAddr, operator.address, 150_000_000n)
+    ).to.be.revertedWith("Action was not queued");
+
+    await expect(
+      pool.adminWithdraw(usdcAddr, other.address, 10_000_000n)
+    ).to.be.revertedWith("Action was not queued");
+  });
+
+  it("Should not allow an announcement to be executed twice", async function () {
+    const { pool, usdc, operator, other } = await loadFixture(deployPoolFixture);
+    const usdcAddr = await usdc.getAddress();
+    await pool.connect(other).fund(usdcAddr, 200_000_000n);
+
+    await pool.queueAdminWithdraw(usdcAddr, operator.address, 10_000_000n);
+    await pool.adminWithdraw(usdcAddr, operator.address, 10_000_000n);
+
+    await expect(
+      pool.adminWithdraw(usdcAddr, operator.address, 10_000_000n)
+    ).to.be.revertedWith("Action was not queued");
+  });
+
+  it("Should let the operator abandon a pending withdrawal immediately", async function () {
+    const { pool, usdc, operator, other } = await loadFixture(deployPoolFixture);
+    const usdcAddr = await usdc.getAddress();
+    await pool.connect(other).fund(usdcAddr, 200_000_000n);
+
+    await pool.queueAdminWithdraw(usdcAddr, operator.address, 10_000_000n);
+    await pool.cancelAdminWithdraw(usdcAddr, operator.address, 10_000_000n);
+
+    // Cancellation is deliberately not delayed — dropping a pending
+    // risk-increasing action reduces risk.
+    await expect(
+      pool.adminWithdraw(usdcAddr, operator.address, 10_000_000n)
+    ).to.be.revertedWith("Action was not queued");
+  });
+
+  it("Should hold a withdrawal until the delay has elapsed", async function () {
+    const [operator, other] = await ethers.getSigners();
+    const Mock = await ethers.getContractFactory("MockERC20");
+    const usdc = await Mock.deploy("USD Coin", "USDC", 6);
+    const Pool = await ethers.getContractFactory("InsurancePool");
+    const pool = await Pool.deploy(operator.address, 1000, 3600);
+
+    const usdcAddr = await usdc.getAddress();
+    await usdc.mint(other.address, 200_000_000n);
+    await usdc.connect(other).approve(await pool.getAddress(), 200_000_000n);
+    await pool.connect(other).fund(usdcAddr, 200_000_000n);
+
+    await pool.queueAdminWithdraw(usdcAddr, operator.address, 10_000_000n);
+    expect(await pool.isExecutable(
+      ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+        ["string", "address", "address", "uint256"],
+        ["adminWithdraw", usdcAddr, operator.address, 10_000_000n]
+      ))
+    )).to.equal(false);
+
+    await expect(
+      pool.adminWithdraw(usdcAddr, operator.address, 10_000_000n)
+    ).to.be.revertedWith("Timelock has not elapsed");
+
+    await ethers.provider.send("evm_increaseTime", [3601]);
+    await ethers.provider.send("evm_mine", []);
+
+    await expect(pool.adminWithdraw(usdcAddr, operator.address, 10_000_000n))
+      .to.emit(pool, "AdminWithdrawal");
+  });
+
+  it("Should not let the operator shorten the delay", async function () {
+    const [operator] = await ethers.getSigners();
+    const Pool = await ethers.getContractFactory("InsurancePool");
+    const pool = await Pool.deploy(operator.address, 1000, 3600);
+
+    // Immutable by construction: a delay the constrained party can shorten to
+    // zero, act under, and restore is not a delay. There is deliberately no
+    // setter to test against — this asserts the value is fixed and reachable.
+    expect(await pool.timelockDelay()).to.equal(3600);
+    expect(pool.interface.fragments.some(
+      (f) => f.type === "function" && /timelockDelay|setDelay/i.test(f.name) && f.stateMutability !== "view"
+    )).to.equal(false);
   });
 
   it("Should enforce draw cap configuration bounds", async function () {

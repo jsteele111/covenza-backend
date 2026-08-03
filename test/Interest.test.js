@@ -55,7 +55,7 @@ describe("Annualised interest", function () {
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator))
-      .deploy(operator.address, operator.address);
+      .deploy(operator.address, operator.address, 0);
     await kyc.verify(borrower.address);
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
@@ -76,7 +76,7 @@ describe("Annualised interest", function () {
     }
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
-      .deploy(operator.address, 1000);
+      .deploy(operator.address, 1000, 0);
 
     // Vaults are EIP-1167 clones of one implementation, so the factory no
     // longer embeds Vault bytecode and needs no library link. The
@@ -92,7 +92,7 @@ describe("Annualised interest", function () {
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address,
       await vaultImpl.getAddress()   // clone source
-    );
+    , 0);
     await pool.setVaultFactory(await factory.getAddress());
 
     // The lender skim now defaults to ZERO — the insurance pool is funded by the

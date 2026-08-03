@@ -24,6 +24,14 @@
  */
 
 const hre = require("hardhat");
+
+// Timelock delay applied to risk-increasing admin actions: administrative
+// withdrawal from the insurance pool, repointing the factory's registries, and
+// recognising a new identity provider. Zero on testnet so flows can be
+// exercised in one sitting; mainnet must pass a real delay. The value is
+// IMMUTABLE once deployed — an operator able to shorten it could shorten it to
+// zero, act, and restore.
+const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
 
@@ -131,7 +139,7 @@ async function main() {
   // --- 3. InsurancePool -------------------------------------------------
 
   const pool = await (await ethers.getContractFactory("InsurancePool", deployer))
-    .deploy(deployer.address, INSURANCE_DRAW_CAP_BPS);
+    .deploy(deployer.address, INSURANCE_DRAW_CAP_BPS, TIMELOCK_DELAY);
   await pool.waitForDeployment();
   console.log(`InsurancePool   ${await pool.getAddress()}`);
 
@@ -212,7 +220,8 @@ async function main() {
   const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury,
     await vaultImpl.getAddress()
-  );
+  ,
+    TIMELOCK_DELAY);
   await factory.waitForDeployment();
   console.log(`VaultFactory    ${await factory.getAddress()}`);
 

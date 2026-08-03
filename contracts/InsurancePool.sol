@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./interfaces/IERC20.sol";
+import "./Timelocked.sol";
 
 /**
  * @title InsurancePool
@@ -39,7 +40,7 @@ import "./interfaces/IERC20.sol";
  *         deployed by the factory, which registers them here at creation.
  */
 
-contract InsurancePool {
+contract InsurancePool is Timelocked {
 
     // --- State variables ---
 
@@ -80,7 +81,15 @@ contract InsurancePool {
      *                    VaR deposit-sizing data once it exists, not chosen
      *                    arbitrarily (see Build-Readiness Spec section 6).
      */
-    constructor(address _operator, uint256 _drawCapBps) {
+    /**
+     * @param _timelockDelay Seconds an administrative withdrawal must wait
+     *        between being announced and being executed. Immutable: an
+     *        operator able to shorten it could shorten it to zero, withdraw,
+     *        and restore, which is not a delay but a formality.
+     */
+    constructor(address _operator, uint256 _drawCapBps, uint256 _timelockDelay)
+        Timelocked(_timelockDelay)
+    {
         require(_operator != address(0), "Invalid operator address");
         require(_drawCapBps > 0 && _drawCapBps <= 10000, "Draw cap must be 1-10000 bps");
         operator   = _operator;
@@ -208,19 +217,57 @@ contract InsurancePool {
     // --- Administrative withdrawal (operator-only) ---
 
     /**
-     * @notice Withdraws reserves outside of automatic settlement draws —
-     *         e.g. if a reserve has grown large relative to outstanding
-     *         risk. Operator-only, per the agreed governance model.
+     * @notice Announces an administrative withdrawal. It becomes executable
+     *         after `timelockDelay`.
+     *
+     * @dev    This reserve is what lenders are told stands behind them once a
+     *         borrower's deposit is exhausted. Removing it instantly, on one
+     *         signature, was the single largest hole in the protocol: a
+     *         compromised or coerced operator key emptied the pool between
+     *         blocks with nobody able to see it coming.
+     *
+     *         The delay does not stop a determined operator — they hold the
+     *         key either way. It makes the attempt VISIBLE while there is
+     *         still time to react: lenders can stop originating, borrowers can
+     *         close, and the queued action is readable on chain the whole
+     *         time.
+     */
+    function queueAdminWithdraw(address asset, address to, uint256 amount) external onlyOperator {
+        require(to != address(0), "Invalid recipient");
+        require(amount > 0, "Amount must be greater than zero");
+        _queue(_withdrawId(asset, to, amount));
+    }
+
+    /// @notice Abandons a queued withdrawal. Not delayed — dropping a pending
+    ///         risk-increasing action reduces risk.
+    function cancelAdminWithdraw(address asset, address to, uint256 amount) external onlyOperator {
+        _cancel(_withdrawId(asset, to, amount));
+    }
+
+    /**
+     * @notice Executes a withdrawal announced at least `timelockDelay` ago.
+     *
+     * @dev    The queue id binds all three arguments, so an approval to move a
+     *         specific amount to a specific address cannot be repurposed into
+     *         moving a different amount somewhere else.
      */
     function adminWithdraw(address asset, address to, uint256 amount) external onlyOperator {
         require(to != address(0), "Invalid recipient");
         require(amount > 0, "Amount must be greater than zero");
+        // Checked after maturity rather than at queue time as well, because a
+        // reserve can be drawn down by settlements while the action waits.
         require(amount <= reserveOf[asset], "Amount exceeds reserve");
+
+        _consume(_withdrawId(asset, to, amount));
 
         reserveOf[asset] -= amount;
         bool ok = IERC20(asset).transfer(to, amount);
         require(ok, "Withdrawal transfer failed");
 
         emit AdminWithdrawal(asset, to, amount);
+    }
+
+    function _withdrawId(address asset, address to, uint256 amount) internal pure returns (bytes32) {
+        return keccak256(abi.encode("adminWithdraw", asset, to, amount));
     }
 }

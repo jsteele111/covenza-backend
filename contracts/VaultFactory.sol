@@ -8,6 +8,7 @@ import "./KYCRegistry.sol";
 import "./AssetRegistry.sol";
 import "./InsurancePool.sol";
 import "./interfaces/IERC20.sol";
+import "./Timelocked.sol";
 
 /**
  * @title VaultFactory
@@ -42,7 +43,7 @@ import "./interfaces/IERC20.sol";
  *         ETH loans are WETH loans: the UI wraps ETH before origination,
  *         and this factory only ever handles ERC20s.
  */
-contract VaultFactory {
+contract VaultFactory is Timelocked {
 
     // --- State variables ---
 
@@ -161,8 +162,9 @@ contract VaultFactory {
         address _assetRegistry,
         address _insurancePool,
         address _treasury,
-        address _vaultImplementation
-    ) {
+        address _vaultImplementation,
+        uint256 _timelockDelay
+    ) Timelocked(_timelockDelay) {
         require(_kycRegistry != address(0),         "Invalid KYC registry address");
         require(_assetRegistry != address(0),       "Invalid asset registry address");
         require(_insurancePool != address(0),       "Invalid insurance pool address");
@@ -881,7 +883,37 @@ contract VaultFactory {
         emit MinimumFeeUpdated(previous, _newBps);
     }
 
-    /// @notice Updates registry/pool references. All three set together.
+    /**
+     * @notice Announces a change of registry/pool references. All three are
+     *         set together and the change becomes executable after
+     *         `timelockDelay`.
+     *
+     * @dev    This call is how the KYC registry was migrated without
+     *         redeploying the factory — a genuinely useful power, and the same
+     *         one that points the protocol at a hostile asset registry able to
+     *         whitelist a worthless token at Blue chip tier with no deposit
+     *         floor. A planned migration tolerates a delay comfortably; an
+     *         attack does not.
+     */
+    function queueSetRegistries(
+        address _kycRegistry,
+        address _assetRegistry,
+        address _insurancePool
+    ) external onlyOwner {
+        _queue(_registriesId(_kycRegistry, _assetRegistry, _insurancePool));
+    }
+
+    function cancelSetRegistries(
+        address _kycRegistry,
+        address _assetRegistry,
+        address _insurancePool
+    ) external onlyOwner {
+        _cancel(_registriesId(_kycRegistry, _assetRegistry, _insurancePool));
+    }
+
+    /// @notice Executes a registry change announced at least `timelockDelay`
+    ///         ago. Existing vaults are unaffected either way — they hold
+    ///         their own references and settle against them.
     function setRegistries(
         address _kycRegistry,
         address _assetRegistry,
@@ -890,10 +922,17 @@ contract VaultFactory {
         require(_kycRegistry != address(0),   "Invalid KYC registry address");
         require(_assetRegistry != address(0), "Invalid asset registry address");
         require(_insurancePool != address(0), "Invalid insurance pool address");
+
+        _consume(_registriesId(_kycRegistry, _assetRegistry, _insurancePool));
+
         kycRegistry   = KYCRegistry(_kycRegistry);
         assetRegistry = AssetRegistry(_assetRegistry);
         insurancePool = InsurancePool(_insurancePool);
         emit RegistriesUpdated(_kycRegistry, _assetRegistry, _insurancePool);
+    }
+
+    function _registriesId(address k, address a, address i) internal pure returns (bytes32) {
+        return keccak256(abi.encode("setRegistries", k, a, i));
     }
 
     // --- View functions ---

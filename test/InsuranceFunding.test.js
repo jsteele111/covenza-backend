@@ -49,7 +49,7 @@ describe("Insurance funding and cancellation", function () {
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator))
-      .deploy(operator.address, operator.address);
+      .deploy(operator.address, operator.address, 0);
     await kyc.verify(borrower.address);
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
@@ -65,7 +65,7 @@ describe("Insurance funding and cancellation", function () {
     }
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
-      .deploy(operator.address, 1000);
+      .deploy(operator.address, 1000, 0);
 
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
@@ -78,7 +78,7 @@ describe("Insurance funding and cancellation", function () {
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address, await vaultImpl.getAddress()
-    );
+    , 0);
     await pool.setVaultFactory(await factory.getAddress());
     await factory.setProtocolFeeRateBps(0);
 

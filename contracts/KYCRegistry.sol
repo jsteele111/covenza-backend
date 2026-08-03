@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
+import "./Timelocked.sol";
 
 /**
  * @title KYCRegistry
@@ -36,7 +37,7 @@ import "@openzeppelin/contracts/utils/Strings.sol";
  *         Badge artwork is generated fully on-chain (tokenURI() below) as
  *         a self-contained SVG - no external hosting dependency.
  */
-contract KYCRegistry is ERC721 {
+contract KYCRegistry is ERC721, Timelocked {
     using ECDSA for bytes32;
 
     // --- State variables ---
@@ -121,7 +122,10 @@ contract KYCRegistry is ERC721 {
      *                      key from _operator - keep verification-signing and
      *                      registry-administration privileges separate.
      */
-    constructor(address _operator, address _verifierKey) ERC721("Covenza KYC Badge", "CVKYC") {
+    constructor(address _operator, address _verifierKey, uint256 _timelockDelay)
+        ERC721("Covenza KYC Badge", "CVKYC")
+        Timelocked(_timelockDelay)
+    {
         require(_operator != address(0), "Invalid operator address");
         require(_verifierKey != address(0), "Invalid verifier key address");
         operator = _operator;
@@ -194,12 +198,45 @@ contract KYCRegistry is ERC721 {
      *         commercial reason is not the same as doubting every check they
      *         ever performed.
      */
+    /**
+     * @notice Announces a new identity provider. Recognised after
+     *         `timelockDelay`.
+     *
+     * @dev    A recognised key can admit any wallet, and the registry cannot
+     *         check that a real identity check happened behind the signature.
+     *         Adding a provider is never urgent; doing it instantly and
+     *         silently is how a hostile key gets added at 3am.
+     */
+    function queueAddAttester(
+        address _key,
+        string calldata _name,
+        string calldata _url
+    ) external onlyOperator {
+        require(_key != address(0), "Invalid attester address");
+        _queue(_attesterId(_key, _name, _url));
+    }
+
+    function cancelAddAttester(
+        address _key,
+        string calldata _name,
+        string calldata _url
+    ) external onlyOperator {
+        _cancel(_attesterId(_key, _name, _url));
+    }
+
     function addAttester(
         address _key,
         string calldata _name,
         string calldata _url
     ) external onlyOperator {
+        _consume(_attesterId(_key, _name, _url));
         _addAttester(_key, _name, _url);
+    }
+
+    function _attesterId(address _key, string memory _name, string memory _url)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encode("addAttester", _key, _name, _url));
     }
 
     function removeAttester(address _key) external onlyOperator {

@@ -55,10 +55,25 @@ async function main() {
     if (!ethers.isAddress(KEY)) throw new Error("KEY must be a valid address.");
     if (!NAME) throw new Error("NAME is required — an unnamed attester cannot be audited.");
     if (!URL) throw new Error("URL is required — it is what an unverified borrower is sent to.");
-    console.log(`\nRecognising ${KEY} as "${NAME}" (${URL}).`);
-    console.log("This key will be able to admit any wallet to the protocol.");
-    await (await registry.addAttester(KEY, NAME, URL)).wait();
-    console.log("Done.");
+    // Two-step: recognising a provider is delayed so the intent is visible
+    // before it takes effect. Removal stays instant.
+    const delay = Number(await registry.timelockDelay());
+    const id = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ["string", "address", "string", "string"], ["addAttester", KEY, NAME, URL]
+    ));
+
+    if (Number(await registry.queuedAt(id)) === 0) {
+      console.log(`\nAnnouncing ${KEY} as "${NAME}" (${URL}).`);
+      console.log("This key will be able to admit any wallet to the protocol.");
+      await (await registry.queueAddAttester(KEY, NAME, URL)).wait();
+      console.log(`Announced. Executable in ${delay}s — re-run this command then.`);
+    } else if (await registry.isExecutable(id)) {
+      await (await registry.addAttester(KEY, NAME, URL)).wait();
+      console.log("\nRecognised.");
+    } else {
+      const left = Number(await registry.timeUntilExecutable(id));
+      console.log(`\nAlready announced. ${left}s remaining before it can be executed.`);
+    }
   } else if (ACTION === "remove") {
     if (!ethers.isAddress(KEY)) throw new Error("KEY must be a valid address.");
     console.log(`\nDelisting ${KEY}.`);

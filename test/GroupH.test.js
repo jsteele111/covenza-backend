@@ -87,7 +87,7 @@ describe("Group H — protocol fee", function () {
     await usdx.mint(await router.getAddress(), E("1000"));
 
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator))
-      .deploy(operator.address, operator.address);
+      .deploy(operator.address, operator.address, 0);
     await kyc.verify(borrower.address);
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
@@ -109,7 +109,7 @@ describe("Group H — protocol fee", function () {
     }
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
-      .deploy(operator.address, 1000);
+      .deploy(operator.address, 1000, 0);
 
     // Fee left at the factory defaults: 10% of fee, 30% referrer share.
     // Vaults are EIP-1167 clones of one implementation, so the factory no
@@ -126,7 +126,7 @@ describe("Group H — protocol fee", function () {
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address,
       await vaultImpl.getAddress()   // clone source
-    );
+    , 0);
     await pool.setVaultFactory(await factory.getAddress());
 
     // The lender skim now defaults to ZERO — the insurance pool is funded by the

@@ -5,6 +5,10 @@
 **Status:** not ready for real money. Nothing here is unfixable; two items are
 structural and the rest are a week of work plus an audit.
 
+**Progress:** items 1, 2, 4 and 6 are addressed in code. Item 3 is a deployment
+decision, 5 is a deploy-script guard still to write, 7 and 8 are blocked, 9 is
+an audit. Fixes are marked inline.
+
 This is a self-review, not an independent audit, and self-review has a known
 failure mode: the person who wrote the bug is the person deciding whether it is
 a bug. Item 1 below was found by reading a code comment I wrote and noticing it
@@ -13,7 +17,13 @@ faster.
 
 ---
 
-## 1. Re-tagging an asset silently loosens live loans — CRITICAL
+## 1. Re-tagging an asset silently loosens live loans — CRITICAL — **FIXED**
+
+> `AssetRegistry` keeps tier history; `Vault.swap` requires
+> `highestTierSince(asset, originatedAt) <= maxTier`, which refuses both
+> directions of change and leaves an unmoved asset alone. Four tests added —
+> the suite previously covered only the direction the code got right.
+
 
 `Vault.swap()` line 646:
 
@@ -52,7 +62,13 @@ are already handled.
 
 ---
 
-## 2. The insurance pool can be emptied by one key, instantly — CRITICAL
+## 2. The insurance pool can be emptied by one key, instantly — CRITICAL — **FIXED**
+
+> `adminWithdraw` is now announce-then-execute via `Timelocked`, with the delay
+> immutable and the queue id bound to asset, recipient and amount. Cancellation
+> stays instant. The delay does not stop a determined operator — it makes the
+> attempt visible while there is still time to react.
+
 
 `InsurancePool.adminWithdraw(asset, to, amount)` sends any amount of reserve to
 any address, operator-only, no timelock, no cap, no delay.
@@ -104,7 +120,10 @@ which is why it is easy to leave undone.
 
 ---
 
-## 4. `setRegistries` can repoint the protocol at anything — HIGH
+## 4. `setRegistries` can repoint the protocol at anything — HIGH — **FIXED**
+
+> Same mechanism. A planned migration tolerates the delay; an attack does not.
+
 
 `VaultFactory.setRegistries(kyc, assetRegistry, insurancePool)` is `onlyOwner`
 and instant. We used it today, legitimately, to migrate the KYC registry
@@ -137,7 +156,12 @@ quietly accept it.
 
 ---
 
-## 6. A recognised attester can admit anyone — HIGH (accepted, not fixable)
+## 6. A recognised attester can admit anyone — HIGH (accepted) — **MITIGATED**
+
+> `addAttester` is timelocked. Removal is not, deliberately: a delay on
+> revoking a compromised provider key would make the timelock the
+> vulnerability.
+
 
 `KYCRegistry.verifyWithSignature` verifies only that a signature came from a
 key on the attester list. It cannot verify that an identity check happened.
@@ -198,12 +222,15 @@ spends its time on what I have missed rather than what I already know.
 
 ## What can be done now
 
+**Done:**
+
+1. ~~Snapshot tier configuration at origination (item 1)~~ — the real bug.
+2. ~~Timelock `adminWithdraw`, `setRegistries` and attester changes (items 2, 4, 6).~~
+4. ~~Fix the misleading comment on `Vault.swap` (item 1).~~
+
 **Immediately, no dependencies:**
 
-1. Snapshot tier configuration at origination (item 1) — the real bug.
-2. Timelock `adminWithdraw`, `setRegistries` and attester changes (items 2, 4, 6).
 3. Deploy-script guards: TWAP window ≥ 1800, all yield venues `None` (items 5, 7).
-4. Fix the misleading comment on `Vault.swap` (item 1).
 
 **At mainnet deploy, free:**
 

@@ -14,7 +14,7 @@ describe("KYCRegistry", function () {
     [operator, verifierKey, wallet1, wallet2, otherAccount] = await ethers.getSigners();
 
     const RegistryFactory = await ethers.getContractFactory("KYCRegistry");
-    registry = await RegistryFactory.deploy(operator.address, verifierKey.address);
+    registry = await RegistryFactory.deploy(operator.address, verifierKey.address, 0);
     await registry.waitForDeployment();
   });
 
@@ -42,14 +42,14 @@ describe("KYCRegistry", function () {
     it("Should revert if operator address is zero", async function () {
       const RegistryFactory = await ethers.getContractFactory("KYCRegistry");
       await expect(
-        RegistryFactory.deploy(ethers.ZeroAddress, verifierKey.address)
+        RegistryFactory.deploy(ethers.ZeroAddress, verifierKey.address, 0)
       ).to.be.revertedWith("Invalid operator address");
     });
 
     it("Should revert if verifier key address is zero", async function () {
       const RegistryFactory = await ethers.getContractFactory("KYCRegistry");
       await expect(
-        RegistryFactory.deploy(operator.address, ethers.ZeroAddress)
+        RegistryFactory.deploy(operator.address, ethers.ZeroAddress, 0)
       ).to.be.revertedWith("Invalid verifier key address");
     });
 
@@ -264,6 +264,7 @@ describe("KYCRegistry", function () {
     });
 
     it("Should accept signatures from a second attester once added", async function () {
+      await registry.connect(operator).queueAddAttester(otherAccount.address, "Second provider", "https://example.com/verify");
       await registry.connect(operator).addAttester(otherAccount.address, "Second provider", "https://example.com/verify");
 
       const expiry = await future();
@@ -316,6 +317,9 @@ describe("KYCRegistry", function () {
     it("Should publish where an unverified borrower can get checked", async function () {
       await registry
         .connect(operator)
+        .queueAddAttester(otherAccount.address, "Second provider", "https://example.com/verify");
+      await registry
+        .connect(operator)
         .addAttester(otherAccount.address, "Second provider", "https://example.com/verify");
 
       // On chain rather than in a frontend config: recognising a provider and
@@ -327,7 +331,7 @@ describe("KYCRegistry", function () {
 
     it("Should only let the operator add an attester", async function () {
       await expect(
-        registry.connect(wallet1).addAttester(otherAccount.address, "Rogue", "")
+        registry.connect(wallet1).queueAddAttester(otherAccount.address, "Rogue", "")
       ).to.be.revertedWith("Caller is not the operator");
     });
 
@@ -338,6 +342,7 @@ describe("KYCRegistry", function () {
     });
 
     it("Should reject adding an attester twice", async function () {
+      await registry.connect(operator).queueAddAttester(verifierKey.address, "Duplicate", "");
       await expect(
         registry.connect(operator).addAttester(verifierKey.address, "Duplicate", "")
       ).to.be.revertedWith("Attester already recognised");
@@ -345,7 +350,7 @@ describe("KYCRegistry", function () {
 
     it("Should reject the zero address as an attester", async function () {
       await expect(
-        registry.connect(operator).addAttester(ethers.ZeroAddress, "Nobody", "")
+        registry.connect(operator).queueAddAttester(ethers.ZeroAddress, "Nobody", "")
       ).to.be.revertedWith("Invalid attester address");
     });
 
