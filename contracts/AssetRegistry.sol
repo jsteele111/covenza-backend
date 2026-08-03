@@ -103,6 +103,29 @@ contract AssetRegistry {
     mapping(RiskTier => TierConfig) public tierConfig;
 
     /**
+     * @notice Every tier an asset has been assigned, with effect dates.
+     *
+     * @dev    Exists because a live loan's risk mandate has to mean what it
+     *         meant when it was written. Vault.swap compared a LIVE tier
+     *         against a ceiling snapshotted at origination, which is safe in
+     *         one direction and not the other: re-tagging an asset as riskier
+     *         excludes it from vaults that previously allowed it, but
+     *         re-tagging it as SAFER admits it to vaults that previously
+     *         excluded it — with no lender consent, against a deposit sized
+     *         for a different volatility.
+     *
+     *         History rather than a single previous value because an asset can
+     *         be re-tagged more than once during a loan, and only the worst it
+     *         has been should count.
+     */
+    struct TierChange {
+        uint64  at;
+        RiskTier tier;
+    }
+
+    mapping(address => TierChange[]) private _tierHistory;
+
+    /**
      * @notice Coefficient in the volatility deposit floor, in bps. 18000 = 1.8.
      *
      * @dev    Calibrated so a 30-day loan at 64% volatility requires ~33%
@@ -319,6 +342,11 @@ contract AssetRegistry {
             allAssets.push(_asset);
         }
 
+        // Seeds history at listing so a vault opened before any re-tag has
+        // something to compare against, rather than falling through to the
+        // empty-history case that trusts the current tier.
+        _recordTier(_asset, existingTier);
+
         emit AssetAdded(_asset, _aToken);
         emit VenueUpdated(_asset, _venue, _venueAddress);
         if (_gracePeriod > 0) { emit GracePeriodUpdated(_asset, _gracePeriod); }
@@ -374,7 +402,57 @@ contract AssetRegistry {
     function setTier(address _asset, RiskTier _tier) external onlyOperator {
         require(_everAdded[_asset], "Unknown asset");
         assetConfig[_asset].tier = _tier;
+        _recordTier(_asset, _tier);
         emit TierUpdated(_asset, _tier);
+    }
+
+    /// @dev Appends to the tier history. Called wherever `tier` is written, so
+    ///      history and current state cannot drift apart.
+    function _recordTier(address _asset, RiskTier _tier) internal {
+        TierChange[] storage h = _tierHistory[_asset];
+        if (h.length > 0 && h[h.length - 1].tier == _tier) { return; }
+        h.push(TierChange({ at: uint64(block.timestamp), tier: _tier }));
+    }
+
+    /**
+     * @notice The riskiest tier `_asset` has held at any point from `_since`
+     *         until now.
+     *
+     * @dev    This is what a vault must check, not the current tier. Requiring
+     *         `highestTierSince(asset, originatedAt) <= maxTier` refuses an
+     *         asset that was too risky when the loan was written even if it
+     *         has since been re-tagged safer, and refuses one that has since
+     *         been re-tagged riskier. An asset that never moved is unaffected.
+     *
+     *         Walks backwards and stops at the first entry that predates
+     *         `_since` — that entry is the tier in force at the time, and
+     *         nothing before it is relevant. Cost is proportional to the number
+     *         of re-tags during the loan, which should be zero.
+     *
+     *         Assets whitelisted before tier history existed have an empty
+     *         array; their current tier is the only truth available and is
+     *         returned unchanged.
+     */
+    function highestTierSince(address _asset, uint256 _since)
+        external view returns (RiskTier)
+    {
+        TierChange[] storage h = _tierHistory[_asset];
+        if (h.length == 0) { return assetConfig[_asset].tier; }
+
+        RiskTier worst = h[h.length - 1].tier;
+        for (uint256 i = h.length; i > 0; i--) {
+            TierChange storage c = h[i - 1];
+            if (uint8(c.tier) > uint8(worst)) { worst = c.tier; }
+            if (c.at <= _since) { break; }
+        }
+        return worst;
+    }
+
+    /// @notice How many times this asset has been re-tagged. Surfaced so an
+    ///         operator can see that changing a tier is not a free action —
+    ///         it constrains every loan already open against it.
+    function tierHistoryLength(address _asset) external view returns (uint256) {
+        return _tierHistory[_asset].length;
     }
 
     /// @notice Updates a tier's risk parameters. Applies to NEW loans only —

@@ -227,10 +227,17 @@ describe("KYCRegistry", function () {
       return signer.signMessage(ethers.getBytes(structHash));
     }
 
-    const future = () => Math.floor(Date.now() / 1000) + 3600;
+    // Chain time, not wall-clock. These tests passed in isolation and failed
+    // in the full suite: other files advance block.timestamp by days for term
+    // and grace scenarios, so Date.now() was already in the chain's past and
+    // every signature read as expired.
+    async function future() {
+      const block = await ethers.provider.getBlock("latest");
+      return block.timestamp + 3600;
+    }
 
     it("Should accept a signature from a recognised attester", async function () {
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(verifierKey, wallet1.address, expiry);
 
       await registry.verifyWithSignature(wallet1.address, expiry, sig);
@@ -238,7 +245,7 @@ describe("KYCRegistry", function () {
     });
 
     it("Should record which attester admitted the wallet", async function () {
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(verifierKey, wallet1.address, expiry);
       await registry.verifyWithSignature(wallet1.address, expiry, sig);
 
@@ -248,7 +255,7 @@ describe("KYCRegistry", function () {
     });
 
     it("Should reject a signature from a key that was never recognised", async function () {
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(otherAccount, wallet1.address, expiry);
 
       await expect(
@@ -259,7 +266,7 @@ describe("KYCRegistry", function () {
     it("Should accept signatures from a second attester once added", async function () {
       await registry.connect(operator).addAttester(otherAccount.address, "Second provider", "https://example.com/verify");
 
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(otherAccount, wallet2.address, expiry);
       await registry.verifyWithSignature(wallet2.address, expiry, sig);
 
@@ -269,7 +276,7 @@ describe("KYCRegistry", function () {
     it("Should stop accepting a delisted attester's signatures", async function () {
       await registry.connect(operator).removeAttester(verifierKey.address);
 
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(verifierKey, wallet1.address, expiry);
 
       await expect(
@@ -278,7 +285,7 @@ describe("KYCRegistry", function () {
     });
 
     it("Should leave existing verifications standing when an attester is delisted", async function () {
-      const expiry = future();
+      const expiry = await future();
       const sig = await attestation(verifierKey, wallet1.address, expiry);
       await registry.verifyWithSignature(wallet1.address, expiry, sig);
 

@@ -164,6 +164,71 @@ describe("Risk tiers", function () {
     ).to.be.revertedWith("Asset exceeds this vault's risk mandate");
   });
 
+  // The direction the original implementation missed. Its comment claimed
+  // re-tagging "can tighten a live loan but never loosen it", and the suite
+  // only ever tested tightening — so the claim and the tests agreed with each
+  // other and both were wrong.
+  it("Re-tagging an asset SAFER does not widen a LIVE loan", async function () {
+    const { originate, borrower, registry, aapl } = await loadFixture(fixture);
+    const vault = await originate(BLUE_CHIP);
+
+    // aapl is Standard, so a Blue chip vault cannot hold it.
+    await expect(
+      vault.connect(borrower).swap(await aapl.getAddress(), E("1"), E("0.9"), POOL_FEE)
+    ).to.be.revertedWith("Asset exceeds this vault's risk mandate");
+
+    // The operator now decides aapl is Blue chip after all. The lender who
+    // wrote this loan never agreed to back it, and their deposit was sized
+    // against Blue chip volatility.
+    await registry.setTier(await aapl.getAddress(), BLUE_CHIP);
+
+    await expect(
+      vault.connect(borrower).swap(await aapl.getAddress(), E("1"), E("0.9"), POOL_FEE)
+    ).to.be.revertedWith("Asset exceeds this vault's risk mandate");
+  });
+
+  it("Accepts the re-tagged asset for a loan written AFTER the change", async function () {
+    const { originate, borrower, registry, aapl } = await loadFixture(fixture);
+
+    await registry.setTier(await aapl.getAddress(), BLUE_CHIP);
+
+    // Not a blanket ban: a lender writing now is consenting to the tier as it
+    // stands, which is the whole point of the ceiling being a lender choice.
+    const vault = await originate(BLUE_CHIP);
+    await expect(
+      vault.connect(borrower).swap(await aapl.getAddress(), E("1"), E("0.9"), POOL_FEE)
+    ).to.not.be.reverted;
+  });
+
+  it("Takes the WORST tier held since origination, across several re-tags", async function () {
+    const { originate, borrower, registry, aapl } = await loadFixture(fixture);
+    const vault = await originate(STANDARD);
+    const asset = await aapl.getAddress();
+
+    // Standard at origination, briefly Speculative, back to Standard. The
+    // asset looks acceptable again by current tier alone, but the loan was
+    // exposed to something the lender's ceiling never covered.
+    await registry.setTier(asset, SPECULATIVE);
+    await registry.setTier(asset, STANDARD);
+
+    await expect(
+      vault.connect(borrower).swap(asset, E("1"), E("0.9"), POOL_FEE)
+    ).to.be.revertedWith("Asset exceeds this vault's risk mandate");
+  });
+
+  it("Leaves an asset that was never re-tagged unaffected", async function () {
+    const { originate, borrower, registry, meme, aapl } = await loadFixture(fixture);
+    const vault = await originate(STANDARD);
+
+    // Churn on a DIFFERENT asset must not touch this one.
+    await registry.setTier(await meme.getAddress(), BLUE_CHIP);
+    await registry.setTier(await meme.getAddress(), SPECULATIVE);
+
+    await expect(
+      vault.connect(borrower).swap(await aapl.getAddress(), E("1"), E("0.9"), POOL_FEE)
+    ).to.not.be.reverted;
+  });
+
   it("Records the ceiling on the vault so it cannot be widened later", async function () {
     const { originate } = await loadFixture(fixture);
     const vault = await originate(BLUE_CHIP);

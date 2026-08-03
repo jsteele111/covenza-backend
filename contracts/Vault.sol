@@ -639,11 +639,22 @@ contract Vault {
             "No TWAP history for this pair and fee tier"
         );
 
-        // The lender's risk mandate. Read live from the registry but compared
-        // against a ceiling snapshotted at origination, so re-tagging an asset
-        // can tighten a live loan but never loosen it.
+        // The lender's risk mandate, measured over the life of the loan rather
+        // than at this instant.
+        //
+        // This previously compared the asset's LIVE tier against the
+        // snapshotted ceiling, with a comment claiming that re-tagging could
+        // tighten a live loan but never loosen it. That was true in one
+        // direction only. Re-tagging an asset SAFER — Standard down to Blue
+        // chip — admitted it to every open Blue chip vault immediately, with
+        // no lender consent, against a deposit sized for a volatility the
+        // asset does not have. A mandate is expressed as a tier, so the lender
+        // never named the asset and had no way to object.
+        //
+        // Taking the worst tier the asset has held since origination refuses
+        // it in both directions, and leaves an asset that never moved alone.
         require(
-            uint8(registry.tierOf(tokenOut)) <= maxTier,
+            uint8(registry.highestTierSince(tokenOut, originatedAt)) <= maxTier,
             "Asset exceeds this vault's risk mandate"
         );
 
