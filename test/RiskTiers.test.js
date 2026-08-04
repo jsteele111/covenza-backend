@@ -81,6 +81,13 @@ describe("Risk tiers", function () {
     }
     await registry.setMaxEntryImpactBps(0);
 
+    // Every asset is tagged explicitly. A never-seen asset now defaults to
+    // Speculative rather than BlueChip — "unassessed" and "safest" used to be
+    // the same state, so an asset nobody had evaluated was admitted to the
+    // most conservative vaults. These four tests previously leaned on that
+    // default without saying so.
+    await registry.setTier(await usdx.getAddress(), BLUE_CHIP);
+    await registry.setTier(await weth.getAddress(), BLUE_CHIP);
     await registry.setTier(await aapl.getAddress(), STANDARD);
     await registry.setTier(await meme.getAddress(), SPECULATIVE);
 

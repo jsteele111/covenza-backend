@@ -57,6 +57,11 @@ describe("Insurance funding and cancellation", function () {
       await uniFactory.getAddress(), usdxAddr
     );
     await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
+    // Explicit: a never-seen asset defaults to Speculative, not BlueChip. This
+    // suite asserts that the vault's CEILING prices the premium rather than
+    // the loan asset's own tier, which needs the loan asset to be tagged
+    // deliberately rather than inherited from a default.
+    await registry.setTier(usdxAddr, 0);
     await registry.setSettlementConfig(1800, 200, 3600, 2, 100);
 
     // Permissive everywhere except the premium, which is what this suite tests.

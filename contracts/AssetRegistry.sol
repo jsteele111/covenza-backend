@@ -311,6 +311,34 @@ contract AssetRegistry {
         _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
     }
 
+    /**
+     * @notice Whitelists an asset AND assigns its tier in one transaction.
+     *
+     * @dev    Listing then tagging in two transactions leaves the asset
+     *         carrying the default tier in between. Observed on testnet:
+     *         listing an equity produced two tier-history entries, the first
+     *         of them a tier nobody intended. Nothing was harmed because no
+     *         loans existed, but the window is real and it is trivially
+     *         avoidable.
+     *
+     *         This is the path an operator should use. addAsset and
+     *         addAssetWithVenue remain for the case where the tier is genuinely
+     *         being left at its default.
+     */
+    function addAssetWithTier(
+        address    _asset,
+        address    _aToken,
+        YieldVenue _venue,
+        address    _venueAddress,
+        uint256    _gracePeriod,
+        RiskTier   _tier
+    ) external onlyOperator {
+        _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
+        assetConfig[_asset].tier = _tier;
+        _recordTier(_asset, _tier);
+        emit TierUpdated(_asset, _tier);
+    }
+
     function _addAsset(
         address    _asset,
         address    _aToken,
@@ -326,7 +354,15 @@ contract AssetRegistry {
         // asset overwrites the whole struct, and silently resetting a
         // Speculative asset to BlueChip would quietly widen every mandate that
         // referenced it.
-        RiskTier existingTier = assetConfig[_asset].tier;
+        //
+        // A NEVER-SEEN asset defaults to Speculative, not BlueChip. The enum's
+        // zero value is BlueChip, which made "unassessed" and "safest" the
+        // same state — so an asset nobody had evaluated was admitted to every
+        // vault including the most conservative. Unknown should be the most
+        // constrained position, and relaxing it should take a deliberate act.
+        RiskTier existingTier = _everAdded[_asset]
+            ? assetConfig[_asset].tier
+            : RiskTier.Speculative;
 
         assetConfig[_asset] = AssetConfig({
             whitelisted:  true,
