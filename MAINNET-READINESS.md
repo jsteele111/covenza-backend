@@ -99,7 +99,23 @@ removing the power.
 
 ---
 
-## 3. Everything is one key — CRITICAL — **PARTIALLY GUARDED**
+## 3. Everything is one key — CRITICAL — **RESOLVED ON TESTNET**
+
+> Two Safes now hold the roles, proven end to end on chain:
+> operator `0x0A2e01…5B1c`, owner `0x7FfCbd…988B`. The deploying key governs
+> nothing. `scripts/verify-handover.js` exercises a real operator action from
+> both sides — refused from the old key with the operator check, executed
+> successfully from the Safe — because reading `operator()` only proves a
+> variable was assigned, not that the permission checks consult it.
+>
+> **The honest caveat:** these are 1-of-1 Safes owned by the same key that
+> deployed everything. Against a compromised key that is barely an improvement.
+> What it buys is structural — a Safe's address survives changes to its owner
+> set, so co-signers can be added later without Covenza being touched again,
+> and the irreversible part is already done and tested.
+>
+> Adding real co-signers is now a Safe administration task, not a protocol one.
+> It must happen before mainnet.
 
 > The deploy guard refuses production when the operator is the deploying EOA.
 > `scripts/transfer-control.js` moves both roles and refuses a target with no

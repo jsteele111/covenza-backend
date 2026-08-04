@@ -59,6 +59,8 @@
       "note": "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js"
     },
     "twapWindow": 60,
-    "deployedAt": "2026-08-04T11:21:55.251Z"
+    "deployedAt": "2026-08-04T11:21:55.251Z",
+    "operatorSafe": "0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c",
+    "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B"
   }
 }
