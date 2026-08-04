@@ -266,6 +266,46 @@ async function main() {
     console.log(`  ${TIER_NAMES[t.tier].padEnd(12)} implied cap ${implied.toFixed(1).padStart(5)}%   ${verdict}`);
   }
 
+  // --- Reserve sizing under correlated stress ---------------------------
+  //
+  // Everything above prices ONE loan in isolation. The scenario that empties a
+  // pool is the opposite: a market-wide fall breaching many deposits at once,
+  // where the per-settlement cap limits each payout and nothing limits the sum.
+  //
+  // Deliberately NOT probabilistic. Asking "how likely is a day when 20% of
+  // loans breach" invites the same lognormal that has already been flagged as
+  // the weakest assumption here. Stating the scenario and pricing it leaves the
+  // judgement visible instead of burying it in a distribution.
+  console.log("\n" + "=".repeat(78));
+  console.log("Reserve required under correlated stress");
+  console.log("=".repeat(78));
+  console.log("\nIf a fraction of open loans breach together, each draws up to the");
+  console.log(`per-settlement cap (${tiers[0].drawCapBps / 100}% of principal). Reserve needed, as a`);
+  console.log("percentage of TOTAL OPEN PRINCIPAL:\n");
+
+  const capFr = tiers[0].drawCapBps / 10000;
+  console.log("   loans breaching     reserve needed     on 1m of open principal");
+  console.log("   " + "-".repeat(62));
+  for (const share of [0.05, 0.2, 0.5, 1.0]) {
+    const reserveFr = share * capFr;
+    console.log(
+      `   ${(share * 100).toFixed(0).padStart(14)}%` +
+      `   ${(reserveFr * 100).toFixed(2).padStart(15)}%` +
+      `   ${(reserveFr * 1_000_000).toLocaleString("en-GB", { maximumFractionDigits: 0 }).padStart(22)}`
+    );
+  }
+
+  console.log(`
+This is an UPPER bound per scenario: it assumes every breaching loan draws the
+full cap, when most draw less. It is also a LOWER bound in a different sense —
+the cap binds per settlement, so a loss larger than ${(capFr * 100).toFixed(0)}% of principal leaves the
+lender short regardless of how much reserve exists. Reserve protects against
+MANY losses, never against a DEEP one.
+
+The 10% cap is therefore doing two jobs: rationing the pool across claimants,
+and silently capping how much protection a lender has at all. Those deserve to
+be separate numbers.`);
+
   // --- What the numbers do and do not say ------------------------------
 
   console.log("\n" + "=".repeat(78));
@@ -310,9 +350,11 @@ ASSUMPTIONS, in the order they are likely to be wrong:
    also the ones most likely to be underwater, realised draws exceed modelled
    ones regardless of the distribution.
 
-WHAT THIS DOES NOT ANSWER: what reserve the pool should hold. That needs a
-target — "survive a day on which 20% of open loans breach simultaneously" — and
-that is a risk-appetite decision, not a calculation.
+WHAT THIS DOES NOT ANSWER: which stress scenario to size against. The table
+above prices several; choosing among them is a risk-appetite decision and
+belongs to whoever answers for the pool being empty. Nor does it answer whether
+the draw cap should keep doing two jobs at once — rationing between claimants
+and capping any one lender's protection.
 `);
 }
 

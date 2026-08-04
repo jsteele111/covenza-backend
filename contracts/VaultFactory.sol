@@ -52,6 +52,21 @@ contract VaultFactory is Timelocked {
     InsurancePool public insurancePool;
     address       public owner;
 
+    /// @notice Nominee for ownership, pending their acceptance.
+    ///
+    /// @dev    Two-step, and the factory had no transfer at all before this:
+    ///         `owner` was set in the constructor with no setter, so handing
+    ///         the protocol to a multisig meant redeploying the factory. Found
+    ///         while writing the script to do exactly that.
+    ///
+    ///         Two-step rather than one because the transfer is irreversible
+    ///         and the recipient is usually a Safe. Requiring the nominee to
+    ///         call accept proves it can transact BEFORE control depends on
+    ///         it — a multisig that cannot reach its threshold is
+    ///         indistinguishable from a lost key, and you find out at the
+    ///         moment you need it.
+    address       public pendingOwner;
+
     /// @notice Portion of each loan's fee skimmed into the insurance pool
     ///         at origination, in bps of the fee (e.g. 2000 = 20% of the
     ///         fee). Launch value is a placeholder pending VaR calibration
@@ -185,6 +200,35 @@ contract VaultFactory is Timelocked {
     modifier onlyOwner() {
         require(msg.sender == owner, "Caller is not the owner");
         _;
+    }
+
+    // --- Ownership ---
+
+    event OwnershipTransferStarted(address indexed from, address indexed to);
+    event OwnershipTransferred(address indexed from, address indexed to);
+
+    /// @notice Nominates a new owner. Takes effect only once they accept.
+    function transferOwnership(address _newOwner) external onlyOwner {
+        require(_newOwner != address(0), "Invalid owner address");
+        pendingOwner = _newOwner;
+        emit OwnershipTransferStarted(owner, _newOwner);
+    }
+
+    /// @notice Withdraws a pending nomination. Not restricted to before any
+    ///         deadline — a nomination that has not been accepted has changed
+    ///         nothing, so cancelling it costs nothing.
+    function cancelOwnershipTransfer() external onlyOwner {
+        emit OwnershipTransferStarted(owner, address(0));
+        pendingOwner = address(0);
+    }
+
+    /// @notice Called by the nominee to take ownership.
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "Caller is not the pending owner");
+        address previous = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previous, owner);
     }
 
     // --- Core function ---

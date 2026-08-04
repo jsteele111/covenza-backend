@@ -102,9 +102,20 @@ removing the power.
 ## 3. Everything is one key — CRITICAL — **PARTIALLY GUARDED**
 
 > The deploy guard refuses production when the operator is the deploying EOA.
-> That catches the laziest version. It cannot check that the operator is a
-> multisig rather than another EOA, so this remains a deployment discipline
-> question rather than something code can settle.
+> `scripts/transfer-control.js` moves both roles and refuses a target with no
+> contract code — a Safe has code, a typo'd EOA does not, and the transfer is
+> irreversible.
+>
+> **This surfaced a blocker.** `VaultFactory` had no ownership transfer at all:
+> `owner` was set in the constructor with no setter, so the factory could only
+> ever belong to whoever deployed it. Handing it to a multisig was impossible
+> without a redeploy. A two-step `transferOwnership` / `acceptOwnership` is now
+> in place — two-step because the recipient calling accept proves the multisig
+> can transact before anything depends on it.
+>
+> **Still open:** the change needs a factory redeploy to take effect, and the
+> three operator roles remain one-step. A mistyped operator address cannot be
+> undone. They should move to the same two-step pattern.
 
 
 Today, on testnet, `0x6C9317…3a68` is simultaneously:
@@ -228,9 +239,11 @@ assert that rather than trusting the operator to remember.
 > - Blue chip exposure reduced 100% → 70%, the cap at which premium income
 >   covers modelled draw by 3x at every permitted term. Tightening the control
 >   rather than repricing, per the principle the tiers were built on.
-> - **Speculative's 600bps premium buys insurance that cannot pay out** — its
->   40% deposit exceeds the 25% maximum possible loss. Not a solvency problem;
->   a fairness one, and still open.
+> - Speculative's premium cut 600bps → 100bps. Its 40% deposit exceeds the 25%
+>   maximum possible loss, so the pool's exposure is not improbable but
+>   arithmetically zero — no tail model reaches it. That is what separates it
+>   from Standard, whose 4.9-sigma threshold fat tails could plausibly touch,
+>   and why Standard's 250bps stands.
 >
 > The 3x target is a risk-appetite choice, not a derivation — it is the margin
 > held against the lognormal being wrong, which the script says plainly it is.

@@ -220,7 +220,16 @@ async function main() {
   // compensation. See scripts/model-insurance-solvency.js.
   await (await registry.setTierConfig(0, 6000, 1000,  30 * 86400, 7000, 100)).wait();
   await (await registry.setTierConfig(1, 10000, 2000,  7 * 86400,  5000, 250)).wait();
-  await (await registry.setTierConfig(2, 20000, 4000,      86400,  2500, 600)).wait();
+  // Speculative's premium is 100bps, not 600. Its 40% deposit exceeds the 25%
+  // maximum possible loss, so the pool's exposure is not merely improbable, it
+  // is arithmetically zero — the position cannot fall far enough. No tail model
+  // changes that, which is what separates it from Standard, whose 4.9-sigma
+  // threshold fat tails could plausibly reach.
+  //
+  // Charging 600bps for cover that cannot pay is not a solvency problem; it is
+  // selling something that does not exist. Kept nominal rather than zero
+  // because the tier still consumes administration and reserve capacity.
+  await (await registry.setTierConfig(2, 20000, 4000,      86400,  2500, 100)).wait();
   console.log("  tier config set (BlueChip / Standard / Speculative)");
 
   // Both test tokens are blue chip here — they are mock ERC-20s against a pool
