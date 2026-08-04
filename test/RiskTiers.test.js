@@ -236,6 +236,77 @@ describe("Risk tiers", function () {
     ).to.not.be.reverted;
   });
 
+  // --- Every listing path must seed history, exactly once ---
+  //
+  // _addAsset does not record; each public entry point does. That is what
+  // lets a tier-assigning listing write one entry instead of two, and it is
+  // fragile in a specific way: a listing path that forgets leaves the asset
+  // with NO history, which falls through to the empty-history case that
+  // trusts the live tier — the re-tagging hole these tiers exist to close.
+  //
+  // Refactoring this and forgetting `addAsset` is not hypothetical. It is
+  // what happened while writing the change these tests cover.
+
+  it("Seeds tier history on the plain addAsset path", async function () {
+    const { registry, operator } = await loadFixture(fixture);
+    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
+      .deploy("Fresh", "FRSH", 18);
+    const addr = await freshToken.getAddress();
+
+    await registry.addAsset(addr, ethers.ZeroAddress);
+    expect(await registry.tierHistoryLength(addr)).to.equal(1);
+  });
+
+  it("Seeds tier history on the addAssetWithVenue path", async function () {
+    const { registry, operator } = await loadFixture(fixture);
+    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
+      .deploy("Fresh", "FRSH", 18);
+    const addr = await freshToken.getAddress();
+
+    await registry.addAssetWithVenue(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0);
+    expect(await registry.tierHistoryLength(addr)).to.equal(1);
+  });
+
+  it("Writes ONE entry when listing with a tier, not the default then the tier", async function () {
+    const { registry, operator } = await loadFixture(fixture);
+    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
+      .deploy("Fresh", "FRSH", 18);
+    const addr = await freshToken.getAddress();
+
+    await registry.addAssetWithTier(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, STANDARD);
+
+    expect(await registry.tierHistoryLength(addr)).to.equal(1);
+    expect(await registry.tierOf(addr)).to.equal(STANDARD);
+  });
+
+  it("Records the tier the asset was actually listed at, not the default", async function () {
+    const { registry, operator } = await loadFixture(fixture);
+    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
+      .deploy("Fresh", "FRSH", 18);
+    const addr = await freshToken.getAddress();
+
+    await registry.addAssetWithTier(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, STANDARD);
+
+    // The sole entry must read Standard. A phantom Speculative entry sharing
+    // this block would make highestTierSince report a tier the asset never
+    // held, tightening loans for no reason.
+    const listedAt = (await ethers.provider.getBlock("latest")).timestamp;
+    expect(await registry.highestTierSince(addr, listedAt)).to.equal(STANDARD);
+  });
+
+  it("Defaults an unassessed listing to Speculative, and says so in history", async function () {
+    const { registry, operator } = await loadFixture(fixture);
+    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
+      .deploy("Fresh", "FRSH", 18);
+    const addr = await freshToken.getAddress();
+
+    await registry.addAsset(addr, ethers.ZeroAddress);
+
+    expect(await registry.tierOf(addr)).to.equal(SPECULATIVE);
+    const listedAt = (await ethers.provider.getBlock("latest")).timestamp;
+    expect(await registry.highestTierSince(addr, listedAt)).to.equal(SPECULATIVE);
+  });
+
   it("Records the ceiling on the vault so it cannot be widened later", async function () {
     const { originate } = await loadFixture(fixture);
     const vault = await originate(BLUE_CHIP);

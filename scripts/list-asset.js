@@ -50,23 +50,28 @@ async function main() {
 
   if (await registry.isWhitelisted(asset)) {
     console.log("\nAlready whitelisted — setting tier only.");
+    await (await registry.setTier(asset, TIER)).wait();
   } else {
-    await (await registry.addAssetWithVenue(
+    // One transaction, not list-then-tag. The two-call version left the asset
+    // whitelisted at the default tier in between, which on a fresh registry is
+    // Speculative — harmless here, but it is a real window on a registry
+    // serving live loans and there is no reason to open it.
+    await (await registry.addAssetWithTier(
       asset,
       ethers.ZeroAddress,   // no Aave on this chain
       0,                    // YieldVenue.None
       ethers.ZeroAddress,
-      GRACE_HOURS * 3600
+      GRACE_HOURS * 3600,
+      TIER
     )).wait();
     console.log("\nWhitelisted.");
   }
 
-  await (await registry.setTier(asset, TIER)).wait();
   console.log(`Tier set to ${TIER}.`);
 
   // The tier history seeded here is what a vault's risk mandate is measured
-  // against. Worth showing: a freshly listed asset has one entry, so no live
-  // loan can be surprised by a tier it never agreed to.
+  // against. A freshly listed asset should show exactly ONE entry: more than
+  // that means it passed through a tier it was never meant to hold.
   //
   // Tolerated rather than assumed: a registry deployed before tier history
   // existed has no such function, and reverting on a REPORTING line after the

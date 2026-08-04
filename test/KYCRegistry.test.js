@@ -146,15 +146,24 @@ describe("KYCRegistry", function () {
   // --- Operator transfer ---
   describe("Operator transfer", function () {
 
-    it("Should allow operator to transfer role", async function () {
+    it("Should nominate rather than transfer, leaving the current operator in place", async function () {
       await registry.connect(operator).transferOperator(otherAccount.address);
-      expect(await registry.operator()).to.equal(otherAccount.address);
+      expect(await registry.operator()).to.equal(operator.address);
+      expect(await registry.pendingOperator()).to.equal(otherAccount.address);
     });
 
-    it("Should emit OperatorUpdated event", async function () {
+    it("Should emit OperatorTransferStarted on nomination", async function () {
       await expect(
         registry.connect(operator).transferOperator(otherAccount.address)
-      ).to.emit(registry, "OperatorUpdated");
+      ).to.emit(registry, "OperatorTransferStarted")
+        .withArgs(operator.address, otherAccount.address);
+    });
+
+    it("Should emit OperatorUpdated only on acceptance", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await expect(registry.connect(otherAccount).acceptOperator())
+        .to.emit(registry, "OperatorUpdated")
+        .withArgs(operator.address, otherAccount.address);
     });
 
     it("Should revert if non-operator tries to transfer", async function () {
@@ -169,17 +178,69 @@ describe("KYCRegistry", function () {
       ).to.be.revertedWith("Invalid operator address");
     });
 
-    it("Should allow new operator to verify after transfer", async function () {
+    it("Should grant no powers to a nominee who has not accepted", async function () {
       await registry.connect(operator).transferOperator(otherAccount.address);
+      await expect(
+        registry.connect(otherAccount).verify(wallet1.address)
+      ).to.be.revertedWith("Caller is not the operator");
+    });
+
+    it("Should reject acceptance from anyone but the nominee", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await expect(
+        registry.connect(wallet1).acceptOperator()
+      ).to.be.revertedWith("Caller is not the pending operator");
+    });
+
+    it("Should reject acceptance when no transfer is pending", async function () {
+      await expect(
+        registry.connect(otherAccount).acceptOperator()
+      ).to.be.revertedWith("Caller is not the pending operator");
+    });
+
+    it("Should allow new operator to verify after accepting", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await registry.connect(otherAccount).acceptOperator();
       await registry.connect(otherAccount).verify(wallet1.address);
       expect(await registry.isVerified(wallet1.address)).to.equal(true);
     });
 
-    it("Should prevent old operator from verifying after transfer", async function () {
+    it("Should prevent old operator from verifying after acceptance", async function () {
       await registry.connect(operator).transferOperator(otherAccount.address);
+      await registry.connect(otherAccount).acceptOperator();
       await expect(
         registry.connect(operator).verify(wallet1.address)
       ).to.be.revertedWith("Caller is not the operator");
+    });
+
+    it("Should let the operator cancel a nomination before it is accepted", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await registry.connect(operator).cancelOperatorTransfer();
+      expect(await registry.pendingOperator()).to.equal(ethers.ZeroAddress);
+      await expect(
+        registry.connect(otherAccount).acceptOperator()
+      ).to.be.revertedWith("Caller is not the pending operator");
+    });
+
+    it("Should replace an outstanding nomination rather than queueing a second", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await registry.connect(operator).transferOperator(wallet1.address);
+      expect(await registry.pendingOperator()).to.equal(wallet1.address);
+      await expect(
+        registry.connect(otherAccount).acceptOperator()
+      ).to.be.revertedWith("Caller is not the pending operator");
+    });
+
+    it("Should clear the nomination after acceptance so it cannot be replayed", async function () {
+      await registry.connect(operator).transferOperator(otherAccount.address);
+      await registry.connect(otherAccount).acceptOperator();
+      expect(await registry.pendingOperator()).to.equal(ethers.ZeroAddress);
+
+      // Without clearing, the old nominee could re-accept and seize the role
+      // back after a later, legitimate transfer moved it elsewhere.
+      await expect(
+        registry.connect(otherAccount).acceptOperator()
+      ).to.be.revertedWith("Caller is not the pending operator");
     });
 
   });

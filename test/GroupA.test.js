@@ -140,6 +140,16 @@ describe("Group A — AssetRegistry", function () {
     const { registry, operator, other, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
 
     await registry.transferOperator(other.address);
+
+    // Nomination alone changes nothing. The old operator still governs, and
+    // the nominee has no powers until they accept.
+    expect(await registry.operator()).to.equal(operator.address);
+    await expect(
+      registry.connect(other).addAsset(await usdc.getAddress(), aTokenUsdc)
+    ).to.be.revertedWith("Caller is not the operator");
+
+    await registry.connect(other).acceptOperator();
+
     await expect(
       registry.connect(operator).addAsset(await usdc.getAddress(), aTokenUsdc)
     ).to.be.revertedWith("Caller is not the operator");

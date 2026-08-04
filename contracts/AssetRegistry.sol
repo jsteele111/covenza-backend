@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "./OperatorControlled.sol";
+
 /**
  * @title AssetRegistry
  * @notice Protocol-level, operator-controlled asset whitelist for the
@@ -30,11 +32,9 @@ pragma solidity ^0.8.24;
  *         whitelist status. A whitelist removal must never strand a
  *         borrower who is already holding the removed asset mid-loan.
  */
-contract AssetRegistry {
+contract AssetRegistry is OperatorControlled {
 
     // --- State variables ---
-
-    address public operator;
 
     // Protocol-wide integration addresses (set once at deployment, but
     // operator-updatable in case of e.g. a router migration).
@@ -199,7 +199,6 @@ contract AssetRegistry {
 
     // --- Events ---
 
-    event OperatorUpdated(address indexed previousOperator, address indexed newOperator);
     event AssetAdded(address indexed asset, address indexed aToken);
     event AssetRemoved(address indexed asset);
     event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
@@ -231,20 +230,17 @@ contract AssetRegistry {
         address _swapRouter,
         address _uniswapFactory,
         address _weth
-    ) {
-        require(_operator != address(0),       "Invalid operator address");
+    ) OperatorControlled(_operator) {
         require(_aavePool != address(0),       "Invalid Aave pool address");
         require(_swapRouter != address(0),     "Invalid swap router address");
         require(_uniswapFactory != address(0), "Invalid Uniswap factory address");
         require(_weth != address(0),           "Invalid WETH address");
 
-        operator       = _operator;
         aavePool       = _aavePool;
         swapRouter     = _swapRouter;
         uniswapFactory = _uniswapFactory;
         weth           = _weth;
 
-        emit OperatorUpdated(address(0), _operator);
         emit IntegrationAddressesUpdated(_aavePool, _swapRouter, _uniswapFactory, _weth);
 
         // Launch defaults. Volatilities are placeholders until measured on
@@ -255,21 +251,7 @@ contract AssetRegistry {
         _setTierConfig(RiskTier.Speculative, 20000, 4000,   7 days,  2500, 600);
     }
 
-    // --- Modifiers ---
-
-    modifier onlyOperator() {
-        require(msg.sender == operator, "Caller is not the operator");
-        _;
-    }
-
     // --- Operator functions ---
-
-    function transferOperator(address _newOperator) external onlyOperator {
-        require(_newOperator != address(0), "Invalid operator address");
-        address previous = operator;
-        operator = _newOperator;
-        emit OperatorUpdated(previous, _newOperator);
-    }
 
     /**
      * @notice Whitelists an asset for loan origination and swap-into use.
@@ -288,6 +270,7 @@ contract AssetRegistry {
             address(0),
             0
         );
+        _recordTier(_asset, assetConfig[_asset].tier);
     }
 
     /**
@@ -309,6 +292,7 @@ contract AssetRegistry {
         uint256    _gracePeriod
     ) external onlyOperator {
         _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
+        _recordTier(_asset, assetConfig[_asset].tier);
     }
 
     /**
@@ -335,6 +319,12 @@ contract AssetRegistry {
     ) external onlyOperator {
         _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
         assetConfig[_asset].tier = _tier;
+
+        // Recorded once, here, rather than inside _addAsset. Recording the
+        // default first and the real tier on top left every listing carrying a
+        // phantom Speculative entry it was never at — same block, so no loan
+        // could read it, but the history is what a lender audits and it should
+        // say what happened.
         _recordTier(_asset, _tier);
         emit TierUpdated(_asset, _tier);
     }
@@ -378,11 +368,11 @@ contract AssetRegistry {
             allAssets.push(_asset);
         }
 
-        // Seeds history at listing so a vault opened before any re-tag has
-        // something to compare against, rather than falling through to the
-        // empty-history case that trusts the current tier.
-        _recordTier(_asset, existingTier);
-
+        // History is seeded by the CALLER, not here, so that a listing which
+        // assigns a tier writes one entry rather than two. Every public path
+        // into this function must record — a listing with no history falls
+        // through to the empty-history case, which trusts the current tier and
+        // would let a re-tag widen a live loan.
         emit AssetAdded(_asset, _aToken);
         emit VenueUpdated(_asset, _venue, _venueAddress);
         if (_gracePeriod > 0) { emit GracePeriodUpdated(_asset, _gracePeriod); }

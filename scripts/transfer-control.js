@@ -7,11 +7,19 @@
  * blast radii, and one key holding both means a single compromise takes the
  * protocol rather than a slice of it.
  *
- * ORDER MATTERS. Operator roles transfer last. Each transfer is one-way — the
- * old holder cannot take the role back — so a mistyped address is unrecoverable
- * on that contract. Every target is checked for contract code first: a
- * multisig has code, a typo'd EOA does not, and "I meant to paste the Safe
- * address" is not a recoverable error.
+ * NOTHING HERE TAKES EFFECT IMMEDIATELY. All four roles are nominate-then-
+ * accept: this script only nominates, and each Safe must call acceptOperator()
+ * or acceptOwnership() to take the role. Until it does, the current key keeps
+ * full control and any nomination can be cancelled.
+ *
+ * That is deliberate. The failure this guards against is not a typo so much as
+ * a Safe that cannot actually reach its signing threshold — misconfigured
+ * signers, a lost device, a threshold nobody can meet. Such a Safe is
+ * indistinguishable from a working one until the moment you need it, which
+ * under a one-step transfer is the moment after control is already gone.
+ *
+ * Targets are still checked for contract code, because a nomination pointed at
+ * an EOA typo simply can never be accepted and wastes the attempt.
  *
  * Usage:
  *   OPERATOR_SAFE=0x… OWNER_SAFE=0x… npx hardhat run scripts/transfer-control.js --network robinhoodTestnet
@@ -48,7 +56,7 @@ async function main() {
       if (!ALLOW_EOA) {
         throw new Error(
           `${label} (${addr}) has no contract code — it is an EOA, not a multisig.\n` +
-          `Transfers are one-way. Set ALLOW_EOA=1 only if this is deliberate.`
+          `Set ALLOW_EOA=1 only if this is deliberate.`
         );
       }
       console.log(`WARNING: ${label} is an EOA. Proceeding because ALLOW_EOA=1.`);
@@ -95,25 +103,33 @@ async function main() {
     return;
   }
 
-  console.log("\nTransferring.\n");
+  console.log("\nNominating.\n");
   for (const [label, c, getter, setter, target] of holders) {
     const held = await c[getter]();
     if (held.toLowerCase() === target.toLowerCase()) { continue; }
     await (await c[setter](target)).wait();
-    console.log(`  ${label} -> ${target}`);
+    console.log(`  ${label} -> ${target} (pending acceptance)`);
   }
 
   console.log(`
-The factory owner is NOMINATED, not transferred. The Safe must call
-acceptOwnership() to take it — which is the point: it proves the multisig can
-transact before anything depends on it. Until then this key still owns it.
+NOTHING HAS CHANGED HANDS YET. This key still holds all four roles.
 
-The three operator roles ARE transferred, immediately and irreversibly. They
-are one-step in the contracts, which is a weaker guarantee than the factory
-now has; a mistyped operator address cannot be undone. Worth aligning them on
-the same two-step pattern before mainnet.
+To complete the handover, each Safe must call:
 
-Verify the Safe can act, then confirm with:
+  Operator Safe (${OPERATOR_SAFE})
+    AssetRegistry.acceptOperator()
+    KYCRegistry.acceptOperator()
+    InsurancePool.acceptOperator()
+
+  Owner Safe (${OWNER_SAFE})
+    VaultFactory.acceptOwnership()
+
+Executing those four calls is itself the test: a Safe that cannot complete them
+is a Safe that could not have governed the protocol either, and finding that
+out now costs nothing. Until they land, cancelOperatorTransfer() and
+cancelOwnershipTransfer() back this out entirely.
+
+Then confirm with:
   npx hardhat run scripts/diagnose-chain.js --network ${hre.network.name}`);
 }
 

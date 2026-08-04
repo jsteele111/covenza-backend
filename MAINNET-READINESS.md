@@ -108,14 +108,24 @@ removing the power.
 >
 > **This surfaced a blocker.** `VaultFactory` had no ownership transfer at all:
 > `owner` was set in the constructor with no setter, so the factory could only
-> ever belong to whoever deployed it. Handing it to a multisig was impossible
-> without a redeploy. A two-step `transferOwnership` / `acceptOwnership` is now
-> in place — two-step because the recipient calling accept proves the multisig
-> can transact before anything depends on it.
+> ever belong to whoever deployed it. Handing it to a multisig was not a
+> permissions question — it was impossible.
 >
-> **Still open:** the change needs a factory redeploy to take effect, and the
-> three operator roles remain one-step. A mistyped operator address cannot be
-> undone. They should move to the same two-step pattern.
+> All four roles are now nominate-then-accept, sharing one `OperatorControlled`
+> base so the pattern cannot drift between contracts. The reason for two steps
+> is not typo protection so much as this: a multisig that cannot reach its
+> signing threshold is indistinguishable from a working one until the moment
+> you need it, and under a one-step transfer that moment arrives after control
+> is already gone. Requiring the nominee to call accept makes the handover its
+> own rehearsal.
+>
+> Deployed and verified on chain by `scripts/verify-two-step.js`, which
+> nominates a probe, asserts the incumbent still governs and the nominee is
+> still powerless, then cancels. The unit suite proves the source is right; it
+> cannot prove the deployment picked it up, and twice today a change reached
+> git without reaching the chain while the tests stayed green.
+>
+> **Still open:** the multisigs themselves. Nothing in code now blocks it.
 
 
 Today, on testnet, `0x6C9317…3a68` is simultaneously:

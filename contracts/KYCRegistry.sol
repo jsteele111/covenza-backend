@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "./Timelocked.sol";
+import "./OperatorControlled.sol";
 
 /**
  * @title KYCRegistry
@@ -37,12 +38,10 @@ import "./Timelocked.sol";
  *         Badge artwork is generated fully on-chain (tokenURI() below) as
  *         a self-contained SVG - no external hosting dependency.
  */
-contract KYCRegistry is ERC721, Timelocked {
+contract KYCRegistry is ERC721, Timelocked, OperatorControlled {
     using ECDSA for bytes32;
 
     // --- State variables ---
-
-    address public operator;     // address authorised to verify/revoke wallets manually
 
     /**
      * @notice Signing keys whose attestations this registry will accept.
@@ -89,11 +88,6 @@ contract KYCRegistry is ERC721, Timelocked {
 
     // --- Events ---
 
-    event OperatorUpdated(
-        address indexed previousOperator,
-        address indexed newOperator
-    );
-
     event AttesterAdded(address indexed key, string name, string url);
     event AttesterRemoved(address indexed key);
 
@@ -125,23 +119,14 @@ contract KYCRegistry is ERC721, Timelocked {
     constructor(address _operator, address _verifierKey, uint256 _timelockDelay)
         ERC721("Covenza KYC Badge", "CVKYC")
         Timelocked(_timelockDelay)
+        OperatorControlled(_operator)
     {
-        require(_operator != address(0), "Invalid operator address");
         require(_verifierKey != address(0), "Invalid verifier key address");
-        operator = _operator;
-        emit OperatorUpdated(address(0), _operator);
 
         // The constructor still takes a single key so existing deployment
         // scripts are unaffected; it is registered as the first recognised
         // attester rather than being privileged.
         _addAttester(_verifierKey, "Initial attester", "");
-    }
-
-    // --- Modifiers ---
-
-    modifier onlyOperator() {
-        require(msg.sender == operator, "Caller is not the operator");
-        _;
     }
 
     // --- Primary verification path: signature-based ---
@@ -300,19 +285,6 @@ contract KYCRegistry is ERC721, Timelocked {
         nonces[_wallet]    += 1;
 
         emit AddressRevoked(_wallet, block.timestamp);
-    }
-
-    /**
-     * @notice Transfers operator role to a new address.
-     *         Allows the KYC operator key to be rotated without
-     *         redeploying the registry.
-     * @param _newOperator The new operator address.
-     */
-    function transferOperator(address _newOperator) external onlyOperator {
-        require(_newOperator != address(0), "Invalid operator address");
-        address previous = operator;
-        operator = _newOperator;
-        emit OperatorUpdated(previous, _newOperator);
     }
 
     /**

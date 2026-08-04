@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "./interfaces/IERC20.sol";
 import "./Timelocked.sol";
+import "./OperatorControlled.sol";
 
 /**
  * @title InsurancePool
@@ -40,11 +41,10 @@ import "./Timelocked.sol";
  *         deployed by the factory, which registers them here at creation.
  */
 
-contract InsurancePool is Timelocked {
+contract InsurancePool is Timelocked, OperatorControlled {
 
     // --- State variables ---
 
-    address public operator;        // governs configuration and admin withdrawal
     address public vaultFactory;    // the only address allowed to register vaults
 
     /// @notice Reserve balance held per asset. This is the source of truth
@@ -62,7 +62,6 @@ contract InsurancePool is Timelocked {
 
     // --- Events ---
 
-    event OperatorUpdated(address indexed previousOperator, address indexed newOperator);
     event VaultFactoryUpdated(address indexed previousFactory, address indexed newFactory);
     event DrawCapUpdated(uint256 previousBps, uint256 newBps);
     event VaultRegistered(address indexed vault);
@@ -89,31 +88,14 @@ contract InsurancePool is Timelocked {
      */
     constructor(address _operator, uint256 _drawCapBps, uint256 _timelockDelay)
         Timelocked(_timelockDelay)
+        OperatorControlled(_operator)
     {
-        require(_operator != address(0), "Invalid operator address");
         require(_drawCapBps > 0 && _drawCapBps <= 10000, "Draw cap must be 1-10000 bps");
-        operator   = _operator;
         drawCapBps = _drawCapBps;
-        emit OperatorUpdated(address(0), _operator);
         emit DrawCapUpdated(0, _drawCapBps);
     }
 
-    // --- Modifiers ---
-
-    modifier onlyOperator() {
-        require(msg.sender == operator, "Caller is not the operator");
-        _;
-    }
-
     // --- Configuration (operator-only) ---
-
-    /// @notice Transfers the operator role. Mirrors KYCRegistry's pattern.
-    function transferOperator(address _newOperator) external onlyOperator {
-        require(_newOperator != address(0), "Invalid operator address");
-        address previous = operator;
-        operator = _newOperator;
-        emit OperatorUpdated(previous, _newOperator);
-    }
 
     /**
      * @notice Sets the VaultFactory allowed to register vaults. Must be set
