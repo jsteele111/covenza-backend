@@ -211,7 +211,33 @@ assert that rather than trusting the operator to remember.
 
 ---
 
-## 8. Insurance pool solvency is untested at scale — MEDIUM
+## 8. Insurance pool solvency is untested at scale — MEDIUM — **MODELLED, one fix applied**
+
+> `scripts/model-insurance-solvency.js` compares modelled expected draw against
+> premium income, reading tier parameters off the live registry.
+>
+> The finding inverted the expectation. **Blue chip was the only tier that could
+> cost the pool anything, and carried the lowest premium.** Breach requires the
+> asset to fall by deposit ÷ exposure; Blue chip permitted 100% exposure, so a
+> 14.9% fall at seven days sufficed — 1.9 sigma, 2.8% likely, expected draw
+> 9.01bp against 1.92bp of premium. Standard needs a 49.8% fall and Speculative
+> a 99.9% one, so both are effectively unexposed.
+>
+> Two consequences:
+>
+> - Blue chip exposure reduced 100% → 70%, the cap at which premium income
+>   covers modelled draw by 3x at every permitted term. Tightening the control
+>   rather than repricing, per the principle the tiers were built on.
+> - **Speculative's 600bps premium buys insurance that cannot pay out** — its
+>   40% deposit exceeds the 25% maximum possible loss. Not a solvency problem;
+>   a fairness one, and still open.
+>
+> The 3x target is a risk-appetite choice, not a derivation — it is the margin
+> held against the lognormal being wrong, which the script says plainly it is.
+> Aggregate reserve sizing remains unanswered: `drawCapBps` limits any single
+> settlement and nothing limits the total, so correlated losses drain the pool
+> first-come-first-served.
+
 
 `drawCapBps` limits any single settlement to a share of that loan's principal
 (currently 10%). There is no aggregate limit and no reserve-ratio target. Many

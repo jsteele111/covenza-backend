@@ -211,7 +211,14 @@ async function main() {
   //
   // Maximum terms stay short deliberately: they are what makes a volatile
   // asset lendable, and testnet is where that should be visible.
-  await (await registry.setTierConfig(0, 6000, 1000,  30 * 86400, 10000, 100)).wait();
+  // Blue chip exposure is 70%, not 100%. At full exposure the deposit is the
+  // only thing between the asset and the pool, so a 14.9% fall at seven days —
+  // 1.9 sigma, ~2.8% likely — starts costing the pool, against a premium of
+  // 1.92bp. Modelled expected draw there was 9.01bp: underwritten roughly
+  // fivefold. Tightening exposure rather than raising the premium keeps to the
+  // principle the tiers were built on — deposits are the control, rates are the
+  // compensation. See scripts/model-insurance-solvency.js.
+  await (await registry.setTierConfig(0, 6000, 1000,  30 * 86400, 7000, 100)).wait();
   await (await registry.setTierConfig(1, 10000, 2000,  7 * 86400,  5000, 250)).wait();
   await (await registry.setTierConfig(2, 20000, 4000,      86400,  2500, 600)).wait();
   console.log("  tier config set (BlueChip / Standard / Speculative)");
