@@ -683,17 +683,52 @@ contract VaultFactory is Timelocked {
     }
 
     /**
+     * @notice The deposit a borrower must actually post on this mandate at a
+     *         given term — the greater of the mandate's own minimum and the
+     *         protocol's tier floor.
+     *
+     * @dev    The tier floor rises with the square root of term, so which of
+     *         the two binds changes ALONG the mandate. A lender setting 15% on
+     *         a Blue chip mandate is bound by their own figure at one day and
+     *         by the protocol's 31% at thirty.
+     */
+    function bindingDepositBps(uint256 id, uint256 termSeconds)
+        public view returns (uint256)
+    {
+        Mandate storage m = _mandates[id];
+        uint256 tierFloor = assetRegistry.minimumDepositBpsForTier(
+            AssetRegistry.RiskTier(m.maxTier), termSeconds
+        );
+        return tierFloor > m.minDepositBps ? tierFloor : m.minDepositBps;
+    }
+
+    /**
      * @notice The APR this mandate charges for a given term and deposit.
      *
      *         apr = base
      *             + termPremiumPerDay x days
-     *             - depositCredit x (deposit% - mandate minimum%)
+     *             - depositCredit x (deposit% - BINDING minimum%)
      *
      *         floored at minAprBps.
      *
      * @dev Longer term costs more; a larger deposit costs less. Both are the
      *      borrower's choice, and both are priced — so there is no corner of
      *      the mandate that is cheap relative to the rest.
+     *
+     *      THE CREDIT IS MEASURED FROM THE BINDING DEPOSIT, NOT THE MANDATE'S.
+     *      Measuring from the mandate's own minimum paid the borrower for
+     *      deposit the protocol had already compelled them to post. On the
+     *      mandate published during the 5 August UI review — 9% base, 2bp/day,
+     *      10bp credit, 15% minimum, Blue chip — a thirty-day loan could not be
+     *      taken below the tier floor of 31%, and the formula then discounted
+     *      160bp for those sixteen compulsory points. The lender advertised
+     *      9.60% and could never have received more than 8.00%.
+     *
+     *      That is not a rate the lender chose to offer. It is yield removed by
+     *      the interaction of two rules that were each correct alone, and it
+     *      widens with the square root of term, so the longest loans leaked
+     *      most. A borrower is now rewarded only for deposit they elected to
+     *      add beyond what they were required to post.
      */
     function quoteMandateApr(uint256 id, uint256 termSeconds, uint256 depositBps)
         public view returns (uint256)
@@ -702,8 +737,9 @@ contract VaultFactory is Timelocked {
 
         uint256 apr = m.baseAprBps + (m.termPremiumBpsPerDay * termSeconds) / 1 days;
 
-        if (depositBps > m.minDepositBps) {
-            uint256 credit = (m.depositCreditBpsPerPoint * (depositBps - m.minDepositBps)) / 100;
+        uint256 binding = bindingDepositBps(id, termSeconds);
+        if (depositBps > binding) {
+            uint256 credit = (m.depositCreditBpsPerPoint * (depositBps - binding)) / 100;
             apr = credit >= apr ? 0 : apr - credit;
         }
 

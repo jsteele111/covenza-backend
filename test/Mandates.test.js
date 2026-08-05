@@ -183,6 +183,91 @@ describe("Mandates", function () {
     expect(await factory.quoteMandateApr(id, 30 * DAY, 3000n)).to.equal(810n);
   });
 
+  // --- Where the protocol floor binds instead of the mandate's own ---
+  //
+  // The fixture above deliberately zeroes tier volatility and tier minimum
+  // deposit, so that only the mandate's bounds bind. That isolation is why the
+  // suite passed while the interaction below was wrong: with a tier floor of
+  // zero, "credit above the mandate minimum" and "credit above the binding
+  // minimum" are the same expression.
+  //
+  // These tests give the tier real parameters, so the floor overtakes the
+  // mandate's minimum partway along the term axis — which is the situation
+  // every real deployment is in.
+
+  async function withBindingFloor(registry) {
+    // Blue chip: 60% assumed volatility, 10% absolute floor. At the default
+    // 1.8 coefficient the volatility term overtakes 15% at roughly a week, so
+    // a 1-30 day mandate spans both regimes.
+    await registry.setTierConfig(BLUE_CHIP, 6000, 1000, 365 * DAY, 10000, PREMIUM_BPS);
+  }
+
+  it("Reports the binding deposit as the greater of the two floors", async function () {
+    const { publish, factory, registry } = await loadFixture(fixture);
+    await withBindingFloor(registry);
+    const id = await publish();
+
+    // At one day the tier's absolute 10% floor is beneath the mandate's 15%,
+    // so the mandate binds.
+    expect(await factory.bindingDepositBps(id, DAY)).to.equal(MIN_DEPOSIT);
+
+    // At thirty days the volatility term has long overtaken it.
+    const tierFloor = await registry.minimumDepositBpsForTier(BLUE_CHIP, 30 * DAY);
+    expect(tierFloor).to.be.greaterThan(MIN_DEPOSIT);
+    expect(await factory.bindingDepositBps(id, 30 * DAY)).to.equal(tierFloor);
+  });
+
+  it("Pays no credit for deposit the protocol compelled", async function () {
+    const { publish, factory, registry } = await loadFixture(fixture);
+    await withBindingFloor(registry);
+    const id = await publish();
+
+    const tierFloor = await registry.minimumDepositBpsForTier(BLUE_CHIP, 30 * DAY);
+
+    // A borrower posting exactly the floor had no choice about any of it, so
+    // the rate is the undiscounted 30-day rate: 900 + 2x30 = 960.
+    expect(await factory.quoteMandateApr(id, 30 * DAY, tierFloor)).to.equal(960n);
+  });
+
+  it("Credits only the deposit a borrower chose to add", async function () {
+    const { publish, factory, registry } = await loadFixture(fixture);
+    await withBindingFloor(registry);
+    const id = await publish();
+
+    const tierFloor = await registry.minimumDepositBpsForTier(BLUE_CHIP, 30 * DAY);
+    const chosen = tierFloor + 500n;   // five points above what was required
+
+    // 960 - 10 x 500/100 = 960 - 50 = 910
+    expect(await factory.quoteMandateApr(id, 30 * DAY, chosen)).to.equal(910n);
+  });
+
+  it("Leaves the lender's advertised rate achievable at every term", async function () {
+    const { publish, factory, registry } = await loadFixture(fixture);
+    await withBindingFloor(registry);
+    const id = await publish();
+
+    // The regression this guards: the lender's quoted rate at a term must be
+    // obtainable by SOME permitted borrower. Previously the cheapest legal
+    // deposit at 30 days already carried a 160bp discount, so the advertised
+    // 9.60% could never be received.
+    for (const days of [1, 7, 14, 30]) {
+      const term = days * DAY;
+      const binding = await factory.bindingDepositBps(id, term);
+      const advertised = BASE_APR + TERM_PREMIUM * BigInt(days);
+      expect(await factory.quoteMandateApr(id, term, binding)).to.equal(advertised);
+    }
+  });
+
+  it("Still credits normally where the mandate's own minimum binds", async function () {
+    const { publish, factory, registry } = await loadFixture(fixture);
+    await withBindingFloor(registry);
+    const id = await publish();
+
+    // At one day the mandate's 15% binds, so behaviour is unchanged from
+    // before: 900 + 2 = 902, less 10 x (2000-1500)/100 = 50.
+    expect(await factory.quoteMandateApr(id, DAY, 2000n)).to.equal(852n);
+  });
+
   it("Never prices below the mandate's floor", async function () {
     const { publish, factory } = await loadFixture(fixture);
     const id = await publish();

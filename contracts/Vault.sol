@@ -1026,6 +1026,58 @@ contract Vault {
 
     // --- Views ---
 
+    /**
+     * @notice What a prospective swap is worth at the TWAP, and the least the
+     *         vault will accept for it.
+     *
+     * @dev    Added so the borrower can set a minimum output that means
+     *         something. The swap form asks for one — it is their slippage
+     *         protection and it is enforced on chain — but nothing anywhere
+     *         exposed a price to set it against. The honest note on the form
+     *         said "there's no live price quote wired into this form, so set it
+     *         deliberately", which is candid and unhelpful: with no reference,
+     *         a borrower either guesses or enters a value low enough to be no
+     *         protection at all, which defeats the control the sentence is
+     *         explaining.
+     *
+     *         Returns rather than reverts when the pair cannot be quoted. An
+     *         unquotable pool is a real and expected state — a freshly created
+     *         pool has no observation history — and a view that reverts is one
+     *         the interface cannot distinguish from a network failure.
+     *
+     * @return quotable     whether the pool can serve the configured window
+     * @return twapOut      output implied by the time-weighted average price
+     * @return minimumOut   the least this vault accepts, i.e. twapOut less the
+     *                      entry-impact allowance. A minimum below this figure
+     *                      does not widen what is permitted; the vault refuses
+     *                      the swap either way.
+     */
+    function quoteSwapOut(address tokenOut, uint256 amountIn, uint24 poolFee)
+        external view
+        returns (bool quotable, uint256 twapOut, uint256 minimumOut)
+    {
+        if (amountIn == 0) return (false, 0, 0);
+
+        address factory = registry.uniswapFactory();
+        uint32  window  = registry.twapWindow();
+
+        // Checked in BOTH directions, matching swap(): the entry quote prices
+        // the position, and the swap-back quote is what settlement will need.
+        // A pair quotable one way and not the other would let a borrower open a
+        // position the vault could never close.
+        if (!UniswapTwap.canQuote(factory, asset, tokenOut, poolFee, window)) return (false, 0, 0);
+        if (!UniswapTwap.canQuote(factory, tokenOut, asset, poolFee, window)) return (false, 0, 0);
+
+        twapOut = UniswapTwap.quote(factory, asset, tokenOut, poolFee, amountIn, window);
+
+        uint256 maxImpactBps = registry.maxEntryImpactBps();
+        minimumOut = maxImpactBps == 0
+            ? twapOut
+            : (twapOut * (10000 - maxImpactBps)) / 10000;
+
+        return (true, twapOut, minimumOut);
+    }
+
     function vaultBalance() external view returns (uint256) {
         return IERC20(asset).balanceOf(address(this));
     }

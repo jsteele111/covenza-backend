@@ -216,6 +216,68 @@ describe("TWAP availability guard", function () {
     expect(await vault.heldAssetCount()).to.equal(1n);
   });
 
+  // --- quoteSwapOut: the borrower's price reference ---
+  //
+  // The swap form asks the borrower for a minimum output and enforces it on
+  // chain, but nothing exposed a price to set it against. A view that reverts
+  // when the pair cannot be quoted would be no better than the silence it
+  // replaced, so these tests pin the not-quotable path as hard as the happy one.
+
+  it("Quotes a prospective swap at the TWAP, with the vault's own floor", async function () {
+    const { vault, usdx, registry } = await loadFixture(fixture);
+
+    const [quotable, twapOut, minimumOut] =
+      await vault.quoteSwapOut(await usdx.getAddress(), E("1"), POOL_FEE);
+
+    expect(quotable).to.equal(true);
+    expect(twapOut).to.be.greaterThan(0n);
+
+    // minimumOut is twapOut less the entry-impact allowance — the same figure
+    // the swap itself enforces, so a borrower who accepts it cannot be refused
+    // for impact.
+    const impactBps = await registry.maxEntryImpactBps();
+    expect(minimumOut).to.equal((twapOut * (10000n - impactBps)) / 10000n);
+  });
+
+  it("Reports not-quotable rather than reverting when the pool has no history", async function () {
+    const { vault, usdx, poolWithWindow } = await loadFixture(fixture);
+    await poolWithWindow(0);
+
+    const [quotable, twapOut, minimumOut] =
+      await vault.quoteSwapOut(await usdx.getAddress(), E("1"), ALT_FEE);
+
+    expect(quotable).to.equal(false);
+    expect(twapOut).to.equal(0n);
+    expect(minimumOut).to.equal(0n);
+  });
+
+  it("Reports not-quotable for a fee tier with no pool at all", async function () {
+    const { vault, usdx } = await loadFixture(fixture);
+
+    const [quotable] = await vault.quoteSwapOut(await usdx.getAddress(), E("1"), ALT_FEE);
+    expect(quotable).to.equal(false);
+  });
+
+  it("Agrees with the swap itself — a quote at the floor is accepted", async function () {
+    const { vault, borrower, usdx } = await loadFixture(fixture);
+
+    const [, , minimumOut] = await vault.quoteSwapOut(await usdx.getAddress(), E("1"), POOL_FEE);
+
+    // The contract is the authority; this asserts the view does not promise
+    // something the swap then refuses.
+    await expect(
+      vault.connect(borrower).swap(await usdx.getAddress(), E("1"), minimumOut, POOL_FEE)
+    ).to.not.be.reverted;
+  });
+
+  it("Returns nothing for a zero amount rather than dividing by it", async function () {
+    const { vault, usdx } = await loadFixture(fixture);
+
+    const [quotable, twapOut] = await vault.quoteSwapOut(await usdx.getAddress(), 0n, POOL_FEE);
+    expect(quotable).to.equal(false);
+    expect(twapOut).to.equal(0n);
+  });
+
   it("A guarded swap still force-settles cleanly", async function () {
     const { vault, borrower, weth, usdx } = await loadFixture(fixture);
 

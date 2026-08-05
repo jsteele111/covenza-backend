@@ -316,7 +316,19 @@ async function main() {
     ? JSON.parse(fs.readFileSync(addressesPath, "utf8"))
     : {};
 
+  // MERGE, do not replace.
+  //
+  // Assigning a fresh object here discarded every key this script does not
+  // itself write — which on 5 August meant deleting operatorSafe and ownerSafe,
+  // recorded by create-safes.js. The Safes still existed on chain; the record
+  // of them did not, so safe-accept-roles.js reported "No Safe addresses
+  // recorded. Run scripts/create-safes.js first" and would have had someone
+  // deploy a second pair.
+  //
+  // A deploy legitimately owns the contract addresses below. It does not own
+  // everything else in the file, and it should not behave as though it does.
   all.robinhoodTestnet = {
+    ...(all.robinhoodTestnet || {}),
     chainId: 46630,
     kycRegistry:    await kyc.getAddress(),
     assetRegistry:  await registry.getAddress(),
