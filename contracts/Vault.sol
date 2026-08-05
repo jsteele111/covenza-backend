@@ -1058,17 +1058,20 @@ contract Vault {
     {
         if (amountIn == 0) return (false, 0, 0);
 
-        address factory = registry.uniswapFactory();
-        uint32  window  = registry.twapWindow();
+        // Named uniFactory, not factory: this vault already has a `factory`
+        // state variable holding the VaultFactory, and shadowing it here would
+        // put two unrelated addresses behind one identifier in a pricing path.
+        address uniFactory = registry.uniswapFactory();
+        uint32  window     = registry.twapWindow();
 
         // Checked in BOTH directions, matching swap(): the entry quote prices
         // the position, and the swap-back quote is what settlement will need.
         // A pair quotable one way and not the other would let a borrower open a
         // position the vault could never close.
-        if (!UniswapTwap.canQuote(factory, asset, tokenOut, poolFee, window)) return (false, 0, 0);
-        if (!UniswapTwap.canQuote(factory, tokenOut, asset, poolFee, window)) return (false, 0, 0);
+        if (!UniswapTwap.canQuote(uniFactory, asset, tokenOut, poolFee, window)) return (false, 0, 0);
+        if (!UniswapTwap.canQuote(uniFactory, tokenOut, asset, poolFee, window)) return (false, 0, 0);
 
-        twapOut = UniswapTwap.quote(factory, asset, tokenOut, poolFee, amountIn, window);
+        twapOut = UniswapTwap.quote(uniFactory, asset, tokenOut, poolFee, amountIn, window);
 
         uint256 maxImpactBps = registry.maxEntryImpactBps();
         minimumOut = maxImpactBps == 0

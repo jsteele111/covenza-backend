@@ -46,7 +46,6 @@ operator-rotatable verifier key. These manage that key.
 
 | Script | Purpose |
 |---|---|
-| `decode-badge-svg.js` | Decodes the on-chain SVG from a KYC badge's `tokenURI`, for inspecting badge rendering. |
 
 ## Environment
 
