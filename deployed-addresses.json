@@ -38,14 +38,14 @@
   },
   "robinhoodTestnet": {
     "chainId": 46630,
-    "kycRegistry": "0xd9A6Bf24136f074d85436BF66c2E0f37Be0Ca85f",
-    "assetRegistry": "0x744b4f7B80f33Ca4E9F6FF7849782df55d1B7384",
-    "insurancePool": "0x867880ADD8C017fF5f4Dc53Eb52C367Ea7DF5607",
-    "vaultFactory": "0xfAF75576D088dEF7318bea8CdE9F45247b71e03a",
-    "vaultImplementation": "0x7dE25E175E3db6f2f7BCc1F49125c15a6B39F82b",
-    "uniswapTwapLibrary": "0x3438bF1E69f2381Df2D8FEFC43CdA1e85156B59F",
+    "kycRegistry": "0xCeC02Aab9e97F8a658D7FED455703E4aAfa1B7ed",
+    "assetRegistry": "0xd3Cc52565faae7419c2BFA6B9FeA9Eed1b28f284",
+    "insurancePool": "0xf7fEb99a5df10Ad3BD37DBB9E3eaAFc79A87e9B1",
+    "vaultFactory": "0x70b5a6c403FB33D0F601fd8F63E1c09b682d2EED",
+    "vaultImplementation": "0x66a400775d1B599bF85fD6676d66D127FE2f51CD",
+    "uniswapTwapLibrary": "0x80Fd8Be02D8573d2B4D31A2EA4b4Ea24dD33CC70",
     "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
-    "yieldVenue4626": "0xB37AEf9CaE1d6127462DAe00CA80bA567d6abbeE",
+    "yieldVenue4626": "0x86d6b40BD8aE3f75F7850BCe7fCefbf6Ea960f53",
     "verifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
     "keeper": "0x26c6fba1774EA978482c0D9CDd1560641DB401c0",
     "tokens": {
@@ -59,7 +59,7 @@
       "note": "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js"
     },
     "twapWindow": 60,
-    "deployedAt": "2026-08-04T11:21:55.251Z",
+    "deployedAt": "2026-08-05T05:55:51.254Z",
     "operatorSafe": "0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c",
     "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B"
   }

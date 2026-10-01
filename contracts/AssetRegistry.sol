@@ -24,6 +24,7 @@ import "./OperatorControlled.sol";
  *         It also stores the protocol-wide external contract addresses
  *         (Aave V3 Pool, Uniswap V3 SwapRouter, Uniswap V3 Factory, WETH),
  *         giving every vault one place to read integration config from.
+ *         These are immutable: fixed at deployment, never repointable.
  *
  *         IMPORTANT SAFETY RULE (enforced in Vault, documented here):
  *         removing an asset from the whitelist blocks NEW exposure to it
@@ -36,12 +37,27 @@ contract AssetRegistry is OperatorControlled {
 
     // --- State variables ---
 
-    // Protocol-wide integration addresses (set once at deployment, but
-    // operator-updatable in case of e.g. a router migration).
-    address public aavePool;         // Aave V3 Pool (uniform entry for all assets)
-    address public swapRouter;       // Uniswap V3 SwapRouter
-    address public uniswapFactory;   // Uniswap V3 Factory (for TWAP pool lookups)
-    address public weth;             // canonical WETH for this network
+    // Protocol-wide integration addresses. IMMUTABLE — fixed at deployment.
+    //
+    // They were previously operator-updatable, instantly, "in case of e.g. a
+    // router migration". Vaults read swapRouter and uniswapFactory LIVE at
+    // every swap and at settlement, and trust the router to enforce the
+    // minimum output they pass it. A repointed router could therefore take a
+    // vault's held assets during settlement, and a repointed factory could
+    // serve the TWAP from a pool of the operator's choosing — against every
+    // open loan at once, with no delay. Found in the 1 October 2026 pre-audit
+    // review; the same class of power as setRegistries, which was already
+    // timelocked, but with no timelock at all.
+    //
+    // Fixing them is stronger than delaying them, and costs little: a router
+    // migration now means deploying a new AssetRegistry and moving the factory
+    // to it through VaultFactory's timelocked setRegistries. Vaults hold their
+    // own registry reference, so live loans keep the integrations they were
+    // originated against and can never be repointed underneath.
+    address public immutable aavePool;       // Aave V3 Pool (uniform entry for all assets)
+    address public immutable swapRouter;     // Uniswap V3 SwapRouter
+    address public immutable uniswapFactory; // Uniswap V3 Factory (for TWAP pool lookups)
+    address public immutable weth;           // canonical WETH for this network
 
     // --- Settlement configuration (protocol-wide, operator-configurable) ---
     // Launch values below are placeholders pending empirical calibration
@@ -555,26 +571,8 @@ contract AssetRegistry is OperatorControlled {
         emit AssetRemoved(_asset);
     }
 
-    /// @notice Updates protocol-wide integration addresses (e.g. a router
-    ///         migration). All four must be supplied — no partial updates.
-    function setIntegrationAddresses(
-        address _aavePool,
-        address _swapRouter,
-        address _uniswapFactory,
-        address _weth
-    ) external onlyOperator {
-        require(_aavePool != address(0),       "Invalid Aave pool address");
-        require(_swapRouter != address(0),     "Invalid swap router address");
-        require(_uniswapFactory != address(0), "Invalid Uniswap factory address");
-        require(_weth != address(0),           "Invalid WETH address");
-
-        aavePool       = _aavePool;
-        swapRouter     = _swapRouter;
-        uniswapFactory = _uniswapFactory;
-        weth           = _weth;
-
-        emit IntegrationAddressesUpdated(_aavePool, _swapRouter, _uniswapFactory, _weth);
-    }
+    // setIntegrationAddresses() was removed on 1 October 2026. See the comment
+    // on the integration addresses above for why, and for the migration path.
 
     /**
      * @notice Updates the protocol-wide settlement configuration. All five

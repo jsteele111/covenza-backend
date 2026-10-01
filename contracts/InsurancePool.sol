@@ -35,6 +35,9 @@ import "./OperatorControlled.sol";
  *         - OPERATOR-ONLY ADMINISTRATION. Same trust pattern as
  *           KYCRegistry: a single operator address governs configuration
  *           and any withdrawal outside of automatic settlement draws.
+ *           The two actions that can move reserves out of the pool —
+ *           administrative withdrawal and repointing the factory — are
+ *           both timelocked.
  *
  *         Only vaults registered by the authorised VaultFactory may draw.
  *         Vault code is trusted by construction — vaults are only ever
@@ -98,15 +101,58 @@ contract InsurancePool is Timelocked, OperatorControlled {
     // --- Configuration (operator-only) ---
 
     /**
-     * @notice Sets the VaultFactory allowed to register vaults. Must be set
-     *         once after deployment (factory and pool reference each other,
-     *         so one must be deployed first and wired to the other).
+     * @notice Sets the VaultFactory allowed to register vaults.
+     *
+     *         The FIRST call is instant: factory and pool reference each
+     *         other, so one must be deployed first and wired to the other, and
+     *         an unwired pool has no registered vaults and nothing to protect.
+     *
+     *         Every LATER call must be announced with queueSetVaultFactory and
+     *         can only execute after `timelockDelay`.
+     *
+     * @dev    WHY THE LATER CALLS ARE DELAYED. The factory decides who may
+     *         register as a vault, and a registered vault may call draw() with
+     *         any principal it likes. Repointing the factory at an address the
+     *         operator controls therefore drained every reserve in two
+     *         transactions — register a fake vault, draw against an inflated
+     *         principal — with no delay at all. That made the adminWithdraw
+     *         timelock decorative: the same money could leave by a side door.
+     *
+     *         Found in the 1 October 2026 pre-audit review. A legitimate
+     *         factory migration (redeploy-factory-v21.js did exactly this)
+     *         tolerates the delay without difficulty; an attack does not.
+     *
+     *         Vaults registered by a previous factory stay registered, so
+     *         in-flight loans keep their access to the pool across a change.
      */
     function setVaultFactory(address _factory) external onlyOperator {
         require(_factory != address(0), "Invalid factory address");
+
+        if (vaultFactory != address(0)) {
+            _consume(_vaultFactoryId(_factory));
+        }
+
         address previous = vaultFactory;
         vaultFactory = _factory;
         emit VaultFactoryUpdated(previous, _factory);
+    }
+
+    /// @notice Announces a change of factory. Executable after
+    ///         `timelockDelay`, via setVaultFactory with the same address.
+    function queueSetVaultFactory(address _factory) external onlyOperator {
+        require(_factory != address(0), "Invalid factory address");
+        require(vaultFactory != address(0), "First factory is set directly");
+        _queue(_vaultFactoryId(_factory));
+    }
+
+    /// @notice Abandons a queued factory change. Not delayed — dropping a
+    ///         pending risk-increasing action reduces risk.
+    function cancelSetVaultFactory(address _factory) external onlyOperator {
+        _cancel(_vaultFactoryId(_factory));
+    }
+
+    function _vaultFactoryId(address _factory) internal pure returns (bytes32) {
+        return keccak256(abi.encode("setVaultFactory", _factory));
     }
 
     /// @notice Updates the per-settlement draw cap (bps of loan principal).

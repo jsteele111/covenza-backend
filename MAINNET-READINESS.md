@@ -9,6 +9,12 @@ structural and the rest are a week of work plus an audit.
 partially enforced by a deploy guard. Items 7 and 8 are blocked; 9 is an audit.
 Fixes are marked inline.
 
+**Second review, 1 October 2026:** six further findings, items 10–15, recorded
+in their own section at the end. Two were HIGH and are fixed. One of them
+(item 10) showed that item 2 below was only half fixed: the withdrawal was
+timelocked, but the same reserves could still leave instantly by another
+route. Item 2 is annotated accordingly rather than quietly rewritten.
+
 Item 5's fix caught something the review did not: `TIMELOCK_DELAY` defaults to
 zero, introduced by the fix for items 2, 4 and 6 an hour earlier. Shipped to
 mainnet it would have deployed timelocks that queue and execute in the same
@@ -73,6 +79,11 @@ are already handled.
 > immutable and the queue id bound to asset, recipient and amount. Cancellation
 > stays instant. The delay does not stop a determined operator — it makes the
 > attempt visible while there is still time to react.
+>
+> **Correction, 1 October 2026: this was only half fixed until item 10.**
+> `setVaultFactory` stayed instant, and repointing the factory let the operator
+> register a fake vault and draw the whole reserve in two transactions, so the
+> withdrawal timelock could be walked around. Both routes are now delayed.
 
 
 `InsurancePool.adminWithdraw(asset, to, amount)` sends any amount of reserve to
@@ -329,3 +340,173 @@ spends its time on what I have missed rather than what I already know.
 **Needs modelling before code:**
 
 9. Insurance pool solvency and premium calibration (item 8).
+
+---
+
+# Second review — 1 October 2026
+
+**Scope:** `contracts/` at commit `3da1f3a`, read check by check against the
+Krait lending checklist while preparing the Zealynx audit-grant application.
+
+The first review looked for what each function does wrong. This one asked a
+different question of every admin setter: *what does a vault read from this
+live, and what happens to an open loan if it changes in the next block?* The
+two HIGH findings both fell out of that question, and both are the same class
+of power that items 2 and 4 had already timelocked — reached by a route the
+first review did not walk.
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| 10 | Insurance pool drainable via an instant factory repoint | HIGH | **FIXED** |
+| 11 | Swap router and Uniswap factory repointable under live vaults | HIGH | **FIXED** |
+| 12 | Other live-loan parameters change instantly | MEDIUM | Open |
+| 13 | A mandate can be filled repeatedly | MEDIUM | Open — design |
+| 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
+| 15 | ERC20 assumptions, and timelock entries that never expire | LOW | Open |
+
+---
+
+## 10. The insurance pool could still be emptied instantly — HIGH — **FIXED**
+
+> First `setVaultFactory` call stays instant, so deployment is unchanged.
+> Every later change must be queued, wait out the timelock, and is bound to
+> the exact factory address. Vaults registered by an earlier factory stay
+> registered, so live loans keep their cover across a migration. Eleven tests
+> in `test/AdminTimelocks.test.js`; ten of them fail against the old contract.
+
+`InsurancePool.setVaultFactory` was operator-only and instant. The factory is
+the only address that may register vaults, and a registered vault may call
+`draw()` naming any principal it likes. So:
+
+1. operator repoints the factory at an address it controls;
+2. that address registers itself as a vault and draws against an inflated
+   principal — the draw cap is a percentage of a number the caller supplies.
+
+Two transactions, no delay, whole reserve. Item 2's withdrawal timelock was
+real but could be walked around, which is worse than having no timelock: it
+let this document claim a protection the contracts did not provide.
+
+**Follow-up:** `scripts/redeploy-factory-v21.js` repointed the factory in one
+step. It needs a queue → wait → execute flow before it is next used.
+
+---
+
+## 11. Integration addresses could be repointed under live loans — HIGH — **FIXED**
+
+> `aavePool`, `swapRouter`, `uniswapFactory` and `weth` are now `immutable`
+> and `setIntegrationAddresses()` is removed. A router migration means a new
+> AssetRegistry, adopted for new loans through the factory's timelocked
+> `setRegistries`; live vaults keep the registry they were originated against.
+> Three tests; the two that check the setter is gone fail against the old
+> contract.
+
+`AssetRegistry.setIntegrationAddresses` was operator-only and instant, and
+vaults read `swapRouter()` and `uniswapFactory()` from the registry at every
+swap and at settlement:
+
+- the vault approves the router for its full held balance and trusts the
+  router to enforce `amountOutMinimum`. A substituted router could take the
+  tokens and return nothing, during a settlement anyone may trigger;
+- the TWAP is read from whichever factory the registry names, so a
+  substituted factory could serve a price from a pool of the operator's
+  choosing, against every open loan at once.
+
+Timelocking it was the alternative. Removing it is stronger and was the
+smaller change: nothing in the tests, scripts or frontend called it.
+
+---
+
+## 12. Other live-loan parameters change instantly — MEDIUM — open
+
+Several operator setters still take effect immediately and are read live by
+open vaults:
+
+| Setter | What an open loan feels |
+|---|---|
+| `AssetRegistry.setSettlementConfig` | TWAP window (≥ 60s) and tolerance (≤ 10%) used by forced swap-back |
+| `AssetRegistry.setMaxEntryImpactBps` | can be set to 0, disabling the entry-impact check |
+| `AssetRegistry.setTierConfig` | `maxExposureBps` is read live by `Vault.swap` |
+| `AssetRegistry.setGracePeriod` | extends or shortens grace on vaults already past deadline |
+| `AssetRegistry.setVenue` | instant; a vault that has not yet supplied will use the new venue |
+| `InsurancePool.setDrawCapBps` | changes cover on loans already written |
+
+Each is bounded, and several only *tighten*. But the same principle as item 1
+applies: a lender priced the loan against the parameters in force when it was
+written. **The comment on `setTierConfig` says "applies to NEW loans only",
+which is not true of the exposure cap** — the same kind of reassuring comment
+item 1 started from.
+
+**Fix (before freeze):** decide per setter. Risk-reducing changes stay instant;
+risk-increasing ones get the timelock, or the value is snapshotted into the
+vault at origination the way APR, fee terms and the tier ceiling already are.
+Correct the `setTierConfig` comment either way.
+
+---
+
+## 13. A mandate can be filled repeatedly — MEDIUM — open, design
+
+`fillMandate` checks `principal <= maxPrincipal` per fill and never marks the
+mandate used. A mandate stays live until it expires or is cancelled, so a
+lender who publishes "maximum 100" can be filled for 100, then 100 again, up to
+whatever their allowance and balance allow. `quoteMandateFillable` reports the
+per-fill figure, which reads as a total.
+
+The bounded approval added in the 5 August UI review (approve the mandate's
+maximum, not unlimited) contains this in practice through the interface. The
+contract does not, and a lender who approves directly, or for several
+mandates at once, is exposed to more than they published.
+
+**Fix (before freeze):** decide whether a mandate is a standing per-fill offer
+or a capacity. If capacity, track `filled` against `maxPrincipal` and refuse
+the excess. Either way, make the UI and the getter say which it is.
+
+---
+
+## 14. Settlement has no fallback when swap-back is impossible — MEDIUM — open, design
+
+`settle()` reverts in full if any step of the forced exit fails:
+
+- a held asset cannot be swapped back within `twapToleranceBps` of the TWAP
+  (thin or moved pool, divergence);
+- a held token refuses the transfer — **a tokenised equity whose issuer can
+  pause or freeze it**, which is exactly the asset class this chain is for;
+- the ERC-4626 venue cannot redeem in full.
+
+Each is a liveness failure rather than a theft, but the principal is locked
+for as long as it lasts, and nothing bounds that. Grace periods give the
+parties time; they do not give an exit.
+
+**Fix (design first):** a last-resort path after an extended window — e.g.
+distribute an unswappable held asset *in kind* to the lender, up to what they
+are owed, and the remainder to the borrower — so the worst case is "lender
+receives the asset" rather than "nobody receives anything".
+
+---
+
+## 15. Minor — LOW — open
+
+- **ERC20 return values.** Transfers and approvals assume `bool` returns
+  (`require(IERC20(..).transfer(..))`); no `SafeERC20`. Tokens that return
+  nothing (USDT on Ethereum mainnet) would revert. Fee-on-transfer tokens
+  would break payout accounting. Acceptable while the whitelist is curated,
+  but it should be either enforced at listing or handled in code, and stated.
+- **Queued actions never expire.** A timelocked action queued once can be
+  executed at any later time. An approval granted for a migration months ago
+  should not still be live. Add an execution window (e.g. delay + 14 days).
+- **Keeper bounty is zero on underwater vaults.** The bounty is paid from the
+  borrower's residual, so a vault in loss pays no keeper. The lender is
+  motivated to settle in that case (it triggers the insurance draw), so this is
+  noted rather than fixed.
+
+---
+
+## Second review — what is left before freeze
+
+**Done (1 October 2026):** items 10 and 11. 250 tests passing.
+
+**Before freeze:** item 12 (per-setter timelock or snapshot, plus the comment),
+item 13 (decide mandate semantics), item 15 (SafeERC20 or listing rule;
+timelock expiry), and update `redeploy-factory-v21.js`.
+
+**Design first:** item 14 (settlement fallback for frozen or unswappable
+assets), alongside item 8 (insurance solvency) and the KYC adapter work.
