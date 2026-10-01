@@ -316,7 +316,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
 
   // --- Insurance pool in the waterfall ---
 
-  it("Loss beyond deposit: insurance pool draw makes the lender whole (severity 1)", async function () {
+  it("Loss beyond deposit: insurance pool restores the lender's PRINCIPAL, not their interest (severity 2)", async function () {
     const { vault, borrower, lender, operator, router, uniPool, pool, weth, usdx } = await loadFixture(deployStackFixture);
     const wethAddr = await weth.getAddress();
 
@@ -333,11 +333,14 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await time.increase(DURATION + GRACE + 61);
     await vault.connect(lender).settle();
 
-    // Returned: 8 + 1.5 = 9.5; shortfall 0.8; cap 1.0; pool pays 0.8 in full.
-    expect(await vault.settledInsuranceDraw()).to.equal(E("0.8"));
-    expect(await weth.balanceOf(lender.address)).to.equal(TARGET);
-    expect(await vault.lossSeverity()).to.equal(1); // loss happened; pool absorbed it
-    expect(await pool.reserveOf(wethAddr)).to.equal(E("2") + SKIM - E("0.8"));
+    // Returned: 8 + 1.5 = 9.5. The pool insures PRINCIPAL only (KRAIT-002,
+    // 1 Oct 2026): shortfall against principal is 10 - 9.5 = 0.5, within the
+    // 1.0 cap, so the pool pays 0.5 and the lender recovers exactly their
+    // principal. The 0.3 of interest is not insured and is not paid.
+    expect(await vault.settledInsuranceDraw()).to.equal(E("0.5"));
+    expect(await weth.balanceOf(lender.address)).to.equal(PRINCIPAL);
+    expect(await vault.lossSeverity()).to.equal(2); // lender received less than principal + interest
+    expect(await pool.reserveOf(wethAddr)).to.equal(E("2") + SKIM - E("0.5"));
   });
 
   it("Thin pool: settlement still completes; lender takes the shortfall (severity 2)", async function () {

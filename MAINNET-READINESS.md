@@ -9,7 +9,7 @@ structural and the rest are a week of work plus an audit.
 partially enforced by a deploy guard. Items 7 and 8 are blocked; 9 is an audit.
 Fixes are marked inline.
 
-**Second review, 1 October 2026:** six further findings, items 10–15, recorded
+**Second review, 1 October 2026:** eleven further findings, items 10–20, recorded
 in their own section at the end. Two were HIGH and are fixed. One of them
 (item 10) showed that item 2 below was only half fixed: the withdrawal was
 timelocked, but the same reserves could still leave instantly by another
@@ -363,6 +363,15 @@ first review did not walk.
 | 13 | A mandate can be filled repeatedly | MEDIUM | Open — design |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | Open |
+| 16 | Sequencer downtime can consume the grace window | MEDIUM | Open |
+| 17 | Swaps trust the router's minimum-output check | LOW | Open |
+| 18 | `swapBack` had no price floor: borrower could drain principal (KRAIT-001) | CRITICAL | **FIXED** |
+| 19 | Insurance paid unpaid interest at a lender-chosen APR (KRAIT-002) | HIGH | **FIXED** |
+| 20 | Borrower can make forced swap-back revert at will (KRAIT-003) | MEDIUM | Open |
+
+Items 16 and 17 surfaced while completing the Krait readiness assessment
+(report: https://krait.zealynx.io/shared/mEyG-WH0MhK1), after items 10–15 were
+written up.
 
 ---
 
@@ -500,13 +509,157 @@ receives the asset" rather than "nobody receives anything".
 
 ---
 
+## 16. Sequencer downtime can consume the grace window — MEDIUM — open
+
+Robinhood Chain is an Arbitrum Orbit L2 with a single sequencer. While it is
+down, no transactions are included but wall-clock time keeps passing, and
+`block.timestamp` jumps forward when it resumes.
+
+Settlement access is entirely time-based (`Vault.settle`): borrower-only before
+the deadline, lender or borrower during grace, anyone with a bounty after.
+If an outage spans a vault's deadline and grace window:
+
+- the borrower loses the chance to close early or unwind positions themselves;
+- the lender loses the grace period meant for them to settle at a price of
+  their choosing;
+- on restart, keepers may settle immediately and the bounty has already
+  accrued for the whole outage;
+- the TWAP window may straddle the outage, so the price bounding the forced
+  swap-back reflects a market nobody could trade in.
+
+This is not theft, but it removes protections the design promises at exactly
+the moment they matter, and a long weekend outage on a 24/5 asset compounds it.
+
+**Fix (before freeze):** detect a gap in block production and extend grace
+accordingly — e.g. track the last observed timestamp per vault interaction, or
+read the chain's sequencer-uptime feed if one exists on Robinhood Chain, and
+refuse keeper settlement until a minimum period has elapsed since restart.
+Accrue the bounty from that point, not from the original grace end.
+
+---
+
+## 17. Swaps trust the router's minimum-output check — LOW — open
+
+`Vault._executeSwap` and `_forcedSwapBackAll` pass `amountOutMinimum` to the
+router and rely on the router to enforce it. The vault never checks its own
+balance change, and uses the router's return value only for events and the
+entry-impact check.
+
+Since item 11 made the router immutable this is not exploitable by the
+operator, and SwapRouter02 is audited and widely used. But it puts the vault's
+only slippage protection in someone else's code, and costs little to verify.
+
+**Fix (before freeze):** measure `balanceOf(tokenOut)` before and after each
+swap, require the delta to meet the minimum, and use the measured delta rather
+than the returned value for the entry-impact and exposure checks.
+
+---
+
+# Krait audit pass — 1 October 2026
+
+**Tool:** Krait (Zealynx Security), full `/krait` pipeline in Claude Code, at
+commit `aee7316`, with items 1–15 above supplied as known issues.
+
+This is the section that matters most in this document, and it should be read
+as a correction to everything before it. Two reviews by the person who wrote
+the code — and a 37-check readiness assessment answered by the same person —
+missed a CRITICAL and a HIGH that an independent pass found in one evening,
+both with executed proofs of concept. Item 10 found a side door around a
+timelock; item 18 is a side door around the custody model itself. The pattern
+is the same: each protection was correct on the path it was written for, and
+nobody walked the parallel path.
+
+## 18. `swapBack` had no price floor: a borrower could drain principal — CRITICAL — **FIXED**
+
+> `swapBack` now enforces the same floor as the forced swap-back at
+> settlement: output >= TWAP x (1 - twapToleranceBps). The borrower may set a
+> higher minimum, never a lower one. Four regression tests in
+> `test/KraitFindings.test.js`; the two attack tests fail against the old
+> contract.
+
+Entry into a foreign asset was bounded (`_enforceEntryImpact`), and the forced
+exit at settlement was bounded (TWAP tolerance). The **voluntary** exit,
+`swapBack`, was bounded only by the borrower's own `minAmountOut`, which had
+to be greater than zero and nothing more. The deposit invariant checks only
+outflows of the loan asset, and a swap-back is an inflow, so nothing in the
+vault looked at the price.
+
+A borrower could move the principal into a held asset at a fair price, move
+the pool's spot price (or route through a pool where they are the only
+liquidity), and sell back at any price they liked. The difference left the
+vault and reached them. In Krait's proof of concept the lender was owed 10.02
+and received 4.58.
+
+This broke the protocol's central claim: that the borrower operates the vault
+but cannot move value out of it.
+
+## 19. Insurance paid unpaid interest at a lender-chosen APR — HIGH — **FIXED**
+
+> The pool now covers a shortfall against **principal only**. Interest is never
+> insured. Two regression tests; one `GroupB` test updated, since it asserted
+> the old behaviour (pool paid 0.8 including interest; now pays 0.5, the
+> principal shortfall).
+
+`_distribute` drew on the pool whenever the vault returned less than
+`principal + accruedFee()`. The fee is computed from `aprBps`, which the lender
+sets and which had no upper bound; and nothing stopped the lender and the
+borrower being the same wallet (lenders need no KYC). So one KYC'd wallet
+could lend to itself for 60 seconds at an absurd APR, settle, and draw
+`drawCapBps` of principal from the shared reserve on every cycle. No market
+loss involved. Krait's proof of concept drained 5 WETH in five cycles.
+
+This is distinct from item 8 (aggregate limits under honest correlated loss):
+here the claim was manufactured.
+
+**Product consequence, stated plainly:** lenders' interest is no longer
+protected by the pool. The deposit absorbs loss first and still covers
+interest where it is large enough; the pool then restores principal, up to
+the cap. Public materials must say "principal", not "made whole".
+
+## 20. Borrower can make forced swap-back revert at will — MEDIUM — open
+
+`_trackHeldAsset` overwrites an asset's fee tier with the tier of the **most
+recent** swap into it, however small, and `_forcedSwapBackAll` sells the whole
+balance through that one tier in a single call. A borrower can build a large
+position through a deep pool, then make a dust swap through a thin pool
+(possibly their own) at another tier. At settlement the whole position is
+pushed into the thin pool, misses the TWAP floor, and `settle()` reverts for
+everyone. After the deadline the borrower cannot `swapBack` either, so the
+tier cannot be changed back. The borrower holds a free option on a
+non-liquidating position; the lender's principal is locked.
+
+Related to item 14, but deliberate rather than circumstantial.
+
+**Fix (before freeze):** pin the fee tier when an asset first becomes held and
+refuse later swaps into it at a different tier; check entry impact against the
+full post-swap balance in the exit direction, not just the increment.
+
+## Krait observations (not findings, but on the list)
+
+- **Attester timelock can be walked around.** `KYCRegistry.rotateAttester`
+  adds the new key instantly, and `verify()` admits any wallet instantly. The
+  README says adding an attester is timelocked; against the operator it
+  currently protects nothing. Same pattern as item 10. Fold into the KYC
+  adapter redesign.
+- **Self-referral.** On direct origination the lender names the referrer, so a
+  lender can name themselves and take the referrer share of the protocol fee.
+  Mandate fills hard-code no referrer. Decide which is intended.
+- **The exposure cap reads the asset's current tier**, so `setTier` to a safer
+  tier loosens the cap on live loans. Same class as item 12.
+- **Stale NatSpec on `setTier`**: says unassessed assets default to Blue chip;
+  they now default to Speculative.
+
+---
+
 ## Second review — what is left before freeze
 
-**Done (1 October 2026):** items 10 and 11. 250 tests passing.
+**Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
 **Before freeze:** item 12 (per-setter timelock or snapshot, plus the comment),
 item 13 (decide mandate semantics), item 15 (SafeERC20 or listing rule;
-timelock expiry), and update `redeploy-factory-v21.js`.
+timelock expiry), item 16 (sequencer-aware grace), item 17 (balance-delta
+check), item 20 (pin fee tier; impact on full balance), the Krait
+observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable
 assets), alongside item 8 (insurance solvency) and the KYC adapter work.

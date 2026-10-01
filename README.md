@@ -19,7 +19,7 @@ Counted at `main` on 1 October 2026, as non-blank, non-comment lines. The exact 
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 545 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps with tier ceiling, exposure caps and entry-impact check, yield venues, TWAP-bounded forced swap-back, three-tier settlement, keeper bounty, protocol fee, payout waterfall |
+| `contracts/Vault.sol` | 551 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps with tier ceiling, exposure caps and entry-impact check, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
 | `contracts/VaultFactory.sol` | 535 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel), pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 336 | Operator-curated whitelist, risk tiers with tier history, on-chain deposit floors, per-asset yield venue and grace period, immutable integration addresses, settlement config |
 | `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
@@ -28,7 +28,7 @@ Counted at `main` on 1 October 2026, as non-blank, non-comment lines. The exact 
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **1,886** | 1,797 written for Covenza + 89 vendored |
+| **Total** | **1,892** | 1,803 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (6 test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -62,7 +62,7 @@ At settlement, any foreign assets are force-swapped back to the loan asset. The 
 Grace periods are per asset. A tokenised equity trades 24/5, so its grace covers a weekend with no market.
 
 **6. Payout waterfall.**
-Loss hits the borrower's deposit first. The per-asset insurance pool covers any remaining shortfall, capped as a % of principal and on post-deadline settlements only. Only a genuine tail event reaches the lender's principal. Once the lender is whole, the residual pays the keeper bounty, then the protocol fee, then the borrower. `lossSeverity()` records the outcome on chain.
+Loss hits the borrower's deposit first. The per-asset insurance pool then covers any remaining shortfall **against principal** — never interest — capped as a % of principal and on post-deadline settlements only. Only a genuine tail event reaches the lender's principal. Insuring principal only means the size of a claim can never be set by the lender's chosen rate. Once the lender is whole, the residual pays the keeper bounty, then the protocol fee, then the borrower. `lossSeverity()` records the outcome on chain.
 
 **7. Insurance pool.**
 Reserves are per asset and never cross-converted, because converting at draw time would need a price and reintroduce the oracle. The pool is funded by a per-tier premium the borrower pays at origination. Reserves are never lent or staked. Only vaults registered by the factory can draw.
@@ -93,7 +93,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**250 tests** across 13 suites.
+**256 tests** across 14 suites.
 
 ```bash
 npm install
@@ -103,7 +103,7 @@ npx hardhat test
 | Suite | Tests | Covers |
 |---|---:|---|
 | `GroupA.test.js` | 26 | AssetRegistry whitelist and config; InsurancePool funding, draws, cap, access control |
-| `GroupB.test.js` | 13 | Full lifecycle: swaps, deposit invariant, forced swap-back (aligned and diverged TWAP), insurance draws, three-tier access, keeper bounty |
+| `GroupB.test.js` | 13 | Full lifecycle: swaps, deposit invariant, forced swap-back (aligned and diverged TWAP), principal-only insurance draws, three-tier access, keeper bounty |
 | `GroupD.test.js` | 17 | Guard rails and edge cases, settlement boundaries, KYC revocation mid-loan |
 | `GroupH.test.js` | 15 | Protocol fee: add-on behaviour, zero fee on loss, referrer split, rate snapshotting |
 | `InsuranceFunding.test.js` | 15 | Premium funding and cancellation |
@@ -115,6 +115,7 @@ npx hardhat test
 | `TwapGuard.test.js` | 12 | Unquotable and manipulated pools |
 | `YieldVenue.test.js` | 14 | Aave and ERC-4626 venues, per-asset grace |
 | `AdminTimelocks.test.js` | 14 | Insurance-pool factory changes are timelocked; integration addresses cannot be repointed |
+| `KraitFindings.test.js` | 6 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
 
@@ -164,6 +165,7 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
 - **Some live-loan parameters still change instantly** (settlement tolerance, exposure caps, grace, draw cap). Bounded, but a lender priced the loan against the values in force when it was written. Item 12 in the self-review.
 - **A mandate can be filled more than once**, up to the lender's allowance; `maxPrincipal` limits each fill, not the total. Item 13.
+- **A borrower can deliberately make settlement revert** by routing a dust swap through a thin pool, which redirects the whole position's exit there. Item 20; fix planned before freeze.
 - **Settlement has no fallback if a held asset cannot be swapped back**, for example a tokenised equity frozen by its issuer. The loan stays unsettled until it can be. Item 14.
 
 ---
@@ -175,7 +177,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 250 tests, 13 suites
+test/                 256 tests, 14 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)

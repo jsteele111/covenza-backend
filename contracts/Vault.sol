@@ -25,8 +25,9 @@ import "./libraries/UniswapTwap.sol";
  *         uniformly across all action types.
  *
  *         SETTLEMENT WATERFALL: deposit absorbs loss first (by
- *         construction of the payout math) --> insurance pool covers
- *         remaining shortfall (capped, post-deadline settlements only)
+ *         construction of the payout math) --> insurance pool covers any
+ *         remaining shortfall against PRINCIPAL (capped, post-deadline
+ *         settlements only; interest is never insured)
  *         --> only a true tail event reaches the lender's principal.
  *         Once the lender is whole, the surviving residual is distributed
  *         in order: keeper bounty --> protocol fee --> borrower.
@@ -732,8 +733,27 @@ contract Vault {
         );
     }
 
-    /// @notice Explicit swap-back entry point: converts `heldAsset` back to
-    ///         the loan asset. Always permitted while the loan is active.
+    /**
+     * @notice Explicit swap-back entry point: converts `heldAsset` back to
+     *         the loan asset. Always permitted while the loan is active.
+     *
+     * @dev    TWAP FLOOR. The exit is held to the same bound as the forced
+     *         swap-back at settlement: output must be at least the TWAP-implied
+     *         value less twapToleranceBps. The borrower may ask for MORE via
+     *         minAmountOut; they can never accept less.
+     *
+     *         Without it this was the one price-unchecked path out of the
+     *         vault. Entry was bounded by _enforceEntryImpact and settlement by
+     *         the tolerance, but the voluntary exit relied on a minimum chosen
+     *         by the borrower — the party it exists to constrain. A borrower
+     *         could sell held assets at 1% of fair value into a pool they had
+     *         moved (or into liquidity they provided) and keep the difference
+     *         outside the vault: custody bypassed, lender loss down to the
+     *         deposit plus the capped insurance draw.
+     *
+     *         Found by Krait (KRAIT-001, Critical) on 1 October 2026 with an
+     *         executed proof of concept; see MAINNET-READINESS item 18.
+     */
     function swapBack(
         address heldAsset,
         uint256 amountIn,
@@ -743,7 +763,14 @@ contract Vault {
         require(amountIn > 0,      "Amount must be greater than zero");
         require(minAmountOut > 0,  "minAmountOut must be greater than zero");
 
-        uint256 amountOut = _executeSwap(heldAsset, asset, amountIn, minAmountOut, swapFeeTierOf[heldAsset]);
+        uint24 feeTier = swapFeeTierOf[heldAsset];
+        uint256 twapOut = UniswapTwap.quote(
+            registry.uniswapFactory(), heldAsset, asset, feeTier, amountIn, registry.twapWindow()
+        );
+        uint256 floorOut = (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+        if (minAmountOut < floorOut) { minAmountOut = floorOut; }
+
+        uint256 amountOut = _executeSwap(heldAsset, asset, amountIn, minAmountOut, feeTier);
         _untrackIfEmptied(heldAsset);
 
         emit SwapExecuted(heldAsset, asset, amountIn, amountOut, true);
@@ -860,9 +887,21 @@ contract Vault {
         // Insurance pool draw — post-deadline settlements only. Early close
         // must make the lender whole from the vault's own funds; a borrower
         // voluntarily realising a loss cannot tap the shared pool at will.
+        //
+        // PRINCIPAL ONLY. The pool covers a shortfall against principal, never
+        // against interest. It used to insure principal + accrued interest,
+        // and the interest is a number the LENDER chooses: APR is unbounded,
+        // and nothing stops lender and borrower being the same wallet. One
+        // KYC'd wallet could lend to itself for 60 seconds at an absurd APR,
+        // settle, and collect drawCapBps of principal from the shared reserve
+        // on every cycle — no market loss involved. Insuring only principal
+        // takes the claim size out of the lender's hands entirely: a shortfall
+        // against principal can only come from the vault actually losing
+        // value. Found by Krait (KRAIT-002, High) on 1 October 2026; see
+        // MAINNET-READINESS item 19.
         uint256 insuranceDraw = 0;
-        if (!early && totalReturned < lenderTarget) {
-            insuranceDraw = insurancePool.draw(asset, lenderTarget - totalReturned, principal);
+        if (!early && totalReturned < principal) {
+            insuranceDraw = insurancePool.draw(asset, principal - totalReturned, principal);
         }
 
         uint256 available    = totalReturned + insuranceDraw;
