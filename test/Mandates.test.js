@@ -103,6 +103,7 @@ describe("Mandates", function () {
       asset: usdxAddr,
       minPrincipal: E("10"),
       maxPrincipal: E("200"),
+      totalCapacity: E("1000"),     // item 13: total across all fills
       minTermSeconds: DAY,
       maxTermSeconds: 30 * DAY,
       validForSeconds: 6 * 3600,
@@ -490,5 +491,44 @@ describe("Mandates", function () {
     // capital until each deadline for the price of gas.
     expect(await usdx.balanceOf(lender.address)).to.equal(lenderBefore);
     expect(await factory.totalVaults()).to.equal(0);
+  });
+
+  // --- Capacity (MAINNET-READINESS item 13) ---
+
+  it("Refuses a total capacity below the per-loan maximum", async function () {
+    const { publish } = await loadFixture(fixture);
+    await expect(publish({ totalCapacity: E("100") }))  // max per loan is 200
+      .to.be.revertedWith("Capacity below the per-loan maximum");
+  });
+
+  it("Stops lending once its TOTAL capacity is used, across borrowers", async function () {
+    const { publish, factory, borrower } = await loadFixture(fixture);
+    const id = await publish({ maxPrincipal: E("100"), totalCapacity: E("250") });
+
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    expect(await factory.mandateRemaining(id)).to.equal(E("50"));
+    expect(await factory.quoteMandateFillable(id)).to.equal(E("50"));
+
+    // A third full-size loan no longer fits...
+    await expect(
+      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT)
+    ).to.be.revertedWith("Exceeds the mandate's remaining capacity");
+
+    // ...but the remainder can still be taken.
+    await factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"));
+    expect(await factory.mandateRemaining(id)).to.equal(0);
+    expect(await factory.quoteMandateFillable(id)).to.equal(0);
+  });
+
+  it("A fill that fails uses up none of the capacity", async function () {
+    const { publish, factory, borrower, lender, usdx, factoryAddr } = await loadFixture(fixture);
+    const id = await publish({ totalCapacity: E("250") });
+    await usdx.connect(lender).approve(factoryAddr, 0);
+
+    await expect(
+      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT)
+    ).to.be.reverted;
+    expect(await factory.mandateRemaining(id)).to.equal(E("250"));
   });
 });

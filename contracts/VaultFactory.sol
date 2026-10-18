@@ -103,6 +103,17 @@ contract VaultFactory is Timelocked {
     ///         the referrer, leaving 70% to the treasury.
     uint256 public referrerShareBps = 3000;
 
+    /// @notice Integrator platforms the owner has approved to earn the
+    ///         referrer share. Krait observation: on a direct origination the
+    ///         lender names the referrer, so any lender could name their own
+    ///         address and take 30% of the protocol fee. Now only an approved
+    ///         platform earns it, and never on a loan where it is also the
+    ///         lender or the borrower. Anyone else named is ignored and the
+    ///         whole fee goes to the treasury.
+    mapping(address => bool) public approvedReferrer;
+
+    event ReferrerApprovalUpdated(address indexed referrer, bool approved);
+
     /// @notice Hard ceilings, enforced in the setters below. These exist so
     ///         that even a compromised owner key cannot set a confiscatory
     ///         rate — the worst case is bounded by the contract itself.
@@ -398,7 +409,7 @@ contract VaultFactory is Timelocked {
             }),
             FeeConfig({
                 treasury:           treasury,
-                referrer:           p.referrer,
+                referrer:           _effectiveReferrer(p),
                 protocolFeeRateBps: protocolFeeRateBps,
                 referrerShareBps:   referrerShareBps,
                 minimumFeeBps:      minimumFeeBps
@@ -551,6 +562,10 @@ contract VaultFactory is Timelocked {
         uint256 depositCreditBpsPerPoint;   // subtracted per whole % of deposit above the minimum
         uint256 minDepositBps;              // the mandate's own floor, on top of the tier's
         uint256 minAprBps;                  // the formula can never price below this
+
+        // --- capacity (MAINNET-READINESS item 13) ---
+        uint256 totalCapacity;              // most this mandate lends across ALL fills
+        uint256 filled;                     // principal lent so far
     }
 
     /// @dev Published as one struct: eleven-plus arguments would overflow the
@@ -569,6 +584,7 @@ contract VaultFactory is Timelocked {
         uint256 depositCreditBpsPerPoint;
         uint256 minDepositBps;
         uint256 minAprBps;
+        uint256 totalCapacity;
     }
 
     Mandate[] internal _mandates;
@@ -606,6 +622,7 @@ contract VaultFactory is Timelocked {
         require(assetRegistry.isWhitelisted(t.asset),     "Loan asset is not whitelisted");
         require(t.minPrincipal > 0,                       "Minimum principal must be nonzero");
         require(t.maxPrincipal >= t.minPrincipal,         "Maximum below minimum principal");
+        require(t.totalCapacity >= t.maxPrincipal,        "Capacity below the per-loan maximum");
         require(t.minTermSeconds > 0,                     "Minimum term must be nonzero");
         require(t.maxTermSeconds >= t.minTermSeconds,     "Maximum below minimum term");
         require(t.validForSeconds > 0,                    "Mandate must have a lifetime");
@@ -642,7 +659,8 @@ contract VaultFactory is Timelocked {
         m.depositCreditBpsPerPoint = t.depositCreditBpsPerPoint;
         m.minDepositBps            = t.minDepositBps;
         m.minAprBps                = t.minAprBps;
-        // cancelled defaults to false
+        m.totalCapacity            = t.totalCapacity;
+        // cancelled defaults to false; filled starts at zero
 
         emit MandatePublished(id, msg.sender, t.asset, t.maxPrincipal, m.expiry, t.maxTier);
     }
@@ -756,7 +774,22 @@ contract VaultFactory is Timelocked {
         uint256 balance   = IERC20(m.asset).balanceOf(m.lender);
 
         uint256 available = allowance < balance ? allowance : balance;
-        return available < m.maxPrincipal ? available : m.maxPrincipal;
+        uint256 offer = m.maxPrincipal < mandateRemaining(id) ? m.maxPrincipal : mandateRemaining(id);
+        return available < offer ? available : offer;
+    }
+
+    /**
+     * @notice How much of this mandate's total capacity is still unlent.
+     *
+     * @dev    MAINNET-READINESS item 13. `maxPrincipal` bounds each fill;
+     *         `totalCapacity` bounds them all together. Before capacity existed
+     *         a mandate never ran out: a lender publishing "maximum 100" could
+     *         be filled for 100 again and again, up to whatever their allowance
+     *         and balance allowed, and the per-fill figure read like a total.
+     */
+    function mandateRemaining(uint256 id) public view returns (uint256) {
+        Mandate storage m = _mandates[id];
+        return m.totalCapacity - m.filled;
     }
 
     function totalMandates() external view returns (uint256) {
@@ -809,6 +842,8 @@ contract VaultFactory is Timelocked {
                 principal >= m.minPrincipal && principal <= m.maxPrincipal,
                 "Principal outside the mandate's bounds"
             );
+            require(principal <= m.totalCapacity - m.filled, "Exceeds the mandate's remaining capacity");
+            m.filled += principal;
 
             uint256 termSeconds = useSeconds ? duration : duration * 1 days;
             require(
@@ -919,6 +954,25 @@ contract VaultFactory is Timelocked {
         uint256 previous = protocolFeeRateBps;
         protocolFeeRateBps = _newBps;
         emit ProtocolFeeRateUpdated(previous, _newBps);
+    }
+
+    /// @notice Approves or removes an integrator as an eligible referrer.
+    ///         Affects new loans only: each vault records its referrer at
+    ///         origination.
+    function setReferrerApproved(address _referrer, bool _approved) external onlyOwner {
+        require(_referrer != address(0), "Invalid referrer");
+        approvedReferrer[_referrer] = _approved;
+        emit ReferrerApprovalUpdated(_referrer, _approved);
+    }
+
+    /// @dev The referrer a loan actually pays: the one named, if approved and
+    ///      not a party to the loan; otherwise none.
+    function _effectiveReferrer(OriginationParams memory p) internal view returns (address) {
+        address r = p.referrer;
+        if (r == address(0) || !approvedReferrer[r] || r == p.lender || r == p.borrower) {
+            return address(0);
+        }
+        return r;
     }
 
     /// @notice Updates the referrer's share of the protocol fee, capped at

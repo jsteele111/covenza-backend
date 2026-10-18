@@ -130,6 +130,8 @@ describe("Group H — protocol fee", function () {
       await vaultImpl.getAddress()   // clone source
     , 0);
     await pool.setVaultFactory(await factory.getAddress());
+    // Only approved integrators earn the referrer share (Krait observation).
+    await factory.setReferrerApproved(referrer.address, true);
 
     // The lender skim now defaults to ZERO — the insurance pool is funded by the
     // borrower's per-tier premium instead, and charging both sides would
@@ -364,5 +366,45 @@ describe("Group H — protocol fee", function () {
 
     await factory.setProtocolFeeRateBps(0);
     expect(await factory.quoteProtocolFee(PRINCIPAL, FEE_BPS, DURATION, true)).to.equal(0);
+  });
+
+  // --- Approved referrers only (Krait observation: self-referral) ---
+
+  it("An address that is not an approved integrator earns nothing", async function () {
+    const { originate, borrower, treasury, keeper, weth } = await loadFixture(baseFixture);
+    const vault = await originate(keeper.address);
+
+    await atDeadline(vault);
+    await vault.connect(borrower).settle();
+
+    expect(await vault.settledReferrerFee()).to.equal(0);
+    expect(await weth.balanceOf(keeper.address)).to.equal(0);
+    expect(await weth.balanceOf(treasury.address)).to.equal(PROTOCOL_FEE);
+  });
+
+  it("A lender cannot refer their own loan, even if approved", async function () {
+    const { originate, borrower, lender, factory } = await loadFixture(baseFixture);
+    await factory.setReferrerApproved(lender.address, true);
+    const vault = await originate(lender.address);
+
+    await atDeadline(vault);
+    await vault.connect(borrower).settle();
+    expect(await vault.settledReferrerFee()).to.equal(0);
+  });
+
+  it("Removing an approval stops it applying to new loans", async function () {
+    const { originate, borrower, referrer, factory } = await loadFixture(baseFixture);
+    await factory.setReferrerApproved(referrer.address, false);
+    const vault = await originate(referrer.address);
+
+    await atDeadline(vault);
+    await vault.connect(borrower).settle();
+    expect(await vault.settledReferrerFee()).to.equal(0);
+  });
+
+  it("Only the owner can approve a referrer", async function () {
+    const { factory, lender } = await loadFixture(baseFixture);
+    await expect(factory.connect(lender).setReferrerApproved(lender.address, true))
+      .to.be.revertedWith("Caller is not the owner");
   });
 });

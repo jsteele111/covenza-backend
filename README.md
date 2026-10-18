@@ -20,7 +20,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | File | nSLOC | Responsibility |
 |---|---:|---|
 | `contracts/Vault.sol` | 582 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
-| `contracts/VaultFactory.sol` | 521 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel), pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
+| `contracts/VaultFactory.sol` | 547 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 372 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config. Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
 | `contracts/InsurancePool.sol` | 105 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
@@ -29,7 +29,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/libraries/SafeTransfer.sol` | 31 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **1,990** | 1,901 written for Covenza + 89 vendored |
+| **Total** | **2,016** | 1,927 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -43,7 +43,7 @@ Compiler: Solidity 0.8.24, optimizer on (200 runs). Hardhat 2.22.
 Principal goes from the lender straight into the loan's own vault. The vault exposes only whitelisted actions: swaps through Uniswap V3 into whitelisted assets, and supplying to the asset's configured yield venue. There is no path to an external address while the loan is live.
 
 **2. Mandates — lenders publish terms, borrowers fill them.**
-A lender publishes a mandate: asset, size range, term range, expiry (capped at 7 days), a risk-tier ceiling, and optionally a single permitted borrower. Pricing is a **formula, not a range**. APR = base + a premium per day of term − a credit per point of deposit above the binding floor, never below the lender's minimum. Publishing a range would expose the lender's worst corner. Pricing every point on the surface leaves the lender indifferent across it. A verified borrower fills a mandate in one atomic transaction that moves the principal, their deposit and the insurance premium together, or none of them. Capital stays in the lender's wallet until a fill.
+A lender publishes a mandate: asset, a size range per loan and a total capacity across all loans, term range, expiry (capped at 7 days), a risk-tier ceiling, and optionally a single permitted borrower. Pricing is a **formula, not a range**. APR = base + a premium per day of term − a credit per point of deposit above the binding floor, never below the lender's minimum. Publishing a range would expose the lender's worst corner. Pricing every point on the surface leaves the lender indifferent across it. A verified borrower fills a mandate in one atomic transaction that moves the principal, their deposit and the insurance premium together, or none of them. Capital stays in the lender's wallet until a fill.
 
 **3. Risk tiers — deposit floors computed on chain.**
 Every asset carries a tier (Blue chip, Standard, Speculative), each with an assumed volatility, an absolute deposit floor, a maximum term, an exposure cap and an insurance premium. The required deposit is `max(tier floor, 1.8 × assumed volatility × √(term/365))`, computed by `AssetRegistry` and **enforced at origination**, not advisory. An unassessed asset defaults to Speculative. The tier ceiling is snapshotted per loan: `highestTierSince(asset, originatedAt)` means re-tagging an asset can tighten a live loan but never loosen it.
@@ -94,7 +94,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**292 tests** across 16 suites.
+**299 tests** across 16 suites.
 
 ```bash
 npm install
@@ -106,17 +106,19 @@ npx hardhat test
 | `GroupA.test.js` | 26 | AssetRegistry whitelist and config; InsurancePool funding, draws, cap, access control |
 | `GroupB.test.js` | 13 | Full lifecycle: swaps, deposit invariant, forced swap-back (aligned and diverged TWAP), principal-only insurance draws, three-tier access, keeper bounty |
 | `GroupD.test.js` | 17 | Guard rails and edge cases, settlement boundaries, KYC revocation mid-loan |
-| `GroupH.test.js` | 15 | Protocol fee: add-on behaviour, zero fee on loss, referrer split, rate snapshotting |
+| `GroupH.test.js` | 19 | Protocol fee: add-on behaviour, zero fee on loss, referrer split, approved referrers only, rate snapshotting |
 | `InsuranceFunding.test.js` | 15 | Premium funding and cancellation |
 | `Interest.test.js` | 11 | Annualised interest and minimum charge |
 | `KYCRegistry.test.js` | 46 | Attester signatures, revocation, two-step operator transfer, timelocked attesters, status |
-| `Mandates.test.js` | 31 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface |
+| `Mandates.test.js` | 34 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface, total capacity |
 | `ProductionGuards.test.js` | 11 | Deploy guards |
 | `RiskTiers.test.js` | 25 | Tier floors, term limits, exposure caps, tier history (both directions) |
-| `TwapGuard.test.js` | 12 | Unquotable and manipulated pools |
+| `TwapGuard.test.js` | 13 | Unquotable and manipulated pools; only the approved pool per pair |
 | `YieldVenue.test.js` | 14 | Aave and ERC-4626 venues, per-asset grace |
 | `AdminTimelocks.test.js` | 14 | Insurance-pool factory changes are timelocked; integration addresses cannot be repointed |
-| `KraitFindings.test.js` | 6 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool |
+| `KraitFindings.test.js` | 16 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool; settlement cannot be stalled (approved pool, held-amount record, full-exit check); measured swap output |
+| `TokenSafety.test.js` | 9 | USDT-style tokens through a whole loan; `false`-returning and code-less tokens still fail; timelock approvals lapse after 14 days |
+| `ParameterTimelocks.test.js` | 16 | Live-loan parameters wait on a real 48-hour timelock by direction; exposure cap uses the worst tier since origination |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
 
@@ -166,7 +168,6 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
 - **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
 - **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool or a new yield venue); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. The **per-asset grace extension** is still instant, pending a design decision. Item 12.
-- **A mandate can be filled more than once**, up to the lender's allowance; `maxPrincipal` limits each fill, not the total. Item 13.
 - **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
 - **Settlement has no fallback if a held asset cannot be swapped back**, for example a tokenised equity frozen by its issuer. The loan stays unsettled until it can be. Item 14.
 
@@ -179,7 +180,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 292 tests, 16 suites
+test/                 299 tests, 16 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)

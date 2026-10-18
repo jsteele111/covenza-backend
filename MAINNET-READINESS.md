@@ -360,7 +360,7 @@ first review did not walk.
 | 10 | Insurance pool drainable via an instant factory repoint | HIGH | **FIXED** |
 | 11 | Swap router and Uniswap factory repointable under live vaults | HIGH | **FIXED** |
 | 12 | Other live-loan parameters change instantly | MEDIUM | **FIXED** (per-asset grace pending) |
-| 13 | A mandate can be filled repeatedly | MEDIUM | Open — design |
+| 13 | A mandate can be filled repeatedly | MEDIUM | **FIXED** |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
 | 16 | Sequencer downtime can consume the grace window | MEDIUM | Open |
@@ -478,7 +478,17 @@ Correct the `setTierConfig` comment either way.
 
 ---
 
-## 13. A mandate can be filled repeatedly — MEDIUM — open, design
+## 13. A mandate can be filled repeatedly — MEDIUM — **FIXED**
+
+> **Fixed 18 October 2026: both.** A mandate keeps its per-loan range
+> (`minPrincipal`..`maxPrincipal`) and gains a `totalCapacity` across all
+> fills, which may not be below the per-loan maximum. `fillMandate` refuses a
+> fill beyond what remains ("Exceeds the mandate's remaining capacity") and
+> records it; `mandateRemaining(id)` reports the rest, and
+> `quoteMandateFillable` now returns the lesser of allowance, balance,
+> per-loan maximum and remaining capacity. Three tests in `Mandates.test.js`.
+> The interface must send `totalCapacity` when publishing.
+
 
 `fillMandate` checks `principal <= maxPrincipal` per fill and never marks the
 mandate used. A mandate stays live until it expires or is cancelled, so a
@@ -715,9 +725,11 @@ full post-swap balance in the exit direction, not just the increment.
   README says adding an attester is timelocked; against the operator it
   currently protects nothing. Same pattern as item 10. Fold into the KYC
   adapter redesign.
-- **Self-referral.** On direct origination the lender names the referrer, so a
-  lender can name themselves and take the referrer share of the protocol fee.
-  Mandate fills hard-code no referrer. Decide which is intended.
+- ~~**Self-referral.**~~ — **fixed 18 October 2026.** Only integrators the
+  owner approves (`setReferrerApproved`) earn the referrer share, and never on
+  a loan where they are also the lender or borrower; anyone else named is
+  ignored and the whole fee goes to the treasury. Mandate fills still carry no
+  referrer. Four tests in `GroupH.test.js`.
 - ~~**The exposure cap reads the asset's current tier**~~ — **fixed with item 12**:
   the cap now uses the worst tier since origination.
 - ~~**Stale NatSpec on `setTier`**~~ — **fixed with item 12**.
@@ -728,9 +740,9 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
-**Done (18 October 2026):** items 12 (except per-asset grace), 15, 17 and 20, and two Krait observations. 292 tests passing.
+**Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 17 and 20, and three Krait observations. 299 tests passing.
 
-**Before freeze:** the per-asset grace decision (item 12), item 13 (decide mandate semantics), item 16 (sequencer-aware grace), the Krait
+**Before freeze:** the per-asset grace decision (item 12), item 16 (sequencer-aware grace), the Krait
 observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable
