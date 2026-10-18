@@ -39,6 +39,7 @@ function isProduction(networkName) {
  * @param {object} cfg
  * @param {number} [cfg.timelockDelay]
  * @param {number} [cfg.twapWindow]
+ * @param {number} [cfg.outageGapThreshold] sequencer-outage detection (0 = off)
  * @param {string} [cfg.operator]     intended operator address
  * @param {string} [cfg.deployer]     the deploying EOA
  */
@@ -58,6 +59,16 @@ function guardProductionConfig(networkName, cfg = {}) {
     problems.push(
       `TWAP window is ${cfg.twapWindow}s; production needs at least ${MIN_TWAP_WINDOW}s. ` +
       `60s is the contract minimum and is manipulable on a thin pool.`
+    );
+  }
+
+  // MAINNET-READINESS item 16. With detection off, a sequencer outage across a
+  // grace window silently consumes it and hands keepers the time jump. The
+  // contract defaults to on; this catches a deployment that switched it off.
+  if (cfg.outageGapThreshold !== undefined && Number(cfg.outageGapThreshold) === 0) {
+    problems.push(
+      "sequencer-outage detection is disabled (gap threshold 0). Production " +
+      "needs it on, with a heartbeat bot running."
     );
   }
 

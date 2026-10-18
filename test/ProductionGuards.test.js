@@ -53,6 +53,12 @@ describe("Production deployment guards", function () {
     ).to.throw(/TWAP window is 60s/);
   });
 
+  it("Refuses sequencer-outage detection switched off on production", function () {
+    expect(() =>
+      guardProductionConfig("robinhoodMainnet", { ...SAFE, outageGapThreshold: 0 })
+    ).to.throw(/sequencer-outage detection is disabled/);
+  });
+
   it("Accepts a properly configured production deployment", function () {
     expect(() => guardProductionConfig("robinhoodMainnet", SAFE)).to.not.throw();
   });

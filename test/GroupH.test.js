@@ -117,6 +117,10 @@ describe("Group H — protocol fee", function () {
     // IMPLEMENTATION does — it delegatecalls UniswapTwap.
     // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
+    // These suites warp the clock by days with no heartbeats, which outage
+    // detection would (correctly) read as an outage. They test bounty and
+    // grace arithmetic, so detection is off here; OutageGrace.test.js covers it.
+    await registry.setOutageConfig(0, 0, 0);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
     const vaultImpl = await (await ethers.getContractFactory("Vault", {

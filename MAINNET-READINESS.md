@@ -363,7 +363,7 @@ first review did not walk.
 | 13 | A mandate can be filled repeatedly | MEDIUM | **FIXED** |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
-| 16 | Sequencer downtime can consume the grace window | MEDIUM | Open |
+| 16 | Sequencer downtime can consume the grace window | MEDIUM | **FIXED** (needs a heartbeat bot) |
 | 17 | Swaps trust the router's minimum-output check | LOW | **FIXED** |
 | 18 | `swapBack` had no price floor: borrower could drain principal (KRAIT-001) | CRITICAL | **FIXED** |
 | 19 | Insurance paid unpaid interest at a lender-chosen APR (KRAIT-002) | HIGH | **FIXED** |
@@ -561,7 +561,36 @@ receives the asset" rather than "nobody receives anything".
 
 ---
 
-## 16. Sequencer downtime can consume the grace window — MEDIUM — open
+## 16. Sequencer downtime can consume the grace window — MEDIUM — **FIXED**
+
+> **Fixed 18 October 2026.** `AssetRegistry` keeps a heartbeat that anyone may
+> call. A gap between heartbeats longer than `outageGapThreshold` (30 minutes)
+> is recorded as an outage. `Vault.settle()` calls `heartbeat()` first, so the
+> first transaction after a restart records the outage before any window is
+> read, then asks `settlementWindow()` for:
+>
+> - **the grace end, extended** by the outage time that fell after the deadline
+>   and within the window, capped at `maxGraceExtension` (72 hours). The
+>   parties get back exactly the time they lost;
+> - **the earliest keeper settlement**: the later of that and the end of the
+>   last outage plus `recoveryPeriod` (1 hour, which may not be shorter than
+>   the TWAP window, since the TWAP is frozen through an outage). The keeper
+>   bounty accrues only from here. The lender and borrower are never held by
+>   the recovery period.
+>
+> Values chosen against recorded L2 outages (Base: 33 minutes in Aug 2025,
+> about 2 hours in Jun 2026; Arbitrum One: almost 3 hours in Dec 2023).
+> Configuration is timelocked in every direction; zero disables detection and
+> the production guard refuses that. Eleven tests in `OutageGrace.test.js`;
+> the three that matter fail against `a9b954b`.
+>
+> **Operational dependency:** an off-chain bot must call `heartbeat()` every
+> 5 minutes. If it stops, quiet periods read as outages: the parties gain time
+> and keepers wait (bounded by the cap). A keeper held off by the recovery
+> period must call `heartbeat()` itself and wait, because a reverted
+> `settle()` also reverts the outage record. No sequencer uptime feed is
+> assumed to exist on Robinhood Chain.
+
 
 Robinhood Chain is an Arbitrum Orbit L2 with a single sequencer. While it is
 down, no transactions are included but wall-clock time keeps passing, and
@@ -740,9 +769,9 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
-**Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 17 and 20, and three Krait observations. 299 tests passing.
+**Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 16, 17 and 20, and three Krait observations. 311 tests passing.
 
-**Before freeze:** the per-asset grace decision (item 12), item 16 (sequencer-aware grace), the Krait
+**Before freeze:** the per-asset grace decision (item 12), the heartbeat bot (item 16), the Krait
 observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable

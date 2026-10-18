@@ -243,6 +243,33 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      */
     mapping(address => mapping(address => uint24)) private _poolFeeTier;
 
+    // --- Sequencer outages (MAINNET-READINESS item 16) ---
+    //
+    // Robinhood Chain has a single sequencer. While it is down nothing can be
+    // included, but the clock runs on, and block.timestamp jumps forward when
+    // it returns. Settlement access is purely time-based, so an outage across
+    // a vault's deadline and grace window silently consumed the parties'
+    // protected window and let keepers force a sale, with a bounty already
+    // accrued, the moment the chain came back.
+    //
+    // A contract cannot see a gap in block production directly, so the
+    // registry keeps a heartbeat. Anyone may call heartbeat(); an off-chain
+    // bot calls it every few minutes and every settle() calls it first. A gap
+    // between heartbeats longer than outageGapThreshold is recorded as an
+    // outage. Vaults then extend their grace by the outage time that fell in
+    // it (capped at maxGraceExtension), keepers wait recoveryPeriod after any
+    // outage ends, and the keeper bounty accrues only from the later of the
+    // two. A missed heartbeat that was NOT an outage costs only time: the
+    // parties get longer, keepers wait. The parties are never held back.
+
+    struct Outage { uint64 start; uint64 end; }
+    Outage[] internal _outages;
+
+    uint256 public lastHeartbeat;
+    uint256 public outageGapThreshold = 30 minutes; // zero disables detection
+    uint256 public recoveryPeriod     = 1 hours;
+    uint256 public maxGraceExtension  = 72 hours;
+
     /// @notice Enumerable list of every asset ever added (whitelisted or
     ///         since removed) — removal flips the flag but keeps the entry,
     ///         so historical vaults can still look up aToken addresses.
@@ -256,6 +283,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
     event PoolFeeTierUpdated(address indexed tokenA, address indexed tokenB, uint24 fee);
+    event OutageRecorded(uint256 start, uint256 end);
+    event OutageConfigUpdated(uint256 gapThreshold, uint256 recoveryPeriod, uint256 maxGraceExtension);
     event TierUpdated(address indexed asset, RiskTier tier);
     event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
         uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
@@ -296,6 +325,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         weth           = _weth;
 
         emit IntegrationAddressesUpdated(_aavePool, _swapRouter, _uniswapFactory, _weth);
+
+        lastHeartbeat = block.timestamp;
 
         // Launch defaults. Volatilities are placeholders until measured on
         // chain (see the deferred observe()-derived sigma work); everything
@@ -826,6 +857,100 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     ///         re-tagging an asset safer loosened the cap on loans already open.
     function maxExposureBpsSince(address _asset, uint256 _since) external view returns (uint256) {
         return tierConfig[highestTierSince(_asset, _since)].maxExposureBps;
+    }
+
+    /**
+     * @notice Records that the chain is live. Callable by anyone; costs only
+     *         gas. If the previous heartbeat is older than the gap threshold,
+     *         the silence between them is recorded as an outage.
+     */
+    function heartbeat() external {
+        uint256 last = lastHeartbeat;
+        if (outageGapThreshold != 0 && block.timestamp > last + outageGapThreshold) {
+            _outages.push(Outage({ start: uint64(last), end: uint64(block.timestamp) }));
+            emit OutageRecorded(last, block.timestamp);
+        }
+        lastHeartbeat = block.timestamp;
+    }
+
+    /**
+     * @notice The settlement window a vault is actually entitled to, given the
+     *         outages recorded so far.
+     * @param  _deadline  The loan's deadline.
+     * @param  _graceEnd  The grace end before any extension.
+     * @return graceEnd   `_graceEnd` extended by the outage time that fell after
+     *                    the deadline and within the (extended) window, capped
+     *                    at maxGraceExtension.
+     * @return keeperFrom The earliest moment a keeper may settle: the extended
+     *                    grace end, or the end of the latest outage plus the
+     *                    recovery period, whichever is later. The keeper bounty
+     *                    accrues from here.
+     *
+     * @dev    Outages are recorded in time order and do not overlap, so the walk
+     *         runs backwards and stops at the first that ended before the
+     *         deadline. An outage that begins after the (extended) grace end can
+     *         be counted here, but it can never reopen a window that has
+     *         closed: such an outage ends at least its own length after the old
+     *         grace end, so the new end is already in the past when it is read.
+     */
+    function settlementWindow(uint256 _deadline, uint256 _graceEnd)
+        external view returns (uint256 graceEnd, uint256 keeperFrom)
+    {
+        uint256 ext;
+        uint256 n = _outages.length;
+        uint256 horizon = _graceEnd + maxGraceExtension;
+        for (uint256 i = n; i > 0; i--) {
+            Outage storage o = _outages[i - 1];
+            if (o.end <= _deadline) { break; }
+            if (o.start >= horizon) { continue; }
+            ext += o.end - (o.start > _deadline ? o.start : _deadline);
+        }
+        if (ext > maxGraceExtension) { ext = maxGraceExtension; }
+        graceEnd = _graceEnd + ext;
+
+        keeperFrom = graceEnd;
+        if (n > 0) {
+            uint256 recovered = uint256(_outages[n - 1].end) + recoveryPeriod;
+            if (recovered > keeperFrom) { keeperFrom = recovered; }
+        }
+    }
+
+    /// @notice Number of outages recorded.
+    function outageCount() external view returns (uint256) { return _outages.length; }
+
+    /// @notice One recorded outage.
+    function outageAt(uint256 _i) external view returns (uint256 start, uint256 end) {
+        Outage storage o = _outages[_i];
+        return (o.start, o.end);
+    }
+
+    /**
+     * @notice Sets outage detection. A zero gap threshold disables it (all
+     *         three must then be zero). Timelocked in every direction: each
+     *         value moves time between the parties and the keepers on loans
+     *         already open.
+     * @dev    The recovery period may not be shorter than the TWAP window.
+     *         During an outage nothing trades, so the TWAP is frozen at the
+     *         pre-outage price; it needs a full window after restart before it
+     *         reflects the market a forced sale will meet.
+     */
+    function setOutageConfig(uint256 _gapThreshold, uint256 _recoveryPeriod, uint256 _maxGraceExtension)
+        external onlyOperator
+    {
+        if (_gapThreshold == 0) {
+            require(_recoveryPeriod == 0 && _maxGraceExtension == 0, "Disable all three together");
+        } else {
+            require(_gapThreshold >= 5 minutes,       "Gap threshold too short");
+            require(_recoveryPeriod >= twapWindow,    "Recovery shorter than the TWAP window");
+            require(_recoveryPeriod <= 1 days,        "Recovery period too long");
+            require(_maxGraceExtension <= 7 days,     "Extension cap too long");
+        }
+        _consumeIfDelayed(keccak256(msg.data));
+
+        outageGapThreshold = _gapThreshold;
+        recoveryPeriod     = _recoveryPeriod;
+        maxGraceExtension  = _maxGraceExtension;
+        emit OutageConfigUpdated(_gapThreshold, _recoveryPeriod, _maxGraceExtension);
     }
 
     /// @notice Announces a timelocked change. `_id` is keccak256 of the exact

@@ -19,9 +19,9 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 582 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
+| `contracts/Vault.sol` | 585 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
 | `contracts/VaultFactory.sol` | 547 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
-| `contracts/AssetRegistry.sol` | 372 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config. Changes that reach open loans wait on the timelock |
+| `contracts/AssetRegistry.sol` | 431 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
 | `contracts/InsurancePool.sol` | 105 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
 | `contracts/Timelocked.sol` | 51 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
@@ -29,7 +29,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/libraries/SafeTransfer.sol` | 31 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,016** | 1,927 written for Covenza + 89 vendored |
+| **Total** | **2,078** | 1,989 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -94,7 +94,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**299 tests** across 16 suites.
+**311 tests** across 17 suites.
 
 ```bash
 npm install
@@ -111,13 +111,14 @@ npx hardhat test
 | `Interest.test.js` | 11 | Annualised interest and minimum charge |
 | `KYCRegistry.test.js` | 46 | Attester signatures, revocation, two-step operator transfer, timelocked attesters, status |
 | `Mandates.test.js` | 34 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface, total capacity |
-| `ProductionGuards.test.js` | 11 | Deploy guards |
+| `ProductionGuards.test.js` | 12 | Deploy guards, including outage detection left on |
 | `RiskTiers.test.js` | 25 | Tier floors, term limits, exposure caps, tier history (both directions) |
 | `TwapGuard.test.js` | 13 | Unquotable and manipulated pools; only the approved pool per pair |
 | `YieldVenue.test.js` | 14 | Aave and ERC-4626 venues, per-asset grace |
 | `AdminTimelocks.test.js` | 14 | Insurance-pool factory changes are timelocked; integration addresses cannot be repointed |
 | `KraitFindings.test.js` | 16 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool; settlement cannot be stalled (approved pool, held-amount record, full-exit check); measured swap output |
 | `TokenSafety.test.js` | 9 | USDT-style tokens through a whole loan; `false`-returning and code-less tokens still fail; timelock approvals lapse after 14 days |
+| `OutageGrace.test.js` | 11 | Sequencer outages: grace extended by lost time, keeper's own settle records the outage first, recovery hold for keepers only, bounty from recovery, 72-hour cap, config bounds |
 | `ParameterTimelocks.test.js` | 16 | Live-loan parameters wait on a real 48-hour timelock by direction; exposure cap uses the worst tier since origination |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
@@ -165,6 +166,7 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **Insurance has no aggregate limit.** The draw cap limits each settlement, but nothing limits total draws, so correlated losses would drain a reserve first-come-first-served. A reserve-ratio floor is the intended fix and needs actuarial modelling first. `scripts/model-insurance-solvency.js` holds the current model.
 - **Governance Safes are 1-of-1.** Co-signers must be added before mainnet.
 - **The ERC-4626 venue on testnet is a mock.** No real venue exists on Robinhood Chain yet; mainnet ships with none.
+- **Outage detection depends on a heartbeat bot.** `AssetRegistry.heartbeat()` must be called every few minutes (`scripts/heartbeat-bot.js`, planned). If it stops, quiet periods are read as outages: the parties get extra time and keepers wait, capped at 72 hours per loan. Nobody is locked out, but the keeper backstop slows.
 - **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
 - **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
 - **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool or a new yield venue); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. The **per-asset grace extension** is still instant, pending a design decision. Item 12.
@@ -180,7 +182,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 299 tests, 16 suites
+test/                 311 tests, 17 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)

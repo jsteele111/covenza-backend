@@ -925,6 +925,13 @@ contract Vault {
     function settle() external {
         require(!isSettled, "Loan already settled");
 
+        // First, so that if this is the first transaction after a sequencer
+        // outage, the outage is on record before any window below is read
+        // (item 16). If this call then reverts, the record reverts with it;
+        // a keeper held off by the recovery period must call heartbeat()
+        // directly and wait.
+        registry.heartbeat();
+
         bool early = block.timestamp <= deadline;
         uint256 bounty = 0;
 
@@ -938,12 +945,16 @@ contract Vault {
             require(depositPaid(), "Deposit was never paid - use cancel()");
 
             if (heldAssets.length > 0) {
-                uint256 graceEnd = deadline + _effectiveGracePeriod();
+                // Grace extended by any recorded outage that consumed it;
+                // keepers additionally held off until the chain has recovered.
+                (uint256 graceEnd, uint256 keeperFrom) =
+                    registry.settlementWindow(deadline, deadline + _effectiveGracePeriod());
+                bool party = msg.sender == lender || msg.sender == borrower;
                 if (block.timestamp <= graceEnd) {
-                    require(msg.sender == lender || msg.sender == borrower,
-                        "Grace period: only lender or borrower may settle");
-                } else if (msg.sender != lender && msg.sender != borrower) {
-                    bounty = _accruedBounty(graceEnd);
+                    require(party, "Grace period: only lender or borrower may settle");
+                } else if (!party) {
+                    require(block.timestamp >= keeperFrom, "Chain recovering from an outage");
+                    bounty = _accruedBounty(keeperFrom);
                 }
             }
         }
