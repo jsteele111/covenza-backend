@@ -162,21 +162,41 @@ The earlier Arbitrum Sepolia deployment predates mandates and risk tiers and is 
 
 ---
 
+## Heartbeat bot
+
+Outage detection (item 16) needs `AssetRegistry.heartbeat()` called every
+5 minutes. `scripts/heartbeat-bot.js` does that, skips when a heartbeat landed
+in the last 4 minutes, retries after a failure, and sends a Telegram message
+when it starts or stops, when an outage is recorded, after 3 failures in a
+row, on recovery, and when its balance falls below 0.002 ETH.
+
+```bash
+node scripts/generate-heartbeat-key.js      # writes HEARTBEAT_PRIVATE_KEY to .env, prints the address to fund
+node scripts/heartbeat-bot.js --test-alert  # needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+node scripts/heartbeat-bot.js --once        # one heartbeat, to check the setup
+npm install -g pm2
+pm2 start ecosystem.config.js               # testnet; add --env mainnet for mainnet
+pm2 logs covenza-heartbeat
+```
+
+The bot's key holds gas money only; anyone may call `heartbeat()`. Each call
+is about 28,600 gas. Mainnet needs an always-on host.
+
 ## Known limitations
 
 Stated plainly, because a reviewer will find them anyway. The full self-review is in [`MAINNET-READINESS.md`](MAINNET-READINESS.md).
 
 - **No independent audit yet.**
 - **Tier parameters are placeholders.** Assumed volatilities and exposure caps are pending empirical calibration.
-- **Insurance has no aggregate limit.** The draw cap limits each settlement, but nothing limits total draws, so correlated losses would drain a reserve first-come-first-served. A reserve-ratio floor is the intended fix and needs actuarial modelling first. `scripts/model-insurance-solvency.js` holds the current model.
+- **Insurance payouts still depend on order.** Each draw is capped at 10% of the loan's principal and at 5% of what is left in the reserve, so a run of losses cannot empty the pool and every lender receives something, but earlier claimants receive more. Premiums are modelled, not yet calibrated against real losses (`scripts/model-insurance-solvency.js`). Item 8.
 - **Governance Safes are 1-of-1.** Co-signers must be added before mainnet.
 - **The ERC-4626 venue on testnet is a mock.** No real venue exists on Robinhood Chain yet; mainnet ships with none.
-- **Outage detection depends on a heartbeat bot.** `AssetRegistry.heartbeat()` must be called every few minutes (`scripts/heartbeat-bot.js`, planned). If it stops, quiet periods are read as outages: the parties get extra time and keepers wait, capped at 72 hours per loan. Nobody is locked out, but the keeper backstop slows.
+- **Outage detection depends on a heartbeat bot.** `scripts/heartbeat-bot.js` calls `AssetRegistry.heartbeat()` every 5 minutes, under pm2, with Telegram alerts (see *Heartbeat bot* above). If it stops, quiet periods are read as outages: the parties get extra time and keepers wait, capped at 72 hours per loan. Nobody is locked out, but the keeper backstop slows.
 - **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
 - **No commercial identity provider is integrated yet.** Attester curation is the main control on who can borrow; attestations now expire within a year and carry the claims checked. A ZK adapter can be added later behind the same interface.
 - **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool or a new yield venue); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. The **per-asset grace extension** is still instant, pending a design decision. Item 12.
 - **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
-- **Settlement has no fallback if a held asset cannot be swapped back**, for example a tokenised equity frozen by its issuer. The loan stays unsettled until it can be. Item 14.
+- **A held asset that cannot be sold is handed over in kind.** If a forced swap-back cannot complete (a frozen tokenised equity, a dead pool), anyone may call `settleInKind()` 7 days after keepers could first settle: the lender gets the cash and then the asset at its TWAP value up to what they are owed, and a frozen token is claimable once it moves. The lender may end up holding the asset rather than cash. Item 14.
 
 ---
 

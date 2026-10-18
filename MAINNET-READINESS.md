@@ -640,6 +640,13 @@ receives the asset" rather than "nobody receives anything".
 > period must call `heartbeat()` itself and wait, because a reverted
 > `settle()` also reverts the outage record. No sequencer uptime feed is
 > assumed to exist on Robinhood Chain.
+>
+> **Bot built (18 October 2026):** `scripts/heartbeat-bot.js` under pm2
+> (`ecosystem.config.js`), with its own gas-only key and Telegram alerts on
+> start, stop, recorded outage, 3 consecutive failures, recovery and low
+> balance. It measures the gap by wall-clock time, not the latest block's,
+> because an idle Arbitrum-style chain makes no blocks. Mainnet needs an
+> always-on host.
 
 
 Robinhood Chain is an Arbitrum Orbit L2 with a single sequencer. While it is
@@ -829,10 +836,14 @@ full post-swap balance in the exit direction, not just the increment.
 **Done (18 October 2026, later):** item 14 (in-kind settlement) and item 8's
 aggregate limit (per-draw reserve share). 353 tests passing.
 
-**Before freeze:** the per-asset grace decision (item 12), the heartbeat bot
-(item 16), and the deployment scripts (`redeploy-factory-v21.js`, pool approvals,
-announcing timelocked changes, deploying `VaultLens`). All four Krait
-observations are closed. Item 8's premium calibration remains modelling work.
+**Done (18 October 2026, later still):** deployment scripts (approved pool per
+pair, announce-then-execute for timelocked calls via `scripts/lib/timelock.js`
+and `execute-timelocked.js`, `VaultLens` in the factory redeploy) and the
+heartbeat bot (item 16).
+
+**Before freeze:** the per-asset grace decision (item 12), Foundry invariant
+tests, and retiring outdated scripts. All four Krait observations are closed.
+Item 8's premium calibration remains modelling work.
 
 The KYC adapter work is
 **done (18 October 2026)**: `IIdentityAdapter`, expiring claim-bearing EIP-712
