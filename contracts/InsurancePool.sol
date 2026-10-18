@@ -64,10 +64,30 @@ contract InsurancePool is Timelocked, OperatorControlled {
     ///         the loan's principal (e.g. 1000 = 10% of principal).
     uint256 public drawCapBps;
 
+    /**
+     * @notice Most any one draw may take, as a share of the asset's reserve at
+     *         that moment, in basis points. 500 = 5%.
+     *
+     * @dev    Item 8. drawCapBps limits a draw against the loan's principal,
+     *         but nothing limited the total: in a market-wide loss the pool
+     *         paid whoever settled first in full, and the later lenders found
+     *         it empty. Capping each draw at a share of what is LEFT means the
+     *         pool can never be emptied by one settlement or a run of them;
+     *         every lender gets something, though earlier ones still get more.
+     *         It slows the drain rather than making payouts equal.
+     *
+     *         While the reserve is large next to loan sizes this never binds:
+     *         5% of the reserve exceeds drawCapBps of any one principal. It
+     *         binds when the pool is small or depleted, which is exactly when
+     *         first-come-first-served did the damage.
+     */
+    uint256 public maxDrawShareBps = 500;
+
     // --- Events ---
 
     event VaultFactoryUpdated(address indexed previousFactory, address indexed newFactory);
     event DrawCapUpdated(uint256 previousBps, uint256 newBps);
+    event DrawShareUpdated(uint256 previousBps, uint256 newBps);
     event VaultRegistered(address indexed vault);
     event Funded(address indexed asset, address indexed from, uint256 amount);
     event Drawn(address indexed asset, address indexed vault, uint256 requested, uint256 paid);
@@ -170,6 +190,17 @@ contract InsurancePool is Timelocked, OperatorControlled {
     }
 
     /// @notice Announces a timelocked change by the hash of its calldata.
+    /// @notice Sets maxDrawShareBps. Timelocked in both directions, like the
+    ///         draw cap: raising it lets early claimants take more, lowering
+    ///         it pays a lender with a loss already under way less.
+    function setMaxDrawShareBps(uint256 _newBps) external onlyOperator {
+        require(_newBps > 0 && _newBps <= 10000, "Draw share must be 1-10000 bps");
+        _consumeIfDelayed(keccak256(msg.data));
+        uint256 previous = maxDrawShareBps;
+        maxDrawShareBps = _newBps;
+        emit DrawShareUpdated(previous, _newBps);
+    }
+
     function queueAction(bytes32 _id) external onlyOperator { _queue(_id); }
 
     /// @notice Abandons an announced change. Instant: it reduces risk.
@@ -216,7 +247,7 @@ contract InsurancePool is Timelocked, OperatorControlled {
      *         The amount actually paid is the smallest of:
      *           1. the requested shortfall,
      *           2. the draw cap (drawCapBps of the loan's principal),
-     *           3. the asset's current reserve balance.
+     *           3. maxDrawShareBps of the asset's current reserve (item 8).
      *
      *         Never reverts for lack of funds — pays what it can and reports
      *         the actual amount, so settlement always completes. The pool
@@ -238,11 +269,12 @@ contract InsurancePool is Timelocked, OperatorControlled {
         require(asset != address(0), "Invalid asset");
         require(shortfall > 0, "Shortfall must be greater than zero");
 
-        uint256 cap = (principal * drawCapBps) / 10000;
+        uint256 cap   = (principal * drawCapBps) / 10000;
+        uint256 share = (reserveOf[asset] * maxDrawShareBps) / 10000;
 
         paid = shortfall;
-        if (paid > cap)               { paid = cap; }
-        if (paid > reserveOf[asset])  { paid = reserveOf[asset]; }
+        if (paid > cap)   { paid = cap; }
+        if (paid > share) { paid = share; }
 
         if (paid > 0) {
             reserveOf[asset] -= paid;

@@ -107,6 +107,10 @@ describe("TWAP availability guard", function () {
       libraries: { UniswapTwap: await twapLib.getAddress() },
     })).deploy();
     await vaultImpl.waitForDeployment();
+    const lens = await (await ethers.getContractFactory("VaultLens", {
+      signer: operator,
+      libraries: { UniswapTwap: await twapLib.getAddress() },
+    })).deploy();
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address,
@@ -136,7 +140,7 @@ describe("TWAP availability guard", function () {
     }
 
     return { operator, lender, borrower, weth, usdx, router, uniFactory, uniPool,
-             registry, vault, poolWithWindow };
+             registry, vault, lens, poolWithWindow };
   }
 
   // --- Rejection cases ---
@@ -238,10 +242,10 @@ describe("TWAP availability guard", function () {
   // replaced, so these tests pin the not-quotable path as hard as the happy one.
 
   it("Quotes a prospective swap at the TWAP, with the vault's own floor", async function () {
-    const { vault, usdx, registry } = await loadFixture(fixture);
+    const { vault, lens, usdx, registry } = await loadFixture(fixture);
 
     const [quotable, twapOut, minimumOut] =
-      await vault.quoteSwapOut(await usdx.getAddress(), E("1"), POOL_FEE);
+      await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), E("1"), POOL_FEE);
 
     expect(quotable).to.equal(true);
     expect(twapOut).to.be.greaterThan(0n);
@@ -254,11 +258,11 @@ describe("TWAP availability guard", function () {
   });
 
   it("Reports not-quotable rather than reverting when the pool has no history", async function () {
-    const { vault, usdx, poolWithWindow } = await loadFixture(fixture);
+    const { vault, lens, usdx, poolWithWindow } = await loadFixture(fixture);
     await poolWithWindow(0);
 
     const [quotable, twapOut, minimumOut] =
-      await vault.quoteSwapOut(await usdx.getAddress(), E("1"), ALT_FEE);
+      await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), E("1"), ALT_FEE);
 
     expect(quotable).to.equal(false);
     expect(twapOut).to.equal(0n);
@@ -266,16 +270,16 @@ describe("TWAP availability guard", function () {
   });
 
   it("Reports not-quotable for a fee tier with no pool at all", async function () {
-    const { vault, usdx } = await loadFixture(fixture);
+    const { vault, lens, usdx } = await loadFixture(fixture);
 
-    const [quotable] = await vault.quoteSwapOut(await usdx.getAddress(), E("1"), ALT_FEE);
+    const [quotable] = await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), E("1"), ALT_FEE);
     expect(quotable).to.equal(false);
   });
 
   it("Agrees with the swap itself — a quote at the floor is accepted", async function () {
-    const { vault, borrower, usdx } = await loadFixture(fixture);
+    const { vault, lens, borrower, usdx } = await loadFixture(fixture);
 
-    const [, , minimumOut] = await vault.quoteSwapOut(await usdx.getAddress(), E("1"), POOL_FEE);
+    const [, , minimumOut] = await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), E("1"), POOL_FEE);
 
     // The contract is the authority; this asserts the view does not promise
     // something the swap then refuses.
@@ -285,9 +289,9 @@ describe("TWAP availability guard", function () {
   });
 
   it("Returns nothing for a zero amount rather than dividing by it", async function () {
-    const { vault, usdx } = await loadFixture(fixture);
+    const { vault, lens, usdx } = await loadFixture(fixture);
 
-    const [quotable, twapOut] = await vault.quoteSwapOut(await usdx.getAddress(), 0n, POOL_FEE);
+    const [quotable, twapOut] = await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), 0n, POOL_FEE);
     expect(quotable).to.equal(false);
     expect(twapOut).to.equal(0n);
   });

@@ -259,7 +259,22 @@ assert that rather than trusting the operator to remember.
 
 ---
 
-## 8. Insurance pool solvency is untested at scale — MEDIUM — **MODELLED, one fix applied**
+## 8. Insurance pool solvency is untested at scale — MEDIUM — **MODELLED; aggregate drain limited (18 October 2026)**
+
+> **Aggregate limit (18 October 2026).** `InsurancePool.maxDrawShareBps`
+> (default 500 = 5%) caps every draw at a share of the asset's reserve as it
+> stands at that moment, on top of the per-loan `drawCapBps`. A run of claims
+> can no longer empty the pool: in a 40-claim crash on a 20-unit reserve, where
+> first-come-first-served paid the first 20 in full and the last 20 nothing,
+> the first is paid in full, the fortieth about 13.5% of its claim, and 2.57
+> remains. It slows the drain rather than equalising payouts: order still
+> matters. While the reserve is large next to loan sizes it never binds; on a
+> young or depleted pool it does, by design. Timelocked in both directions.
+> Seven tests in `DrawShare.test.js`. Chosen over coverage-ratio scaling (fairer,
+> but needs the pool to track every live loan's maximum claim, touching the
+> factory and the Vault) for pre-audit simplicity. Premium calibration below
+> stands.
+
 
 > `scripts/model-insurance-solvency.js` compares modelled expected draw against
 > premium income, reading tier parameters off the live registry.
@@ -297,8 +312,9 @@ settle finds it empty.
 The only inflows are borrower premiums and grants. Nothing models whether
 premiums cover expected draws.
 
-**Fix (needs thought, not code):** a reserve-ratio floor below which draws are
-scaled down rather than served first-come-first-served, and a premium model
+**Fix (needs thought, not code):** ~~a reserve-ratio floor below which draws are
+scaled down rather than served first-come-first-served~~ (done as a per-draw
+reserve share, above), and a premium model
 calibrated against the tier volatilities already in the registry. This is
 actuarial work, not engineering, and doing the engineering first would be
 building the wrong thing.
@@ -361,13 +377,13 @@ first review did not walk.
 | 11 | Swap router and Uniswap factory repointable under live vaults | HIGH | **FIXED** |
 | 12 | Other live-loan parameters change instantly | MEDIUM | **FIXED** (per-asset grace pending) |
 | 13 | A mandate can be filled repeatedly | MEDIUM | **FIXED** |
-| 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
+| 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | **FIXED** (in-kind settlement) |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
 | 16 | Sequencer downtime can consume the grace window | MEDIUM | **FIXED** (needs a heartbeat bot) |
 | 17 | Swaps trust the router's minimum-output check | LOW | **FIXED** |
 | 18 | `swapBack` had no price floor: borrower could drain principal (KRAIT-001) | CRITICAL | **FIXED** |
 | 19 | Insurance paid unpaid interest at a lender-chosen APR (KRAIT-002) | HIGH | **FIXED** |
-| 20 | Borrower can make forced swap-back revert at will (KRAIT-003) | MEDIUM | **FIXED** (residual: see item 14) |
+| 20 | Borrower can make forced swap-back revert at will (KRAIT-003) | MEDIUM | **FIXED** (residual covered by item 14) |
 
 Items 16 and 17 surfaced while completing the Krait readiness assessment
 (report: https://krait.zealynx.io/shared/mEyG-WH0MhK1), after items 10–15 were
@@ -507,7 +523,41 @@ the excess. Either way, make the UI and the getter say which it is.
 
 ---
 
-## 14. Settlement has no fallback when swap-back is impossible — MEDIUM — open, design
+## 14. Settlement has no fallback when swap-back is impossible — MEDIUM — **FIXED** (18 October 2026)
+
+> `Vault.settleInKind()` is a last-resort settlement, open to anyone from
+> `inKindFrom()`: `IN_KIND_DELAY` (7 days) after keepers could first settle,
+> including any outage extension, so it never cuts a normal path short.
+> `settle()` stays available throughout.
+>
+> 1. Each held asset is sold at the TWAP floor if it can be, each attempt
+>    isolated (`exitHeld`, a self-call), so one refusing asset no longer
+>    blocks the rest.
+> 2. Cash pays the lender first, up to principal plus accrued interest;
+>    surplus cash goes to the borrower.
+> 3. Each unsold asset goes to the lender up to what is still owed, valued at
+>    the TWAP, the rest to the borrower. Priced assets are allocated first.
+> 4. An asset with no TWAP goes wholly to the lender if anything is still
+>    owed, otherwise to the borrower.
+>
+> Insurance is drawn only on the shortfall after counting in-kind assets at
+> TWAP value, and only when every asset could be priced: an unpriceable asset
+> could be worth anything, and a claim on top of it could pay twice. No keeper
+> bounty and no protocol fee on this path. A token that refuses even the
+> in-kind transfer (issuer freeze) is recorded in `inKindOwed` and claimed with
+> `claimInKind()` once it moves; the cash goes out regardless.
+>
+> **Out of scope:** an ERC-4626 venue that cannot redeem still reverts this
+> path. Mainnet ships with every venue `None`, enforced by the production
+> guard.
+>
+> **Contract size:** Vault went over the 24,576-byte limit. The exit floor was
+> consolidated into one helper and `quoteSwapOut` (a read-only view) moved to a
+> new `VaultLens` contract. Vault is now 23,965 bytes; the interface must call
+> `VaultLens.quoteSwapOut(vault, …)`.
+>
+> Eleven tests in `InKindSettlement.test.js`.
+
 
 `settle()` reverts in full if any step of the forced exit fails:
 
@@ -776,12 +826,15 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 16, 17 and 20, the KYC adapter redesign, and four Krait observations. 335 tests passing.
 
+**Done (18 October 2026, later):** item 14 (in-kind settlement) and item 8's
+aggregate limit (per-draw reserve share). 353 tests passing.
+
 **Before freeze:** the per-asset grace decision (item 12), the heartbeat bot
 (item 16), and the deployment scripts (`redeploy-factory-v21.js`, pool approvals,
-announcing timelocked changes). All four Krait observations are closed.
+announcing timelocked changes, deploying `VaultLens`). All four Krait
+observations are closed. Item 8's premium calibration remains modelling work.
 
-**Design first:** item 14 (settlement fallback for frozen or unswappable
-assets), alongside item 8 (insurance solvency). The KYC adapter work is
+The KYC adapter work is
 **done (18 October 2026)**: `IIdentityAdapter`, expiring claim-bearing EIP-712
 attestations checked at origination, lender screening, and the manual-grant
 safeguards. See `KYCRegistry.sol` and `IdentityAdapter.test.js`.

@@ -103,6 +103,9 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000, 0); // draw cap 10% of principal
+    // Per-draw reserve share (item 8) lifted to 100%, so these tests isolate
+    // the per-loan cap. The share limit has its own suite (DrawShare.test.js).
+    await pool.setMaxDrawShareBps(10000);
 
     // Vaults are EIP-1167 clones of one implementation, so the factory no
     // longer embeds Vault bytecode and needs no library link. The

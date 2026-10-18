@@ -44,6 +44,13 @@ library SafeTransfer {
         );
     }
 
+    /// @dev As safeTransfer, but reports failure instead of reverting. Used
+    ///      only where a refusing token must not block everything else: the
+    ///      in-kind settlement of an asset whose issuer has frozen it.
+    function trySafeTransfer(address token, address to, uint256 amount) internal returns (bool) {
+        return _succeeded(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
     function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
         require(
             _succeeded(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)),

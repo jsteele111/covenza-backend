@@ -19,18 +19,19 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 585 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
+| `contracts/Vault.sol` | 674 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall, last-resort in-kind settlement (unsellable assets handed over at TWAP value; frozen tokens claimable later) |
 | `contracts/VaultFactory.sol` | 566 | Clones vaults from one implementation. identity gating through `IIdentityAdapter` (borrowers need all three claims, lenders sanctions screening; loosening is timelocked), whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 431 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 190 | Identity adapter backed by third-party attesters. EIP-712 attestations bound to chain and contract, carrying claim flags (KYC, sanctions, jurisdiction) and an expiry of at most 365 days, checked at every origination. Timelocked attester additions and rotations. Manual grants: timelocked, 30 days, once per wallet per year, case reference on chain, marked manual, at most 5 per 30 days. No identity data stored |
-| `contracts/InsurancePool.sol` | 105 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
+| `contracts/InsurancePool.sol` | 115 | Per-asset reserves, draws capped as a % of principal and as a share of the remaining reserve (so no run of claims empties it), vault-only draws, timelocked withdrawals, factory and draw-limit changes |
 | `contracts/Timelocked.sol` | 51 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
+| `contracts/VaultLens.sol` | 37 | Read-only swap quote for the interface (`quoteSwapOut`). Holds no state; nothing in the protocol calls it. Moved off Vault for contract size |
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/interfaces/IIdentityAdapter.sol` | 10 | The one identity question the protocol asks (`isEligible(wallet, claims)`), and the claim flags. Lets a ZK adapter replace KYCRegistry without changing the lending contracts |
-| `contracts/libraries/SafeTransfer.sol` | 31 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code |
+| `contracts/libraries/SafeTransfer.sol` | 34 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code. A non-reverting variant for in-kind hand-over of frozen tokens |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,151** | 2,062 written for Covenza + 89 vendored |
+| **Total** | **2,290** | 2,201 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -95,7 +96,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**335 tests** across 18 suites.
+**353 tests** across 20 suites.
 
 ```bash
 npm install
@@ -115,12 +116,14 @@ npx hardhat test
 | `Mandates.test.js` | 34 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface, total capacity |
 | `ProductionGuards.test.js` | 12 | Deploy guards, including outage detection left on |
 | `RiskTiers.test.js` | 25 | Tier floors, term limits, exposure caps, tier history (both directions) |
-| `TwapGuard.test.js` | 13 | Unquotable and manipulated pools; only the approved pool per pair |
+| `TwapGuard.test.js` | 13 | Unquotable and manipulated pools; only the approved pool per pair; the lens quote agrees with the swap |
 | `YieldVenue.test.js` | 14 | Aave and ERC-4626 venues, per-asset grace |
 | `AdminTimelocks.test.js` | 14 | Insurance-pool factory changes are timelocked; integration addresses cannot be repointed |
 | `KraitFindings.test.js` | 16 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool; settlement cannot be stalled (approved pool, held-amount record, full-exit check); measured swap output |
 | `TokenSafety.test.js` | 9 | USDT-style tokens through a whole loan; `false`-returning and code-less tokens still fail; timelock approvals lapse after 14 days |
 | `OutageGrace.test.js` | 11 | Sequencer outages: grace extended by lost time, keeper's own settle records the outage first, recovery hold for keepers only, bounty from recovery, 72-hour cap, config bounds |
+| `InKindSettlement.test.js` | 11 | Item 14: opens 7 days after keepers could settle; cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender with no insurance draw; insurance only on the shortfall after in-kind value |
+| `DrawShare.test.js` | 7 | Item 8: each insurance draw limited to 5% of the remaining reserve; a 40-claim crash pays everyone something; timelocked both ways |
 | `ParameterTimelocks.test.js` | 16 | Live-loan parameters wait on a real 48-hour timelock by direction; exposure cap uses the worst tier since origination |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
@@ -184,7 +187,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 335 tests, 18 suites
+test/                 353 tests, 20 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)

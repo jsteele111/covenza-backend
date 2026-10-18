@@ -263,6 +263,14 @@ async function main() {
   console.log(`\nUniswapTwap lib ${await twapLib.getAddress()}`);
   console.log(`Vault impl      ${await vaultImpl.getAddress()} (clone source, never initialised)`);
 
+  // Read-only quote helper for the swap form (moved off Vault for size).
+  const lens = await (await ethers.getContractFactory("VaultLens", {
+    signer: deployer,
+    libraries: { UniswapTwap: await twapLib.getAddress() },
+  })).deploy();
+  await lens.waitForDeployment();
+  console.log(`VaultLens       ${await lens.getAddress()}`);
+
   const factory = await (await ethers.getContractFactory("VaultFactory", deployer)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury,
     await vaultImpl.getAddress()
@@ -342,6 +350,7 @@ async function main() {
     // because the implementation is what a verifier should be pointed at —
     // clones carry no code of their own for an explorer to show.
     vaultImplementation: await vaultImpl.getAddress(),
+    vaultLens: await lens.getAddress(),
     uniswapTwapLibrary:  await twapLib.getAddress(),
     treasury,
     yieldVenue4626: venueAddress,

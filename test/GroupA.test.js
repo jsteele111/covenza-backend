@@ -168,6 +168,9 @@ describe("Group A — InsurancePool", function () {
 
     const Pool = await ethers.getContractFactory("InsurancePool", operator);
     const pool = await Pool.deploy(operator.address, DRAW_CAP_BPS, 0);
+    // Per-draw reserve share (item 8) lifted to 100%, so these tests isolate
+    // the per-loan cap. The share limit has its own suite (DrawShare.test.js).
+    await pool.setMaxDrawShareBps(10000);
 
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const usdc = await Mock.deploy("Mock USDC", "USDC", 6);

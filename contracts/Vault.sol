@@ -267,6 +267,21 @@ contract Vault {
     uint256 public settledProtocolFee;     // paid to treasury at settlement
     uint256 public settledReferrerFee;     // paid to referrer at settlement
 
+    // --- In-kind settlement (item 14) ---
+
+    /// @notice How long after keepers could first settle before the last-resort
+    ///         in-kind settlement opens. Longer than the 72-hour outage cap and
+    ///         any weekend grace, so it can never cut a normal path short.
+    uint256 public constant IN_KIND_DELAY = 7 days;
+
+    /// @notice True when the loan was closed by settleInKind().
+    bool public settledInKind;
+
+    /// @notice Held tokens allocated in kind that could not be transferred at
+    ///         settlement (a frozen token), by token and recipient. Claimable
+    ///         with claimInKind() once the token moves again.
+    mapping(address => mapping(address => uint256)) public inKindOwed;
+
     // --- Events ---
 
     event VaultInitialised(address indexed lender, address indexed borrower, address indexed asset,
@@ -284,6 +299,9 @@ contract Vault {
         uint256 lenderPayout, uint256 borrowerPayout, uint256 fee, uint256 bounty, uint256 timestamp);
     event ProtocolFeePaid(address indexed treasury, address indexed referrer,
         uint256 treasuryAmount, uint256 referrerAmount);
+    event InKindAllocated(address indexed token, uint256 toLender, uint256 toBorrower,
+        uint256 twapValue, bool priced);
+    event InKindClaimed(address indexed token, address indexed to, uint256 amount);
 
     // --- Constructor ---
 
@@ -774,10 +792,7 @@ contract Vault {
      */
     function _enforceExitable(address held, uint24 feeTier) internal {
         uint256 amount = heldAmount[held];
-        uint256 twapOut = UniswapTwap.quote(
-            registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
-        );
-        uint256 floorOut = (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+        uint256 floorOut = _exitFloor(held, amount, feeTier);
 
         uint256 simulatedOut;
         try this.simulateExit(held, amount, feeTier) {
@@ -838,10 +853,7 @@ contract Vault {
         require(amountIn <= heldAmount[heldAsset], "Exceeds the amount this vault bought");
 
         uint24 feeTier = swapFeeTierOf[heldAsset];
-        uint256 twapOut = UniswapTwap.quote(
-            registry.uniswapFactory(), heldAsset, asset, feeTier, amountIn, registry.twapWindow()
-        );
-        uint256 floorOut = (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+        uint256 floorOut = _exitFloor(heldAsset, amountIn, feeTier);
         if (minAmountOut < floorOut) { minAmountOut = floorOut; }
 
         uint256 amountOut = _executeSwap(heldAsset, asset, amountIn, minAmountOut, feeTier);
@@ -967,6 +979,191 @@ contract Vault {
         _distribute(early, bounty);
     }
 
+    /**
+     * @notice When the last-resort in-kind settlement opens: IN_KIND_DELAY
+     *         after keepers could first settle, including any outage
+     *         extension and recovery period.
+     */
+    function inKindFrom() public view returns (uint256) {
+        (, uint256 keeperFrom) = registry.settlementWindow(deadline, deadline + _effectiveGracePeriod());
+        return keeperFrom + IN_KIND_DELAY;
+    }
+
+    /**
+     * @notice Last-resort settlement for a vault whose forced exit cannot
+     *         complete — a held asset frozen by its issuer, or a pool too thin
+     *         or too far from its TWAP to sell into. Callable by anyone, once
+     *         inKindFrom() has passed. settle() remains available throughout;
+     *         whichever succeeds first closes the loan.
+     *
+     * @dev    Item 14. Without it settle() reverts in full for as long as any
+     *         one asset cannot be sold, and nothing bounds that: the lender
+     *         receives nothing, not even the cash already in the vault. This
+     *         turns the worst case into "the lender receives the asset".
+     *
+     *         1. Every held asset the vault CAN sell at the TWAP floor is sold,
+     *            exactly as settle() would. Each attempt is isolated, so one
+     *            refusing asset no longer blocks the rest.
+     *         2. The cash pays the lender first, up to principal plus accrued
+     *            interest. Any cash beyond that goes to the borrower.
+     *         3. Each unsold asset goes to the lender up to what they are still
+     *            owed, valued at the TWAP, and the rest to the borrower. Priced
+     *            assets are allocated before unpriceable ones.
+     *         4. An asset with no TWAP at all (its pool is gone) cannot be
+     *            valued, so the lender receives all of it if anything is still
+     *            owed, and the borrower receives it otherwise.
+     *
+     *         INSURANCE is drawn only on the shortfall that remains after the
+     *         in-kind assets are counted at their TWAP value, and only when
+     *         every asset could be priced. An unpriceable asset might be worth
+     *         anything, and paying a claim on top of handing it over would let
+     *         a borrower who drained their own pool collect twice.
+     *
+     *         No keeper bounty and no protocol fee: this is a rescue, and the
+     *         lender has every reason to call it themselves.
+     *
+     *         A frozen token may refuse even the in-kind transfer. Its share
+     *         is then recorded in inKindOwed and the recipient claims it with
+     *         claimInKind() when the freeze lifts. The cash goes out regardless.
+     *
+     *         OUT OF SCOPE: a yield venue that cannot redeem still reverts this
+     *         path. Mainnet ships with every venue set to None (enforced by
+     *         the production deployment guard), so no vault can be in that
+     *         state; a real venue reopens the question.
+     */
+    function settleInKind() external {
+        require(!isSettled, "Loan already settled");
+        registry.heartbeat();
+        require(depositPaid(), "Deposit was never paid - use cancel()");
+        require(heldAssets.length > 0, "Nothing held - use settle()");
+        require(block.timestamp >= inKindFrom(), "In-kind settlement not yet open");
+
+        isSettled = true; // before external calls — reentrancy guard
+        settledInKind = true;
+
+        // 1. Sell what can be sold. What cannot stays in heldAssets.
+        for (uint256 i = heldAssets.length; i > 0; i--) {
+            address held = heldAssets[i - 1];
+            try this.exitHeld(held) {
+                heldAssets[i - 1] = heldAssets[heldAssets.length - 1];
+                _dropLastHeld(held);
+            } catch {}
+        }
+
+        _withdrawAllFromYield();
+
+        uint256 cash = IERC20(asset).balanceOf(address(this));
+        uint256 fee = accruedFee();
+        uint256 owed = principal + fee;
+
+        // 2. Insurance, on the shortfall after counting what is handed over.
+        uint256 insuranceDraw;
+        {
+            (uint256 pricedValue, bool allPriced) = _inKindValue();
+            if (allPriced && cash + pricedValue < principal) {
+                insuranceDraw = insurancePool.draw(asset, principal - cash - pricedValue, principal);
+            }
+        }
+
+        uint256 available = cash + insuranceDraw;
+        uint256 lenderCash = available < owed ? available : owed;
+        owed -= lenderCash;
+
+        settledTotalReturned  = cash;
+        settledInsuranceDraw  = insuranceDraw;
+        settledLenderPayout   = lenderCash;
+        settledBorrowerPayout = available - lenderCash;
+        settledFee            = fee;
+
+        if (lenderCash > 0) { SafeTransfer.safeTransfer(asset, lender, lenderCash); }
+        if (settledBorrowerPayout > 0) { SafeTransfer.safeTransfer(asset, borrower, settledBorrowerPayout); }
+
+        // 3 and 4. Priced assets first, then unpriceable ones.
+        owed = _allocateInKind(owed, true);
+        _allocateInKind(owed, false);
+
+        emit Settled(msg.sender, false, cash, insuranceDraw,
+            lenderCash, settledBorrowerPayout, fee, 0, block.timestamp);
+    }
+
+    /**
+     * @notice Internal use only: sells the whole of one held asset at the TWAP
+     *         floor. External so settleInKind() can isolate each attempt.
+     */
+    function exitHeld(address held) external {
+        require(msg.sender == address(this), "Only the vault itself");
+        _sellHeld(held, _sellableAmount(held));
+    }
+
+    /// @dev Whether `held` can be valued at the TWAP and, if so, the value of
+    ///      what settlement would hand over.
+    function _priceHeld(address held) internal view returns (bool priced, uint256 value) {
+        uint256 amount = _sellableAmount(held);
+        uint24 feeTier = swapFeeTierOf[held];
+        address uniFactory = registry.uniswapFactory();
+        uint32 window = registry.twapWindow();
+        if (!UniswapTwap.canQuote(uniFactory, held, asset, feeTier, window)) { return (false, 0); }
+        if (amount == 0) { return (true, 0); }
+        return (true, UniswapTwap.quote(uniFactory, held, asset, feeTier, amount, window));
+    }
+
+    function _inKindValue() internal view returns (uint256 total, bool allPriced) {
+        allPriced = true;
+        for (uint256 i = 0; i < heldAssets.length; i++) {
+            (bool priced, uint256 value) = _priceHeld(heldAssets[i]);
+            if (priced) { total += value; } else { allPriced = false; }
+        }
+    }
+
+    /// @dev Hands over every remaining held asset that is (or, with
+    ///      `pricedPass` false, is not) priceable, and forgets it. Returns what
+    ///      the lender is still owed.
+    function _allocateInKind(uint256 owed, bool pricedPass) internal returns (uint256) {
+        for (uint256 i = heldAssets.length; i > 0; i--) {
+            address held = heldAssets[i - 1];
+            (bool priced, uint256 value) = _priceHeld(held);
+            if (priced != pricedPass) { continue; }
+
+            uint256 amount = _sellableAmount(held);
+            uint256 toLender;
+            if (owed > 0) {
+                if (!priced || value <= owed) {
+                    toLender = amount;
+                    owed = priced ? owed - value : 0;
+                } else {
+                    toLender = (amount * owed) / value;
+                    owed = 0;
+                }
+            }
+
+            _handOver(held, lender, toLender);
+            _handOver(held, borrower, amount - toLender);
+            emit InKindAllocated(held, toLender, amount - toLender, value, priced);
+
+            heldAssets[i - 1] = heldAssets[heldAssets.length - 1];
+            _dropLastHeld(held);
+        }
+        return owed;
+    }
+
+    /// @dev Transfers, or records the entitlement if the token refuses.
+    function _handOver(address token, address to, uint256 amount) internal {
+        if (amount == 0) { return; }
+        if (!SafeTransfer.trySafeTransfer(token, to, amount)) {
+            inKindOwed[token][to] += amount;
+        }
+    }
+
+    /// @notice Claims a held token allocated in kind that could not be
+    ///         transferred at settlement. Reverts while the token still refuses.
+    function claimInKind(address token) external {
+        uint256 amount = inKindOwed[token][msg.sender];
+        require(amount > 0, "Nothing owed in kind");
+        inKindOwed[token][msg.sender] = 0;
+        SafeTransfer.safeTransfer(token, msg.sender, amount);
+        emit InKindClaimed(token, msg.sender, amount);
+    }
+
     /// @dev Settlement phase 2: computes the waterfall, stores the outcome,
     ///      and pays out. Separated from settle() to keep each function's
     ///      stack frame within EVM limits — and it reads better in an audit.
@@ -1074,36 +1271,50 @@ contract Vault {
     ///      the TWAP-implied value, or the whole settlement reverts.
     ///      Settlement happens in the loan asset, or not at all.
     function _forcedSwapBackAll() internal {
-        uint32 twapWindow = registry.twapWindow();
-        uint256 tolBps = registry.twapToleranceBps();
-
         while (heldAssets.length > 0) {
             address held = heldAssets[heldAssets.length - 1];
-
-            // Sell what the vault BOUGHT, not whatever it happens to hold.
-            // Selling the whole balance let anyone stall settlement by
-            // sending the vault more of the asset than the pool could absorb
-            // (KRAIT-003): the oversized sale missed the floor and reverted.
-            // Tokens sent in directly stay in the vault, untouched.
-            uint256 amount = heldAmount[held];
-            uint256 bal = IERC20(held).balanceOf(address(this));
-            if (bal < amount) { amount = bal; }
-
-            if (amount > 0) {
-                uint24 feeTier = swapFeeTierOf[held];
-                uint256 twapQuote = UniswapTwap.quote(
-                    registry.uniswapFactory(), held, asset, feeTier, amount, twapWindow
-                );
-                uint256 minOut = (twapQuote * (10000 - tolBps)) / 10000;
-
-                uint256 out = _executeSwap(held, asset, amount, minOut, feeTier);
-                emit ForcedSwapBack(held, amount, out);
-            }
-            heldAmount[held] = 0;
-            isHeld[held] = false;
-            delete swapFeeTierOf[held];
-            heldAssets.pop();
+            _sellHeld(held, _sellableAmount(held));
+            _dropLastHeld(held);
         }
+    }
+
+    /// @dev What settlement may sell of a held asset: what the vault BOUGHT,
+    ///      not whatever it happens to hold. Selling the whole balance let
+    ///      anyone stall settlement by sending the vault more of the asset
+    ///      than the pool could absorb (KRAIT-003): the oversized sale missed
+    ///      the floor and reverted. Tokens sent in directly stay untouched.
+    ///      Capped at the balance, in case an issuer has clawed some back.
+    function _sellableAmount(address held) internal view returns (uint256 amount) {
+        amount = heldAmount[held];
+        uint256 bal = IERC20(held).balanceOf(address(this));
+        if (bal < amount) { amount = bal; }
+    }
+
+    /// @dev Sells `amount` of `held` back to the loan asset at no worse than
+    ///      the TWAP floor, or reverts.
+    function _sellHeld(address held, uint256 amount) internal {
+        if (amount == 0) { return; }
+        uint24 feeTier = swapFeeTierOf[held];
+        uint256 out = _executeSwap(held, asset, amount, _exitFloor(held, amount, feeTier), feeTier);
+        emit ForcedSwapBack(held, amount, out);
+    }
+
+    /// @dev Forgets the LAST entry of heldAssets, which must be `held`.
+    function _dropLastHeld(address held) internal {
+        heldAmount[held] = 0;
+        isHeld[held] = false;
+        delete swapFeeTierOf[held];
+        heldAssets.pop();
+    }
+
+    /// @dev The least the vault accepts for selling `amount` of `held`: the
+    ///      TWAP-implied value less twapToleranceBps. One floor for every exit
+    ///      path — voluntary swap-back, the exit simulation, and settlement.
+    function _exitFloor(address held, uint256 amount, uint24 feeTier) internal view returns (uint256) {
+        uint256 twapOut = UniswapTwap.quote(
+            registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
+        );
+        return (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
     }
 
     /// @dev Withdraws the vault's full yield position, if any, from whichever
@@ -1171,67 +1382,8 @@ contract Vault {
 
     // --- Views ---
 
-    /**
-     * @notice What a prospective swap is worth at the TWAP, and the least the
-     *         vault will accept for it.
-     *
-     * @dev    Added so the borrower can set a minimum output that means
-     *         something. The swap form asks for one — it is their slippage
-     *         protection and it is enforced on chain — but nothing anywhere
-     *         exposed a price to set it against. The honest note on the form
-     *         said "there's no live price quote wired into this form, so set it
-     *         deliberately", which is candid and unhelpful: with no reference,
-     *         a borrower either guesses or enters a value low enough to be no
-     *         protection at all, which defeats the control the sentence is
-     *         explaining.
-     *
-     *         Returns rather than reverts when the pair cannot be quoted. An
-     *         unquotable pool is a real and expected state — a freshly created
-     *         pool has no observation history — and a view that reverts is one
-     *         the interface cannot distinguish from a network failure.
-     *
-     * @return quotable     whether the pool can serve the configured window
-     * @return twapOut      output implied by the time-weighted average price
-     * @return minimumOut   the least this vault accepts, i.e. twapOut less the
-     *                      entry-impact allowance. A minimum below this figure
-     *                      does not widen what is permitted; the vault refuses
-     *                      the swap either way.
-     */
-    function quoteSwapOut(address tokenOut, uint256 amountIn, uint24 poolFee)
-        external view
-        returns (bool quotable, uint256 twapOut, uint256 minimumOut)
-    {
-        if (amountIn == 0) return (false, 0, 0);
-
-        // Same pool rule as swap(): a quote for a pool the vault would refuse
-        // is not a quote.
-        uint24 approvedFee = isHeld[tokenOut]
-            ? swapFeeTierOf[tokenOut]
-            : registry.poolFeeTier(tokenOut, asset);
-        if (approvedFee == 0 || poolFee != approvedFee) return (false, 0, 0);
-
-        // Named uniFactory, not factory: this vault already has a `factory`
-        // state variable holding the VaultFactory, and shadowing it here would
-        // put two unrelated addresses behind one identifier in a pricing path.
-        address uniFactory = registry.uniswapFactory();
-        uint32  window     = registry.twapWindow();
-
-        // Checked in BOTH directions, matching swap(): the entry quote prices
-        // the position, and the swap-back quote is what settlement will need.
-        // A pair quotable one way and not the other would let a borrower open a
-        // position the vault could never close.
-        if (!UniswapTwap.canQuote(uniFactory, asset, tokenOut, poolFee, window)) return (false, 0, 0);
-        if (!UniswapTwap.canQuote(uniFactory, tokenOut, asset, poolFee, window)) return (false, 0, 0);
-
-        twapOut = UniswapTwap.quote(uniFactory, asset, tokenOut, poolFee, amountIn, window);
-
-        uint256 maxImpactBps = registry.maxEntryImpactBps();
-        minimumOut = maxImpactBps == 0
-            ? twapOut
-            : (twapOut * (10000 - maxImpactBps)) / 10000;
-
-        return (true, twapOut, minimumOut);
-    }
+    // quoteSwapOut moved to VaultLens.quoteSwapOut(vault, ...) to make
+    // room for item 14 under the contract size limit.
 
     function vaultBalance() external view returns (uint256) {
         return IERC20(asset).balanceOf(address(this));
