@@ -1,0 +1,47 @@
+{
+  "protocol": "Covenza",
+  "date": "2026-10-01",
+  "commit": "aee7316",
+  "findings": [
+    {
+      "id": "KRAIT-001",
+      "title": "swapBack has no TWAP floor: a borrower can drain principal through a self-sandwich",
+      "severity": "critical",
+      "file": "contracts/Vault.sol",
+      "line": 746,
+      "category": "custody-bypass",
+      "evidence": "POC-PASS",
+      "description": "swapBack is bounded only by the borrower-supplied minAmountOut (> 0). Swap entry and forced swap-back are TWAP-bounded; voluntary exit is not.",
+      "impact": "Lender loses principal down to deposit + capped insurance draw; PoC: owed 10.02, paid 4.58.",
+      "rootCause": "The slippage floor on the exit path is chosen by the party it should constrain.",
+      "recommendation": "Floor minAmountOut at TWAP x (1 - twapToleranceBps) in swapBack; fix the fee tier once an asset is held."
+    },
+    {
+      "id": "KRAIT-002",
+      "title": "Insurance pays unpaid interest at a lender-chosen, unbounded APR; one wallet acting as both lender and borrower drains the reserve",
+      "severity": "high",
+      "file": "contracts/Vault.sol",
+      "line": 864,
+      "category": "economic",
+      "evidence": "POC-PASS",
+      "description": "Insurance draws cover principal + accruedFee; aprBps is unbounded and lender == borrower is allowed, so a 60-second loan at a huge APR draws drawCapBps x principal from the pool each cycle.",
+      "impact": "Any per-asset reserve can be drained by one KYC'd wallet; PoC drains 5 WETH in 5 cycles.",
+      "rootCause": "The lender sets the size of the insured claim.",
+      "recommendation": "Insure principal only, or cap the insured APR, enforce a minimum insured term and require lender != borrower."
+    },
+    {
+      "id": "KRAIT-003",
+      "title": "Borrower can make forced swap-back revert at will, getting a free extension of a non-liquidating position",
+      "severity": "medium",
+      "file": "contracts/Vault.sol",
+      "line": 780,
+      "category": "settlement-liveness",
+      "evidence": "CODE-TRACE",
+      "description": "A dust swap() overwrites swapFeeTierOf for the whole held balance; settlement then sells everything through a thin pool and reverts on the TWAP floor. Donating the held asset beyond pool depth has the same effect.",
+      "impact": "Lender principal locked past term with no bound; borrower holds a free option to unblock settlement when favourable.",
+      "rootCause": "The fee tier is chosen by the last swap, and the exit sells the whole balance in one call.",
+      "recommendation": "Pin the fee tier at first entry; check entry impact against the full post-swap balance in the exit direction."
+    }
+  ],
+  "summary": { "critical": 1, "high": 1, "medium": 1, "low": 0, "total": 3 }
+}

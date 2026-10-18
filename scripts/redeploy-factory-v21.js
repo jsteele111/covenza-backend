@@ -43,6 +43,7 @@ const hre = require("hardhat");
 
 const fs = require("fs");
 const path = require("path");
+const { readPending, writePending } = require("./lib/timelock");
 
 // Timelock delay applied to risk-increasing admin actions: administrative
 // withdrawal from the insurance pool, repointing the factory's registries, and
@@ -74,7 +75,7 @@ async function main() {
     if (!existing[key]) {
       throw new Error(
         `deployed-addresses.json has no "${key}" for ${hre.network.name}. ` +
-        `Run deploy-v2-infrastructure.js first — this script only replaces the factory.`
+        `Run deploy-robinhood-testnet.js first — this script only replaces the factory.`
       );
     }
     const code = await hre.ethers.provider.getCode(existing[key]);
@@ -83,9 +84,32 @@ async function main() {
     }
   }
 
+  // --- The reused contracts must be the CURRENT generation ---
+  //
+  // A new factory and Vault built against an older registry, KYC adapter or
+  // pool would deploy cleanly and then revert on the first origination or
+  // swap. Each probe below calls something only the current version has.
+  const probes = [
+    ["KYCRegistry (identity adapter, #7)", existing.kycRegistry,
+      ["function isEligible(address,uint256) view returns (bool)"], (c) => c.isEligible(deployer.address, 1)],
+    ["AssetRegistry (approved pools, outages)", existing.assetRegistry,
+      ["function outageGapThreshold() view returns (uint256)"], (c) => c.outageGapThreshold()],
+    ["InsurancePool (per-draw share, item 8)", existing.insurancePool,
+      ["function maxDrawShareBps() view returns (uint256)"], (c) => c.maxDrawShareBps()],
+  ];
+  for (const [label, addr, abi, probe] of probes) {
+    try { await probe(new hre.ethers.Contract(addr, abi, deployer)); }
+    catch {
+      throw new Error(
+        `${label} at ${addr} is an older version. A factory-only redeploy cannot ` +
+        `run against it — redeploy everything with deploy-robinhood-testnet.js.`
+      );
+    }
+  }
+
   const treasury = TREASURY_ADDRESS || deployer.address;
 
-  console.log("Redeploying VaultFactory for the v2.1 protocol fee upgrade");
+  console.log("Redeploying VaultFactory, Vault implementation, TWAP library and VaultLens");
   console.log("Network:            ", hre.network.name);
   console.log("Deployer / operator:", deployer.address);
   console.log();
@@ -133,6 +157,12 @@ async function main() {
     libraries: { UniswapTwap: await twapLib.getAddress() },
   })).deploy();
   await vaultImpl.waitForDeployment();
+  // Read-only quote helper for the swap form (moved off Vault for size).
+  const lens = await (await hre.ethers.getContractFactory("VaultLens", {
+    signer: deployer,
+    libraries: { UniswapTwap: await twapLib.getAddress() },
+  })).deploy();
+  await lens.waitForDeployment();
   const factory = await (await hre.ethers.getContractFactory("VaultFactory", deployer)).deploy(
     existing.kycRegistry,
     existing.assetRegistry,
@@ -151,8 +181,32 @@ async function main() {
   console.log("   Referrer share:    ", (await factory.referrerShareBps()).toString(), "bps of the protocol fee");
 
   // --- Rewire the insurance pool ---
-  await (await pool.setVaultFactory(factoryAddress)).wait();
-  console.log("✅ InsurancePool rewired to the new factory.");
+  //
+  // Repointing an already-wired pool is timelocked: it decides who may
+  // register vaults, and a registered vault can draw. With a delay, the change
+  // is announced now and executed later by execute-timelocked.js; until then
+  // the new factory cannot originate (registration would revert).
+  if ((await pool.timelockDelay()) === 0n) {
+    await (await pool.setVaultFactory(factoryAddress)).wait();
+    console.log("✅ InsurancePool rewired to the new factory.");
+  } else {
+    await (await pool.queueSetVaultFactory(factoryAddress)).wait();
+    const id = hre.ethers.keccak256(hre.ethers.AbiCoder.defaultAbiCoder()
+      .encode(["string", "address"], ["setVaultFactory", factoryAddress]));
+    const all = readPending();
+    const network = hre.network.name;
+    all[network] = (all[network] || []).filter((p) => p.id !== id);
+    all[network].push({
+      label: `InsurancePool.setVaultFactory(${factoryAddress})`,
+      target: existing.insurancePool, method: "setVaultFactory", args: [factoryAddress],
+      data: pool.interface.encodeFunctionData("setVaultFactory", [factoryAddress]), id,
+      executableAt: new Date((Math.floor(Date.now() / 1000) + Number(await pool.timelockDelay())) * 1000).toISOString(),
+      queuedBy: deployer.address,
+    });
+    writePending(all);
+    console.log("⏳ InsurancePool rewiring ANNOUNCED. Run execute-timelocked.js after the delay;");
+    console.log("   the new factory cannot originate until then.");
+  }
   console.log("   (Vaults registered by the previous factory keep their draw rights.)");
 
   // --- Confirm reserves survived ---
@@ -173,19 +227,21 @@ async function main() {
     ...existing,
     vaultFactory: factoryAddress,
     vaultImplementation: await vaultImpl.getAddress(),
-    uniswapTwapLib: await twapLib.getAddress(),
+    vaultLens: await lens.getAddress(),
+    uniswapTwapLibrary: await twapLib.getAddress(),
     treasury: treasury,
     previousVaultFactory: existing.vaultFactory,
     factoryUpgradedAt: new Date().toISOString(),
-    factoryVersion: "phase 4 — risk tiers, borrower-funded premium, mandates",
   };
+  delete updated.uniswapTwapLib;   // renamed, to match deploy-robinhood-testnet.js
+  delete updated.factoryVersion;   // went stale; the commit hash is the version
   allAddresses[hre.network.name] = updated;
   fs.writeFileSync(addressesPath, JSON.stringify(allAddresses, null, 2));
   console.log("\n📄 deployed-addresses.json updated.");
 
   console.log("\n" + "─".repeat(60));
   console.log("Verify:\n");
-  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress} ${existing.kycRegistry} ${existing.assetRegistry} ${existing.insurancePool} ${treasury} ${await vaultImpl.getAddress()}`);
+  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress} ${existing.kycRegistry} ${existing.assetRegistry} ${existing.insurancePool} ${treasury} ${await vaultImpl.getAddress()} ${TIMELOCK_DELAY}`);
 
   console.log("\nNext steps:");
   console.log("  1. npx hardhat run scripts/diagnose-chain.js --network " + hre.network.name);
@@ -193,6 +249,7 @@ async function main() {
   console.log("  2. In the FRONTEND repo, update src/config/contracts.js:");
   console.log("       vaultFactory:   " + factoryAddress);
   console.log("       vaultImpl:      " + (await vaultImpl.getAddress()));
+  console.log("       vaultLens:      " + (await lens.getAddress()));
   console.log("       uniswapTwapLib: " + (await twapLib.getAddress()));
 }
 

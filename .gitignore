@@ -19,3 +19,6 @@ coverage.json
 
 test-wallet-*.json
 badge-artwork-check.svg
+
+# Timelocked admin calls announced but not yet executed (per network)
+pending-timelock.json

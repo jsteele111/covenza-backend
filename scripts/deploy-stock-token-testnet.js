@@ -214,6 +214,11 @@ async function main() {
   )).wait();
   await (await registry.setTier(stockAddr, TIER_STANDARD)).wait();
 
+  // Vaults trade only through the pool the registry names for each pair
+  // (KRAIT-003 / item 20). Naming the first pool for a pair is instant.
+  await (await registry.setPoolFeeTier(stockAddr, usdgAddr, FEE)).wait();
+  console.log(`Approved pool: tUSDG/${SYMBOL} at fee ${FEE}.`);
+
   console.log(`\nWhitelisted, Standard tier, ${GRACE_SECONDS / 3600}h grace extension.`);
 
   const cfg = await registry.tierConfig(TIER_STANDARD);

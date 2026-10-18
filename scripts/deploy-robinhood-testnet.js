@@ -35,6 +35,7 @@ const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig, guardNoYieldVenues } = require("./lib/production-guards");
+const { sendOrQueue } = require("./lib/timelock");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
 const TWAP_TOLERANCE_BPS       = 300;  // 3%
@@ -46,6 +47,9 @@ const INSURANCE_DRAW_CAP_BPS   = 1000; // 10% of principal
 const VENUE_NONE = 0;
 const VENUE_4626 = 2;
 
+const TIER_STANDARD = 1;
+const STOCK_GRACE_SECONDS = 72 * 3600;   // covers a weekend; see deploy-stock-token-testnet.js
+
 // Whatever the deployer has left after the Uniswap deployment needs to cover
 // the Vault implementation, which is now the largest single deployment here —
 // VaultFactory only clones it, so the factory itself is small.
@@ -53,16 +57,21 @@ const MIN_BALANCE = ethers => ethers.parseEther("0.0015");
 
 async function main() {
 
-  // Refuses a mainnet deployment carrying testnet values. Every one of them is
-  // a legal value the contracts accept, which is exactly why nothing else
-  // catches it.
-  guardProductionConfig(hre.network.name, {
-    timelockDelay: TIMELOCK_DELAY,
-    twapWindow: TWAP_WINDOW_SECONDS,
-  });
   const { ethers } = hre;
   const [deployer, borrower, keeper] = await ethers.getSigners();
   const net = await ethers.provider.getNetwork();
+  const network = hre.network.name;
+  const attesterKey = process.env.ATTESTER_KEY || deployer.address;
+
+  // Refuses a mainnet deployment carrying testnet values. Every one of them is
+  // a legal value the contracts accept, which is exactly why nothing else
+  // catches it. Outage detection is checked again once the registry exists.
+  guardProductionConfig(network, {
+    timelockDelay: TIMELOCK_DELAY,
+    twapWindow: TWAP_WINDOW_SECONDS,
+    attesterKey,
+    deployer: deployer.address,
+  });
 
   if (net.chainId !== 46630n) {
     throw new Error(`Expected Robinhood testnet (46630), got ${net.chainId}.`);
@@ -135,7 +144,6 @@ async function main() {
   // Tolerated on testnet, where the mock signer has to come from somewhere,
   // but it is announced rather than silent — and the production guard refuses
   // it outright.
-  const attesterKey = process.env.ATTESTER_KEY || deployer.address;
   if (attesterKey.toLowerCase() === deployer.address.toLowerCase()) {
     console.log("\n  NOTE: no ATTESTER_KEY set — the deployer is the initial attester.");
     console.log("  Covenza can attest for itself until this key is delisted.");
@@ -148,11 +156,12 @@ async function main() {
   console.log(`\nKYCRegistry     ${await kyc.getAddress()}`);
 
   // Manual grant (#7): all three claims, 30 days, with a case reference.
-  // With a zero testnet delay it applies at once.
-  await (await kyc.verify(borrower.address, 7, ethers.id("testnet-demo-borrower"))).wait();
-  console.log(`  manually granted borrower ${borrower.address} (30 days)`);
-  await (await kyc.verify(deployer.address, 7, ethers.id("testnet-demo-lender"))).wait();
-  console.log(`  manually granted lender ${deployer.address} (lenders need sanctions screening)`);
+  // Timelocked: with a zero testnet delay it applies at once; with a real
+  // delay it is announced here and executed by execute-timelocked.js.
+  await sendOrQueue(kyc, "verify", [borrower.address, 7, ethers.id("testnet-demo-borrower")],
+    { network, label: `manual grant: borrower ${borrower.address} (30 days)` });
+  await sendOrQueue(kyc, "verify", [deployer.address, 7, ethers.id("testnet-demo-lender")],
+    { network, label: `manual grant: lender ${deployer.address} (lenders need sanctions screening)` });
 
   // --- 2. ERC-4626 yield venue over tUSDG ------------------------------
   //
@@ -188,6 +197,10 @@ async function main() {
   await registry.waitForDeployment();
   console.log(`AssetRegistry   ${await registry.getAddress()}`);
 
+  // Item 16: sequencer-outage detection is on by default (30-minute gap).
+  // Production must keep it on, with the heartbeat bot running.
+  guardProductionConfig(network, { outageGapThreshold: await registry.outageGapThreshold() });
+
   // tUSDG earns yield through the 4626 venue; tWETH is swap-only. Neither
   // carries a grace extension — both are continuously tradeable. Stock
   // tokens are where extensions apply.
@@ -199,11 +212,11 @@ async function main() {
   )).wait();
   console.log("  whitelisted tUSDG (ERC-4626 venue) and tWETH (swap-only)");
 
-  await (await registry.setSettlementConfig(
+  // Always timelocked (item 12): every direction hurts someone on a live loan.
+  await sendOrQueue(registry, "setSettlementConfig", [
     TWAP_WINDOW_SECONDS, TWAP_TOLERANCE_BPS, GRACE_PERIOD_SECONDS,
-    BOUNTY_RATE_PER_HOUR_BPS, BOUNTY_CAP_BPS
-  )).wait();
-  console.log(`  settlement config set (twapWindow ${TWAP_WINDOW_SECONDS}s — see header)`);
+    BOUNTY_RATE_PER_HOUR_BPS, BOUNTY_CAP_BPS,
+  ], { network, label: `settlement config (twapWindow ${TWAP_WINDOW_SECONDS}s — see header)` });
 
   // --- Risk tiers ---
   //
@@ -222,8 +235,10 @@ async function main() {
   // fivefold. Tightening exposure rather than raising the premium keeps to the
   // principle the tiers were built on — deposits are the control, rates are the
   // compensation. See scripts/model-insurance-solvency.js.
-  await (await registry.setTierConfig(0, 6000, 1000,  30 * 86400, 7000, 100)).wait();
-  await (await registry.setTierConfig(1, 10000, 2000,  7 * 86400,  5000, 250)).wait();
+  // Raising an exposure cap waits on the timelock; these all lower or keep
+  // the constructor's caps, so sendOrQueue sends them at once.
+  await sendOrQueue(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 100], { network, label: "tier config: BlueChip" });
+  await sendOrQueue(registry, "setTierConfig", [1, 10000, 2000, 7 * 86400, 5000, 250], { network, label: "tier config: Standard" });
   // Speculative's premium is 100bps, not 600. Its 40% deposit exceeds the 25%
   // maximum possible loss, so the pool's exposure is not merely improbable, it
   // is arithmetically zero — the position cannot fall far enough. No tail model
@@ -233,8 +248,7 @@ async function main() {
   // Charging 600bps for cover that cannot pay is not a solvency problem; it is
   // selling something that does not exist. Kept nominal rather than zero
   // because the tier still consumes administration and reserve capacity.
-  await (await registry.setTierConfig(2, 20000, 4000,      86400,  2500, 100)).wait();
-  console.log("  tier config set (BlueChip / Standard / Speculative)");
+  await sendOrQueue(registry, "setTierConfig", [2, 20000, 4000, 86400, 2500, 100], { network, label: "tier config: Speculative" });
 
   // Both test tokens are blue chip here — they are mock ERC-20s against a pool
   // we control, so the tier reflects how they behave rather than what they are
@@ -242,6 +256,43 @@ async function main() {
   await (await registry.setTier(usdg, 0)).wait();
   await (await registry.setTier(weth, 0)).wait();
   console.log("  tUSDG and tWETH tagged BlueChip");
+
+  // Tokenised equities added earlier by deploy-stock-token-testnet.js are
+  // re-listed, so a full redeploy keeps them: Standard tier, 72-hour grace,
+  // no yield venue. Skipped if the testnet reset took them.
+  const stocks = [];
+  for (const [symbol, addr] of Object.entries(uni.tokens)) {
+    if (addr === usdg || addr === weth) continue;
+    if ((await ethers.provider.getCode(addr)).length <= 2) {
+      console.log(`  ${symbol} ${addr} has no code — skipped`);
+      continue;
+    }
+    await (await registry.addAssetWithVenue(addr, ethers.ZeroAddress, VENUE_NONE, ethers.ZeroAddress, STOCK_GRACE_SECONDS)).wait();
+    await (await registry.setTier(addr, TIER_STANDARD)).wait();
+    stocks.push(symbol);
+    console.log(`  whitelisted ${symbol} (Standard, ${STOCK_GRACE_SECONDS / 3600}h grace)`);
+  }
+
+  // --- Approved pools (KRAIT-003 / item 20) ---
+  //
+  // Vaults only trade through the pool the registry names for each pair; with
+  // none named, every swap is refused. Naming the FIRST pool is instant.
+  for (const p of uni.pools) {
+    let a = p.token0, b = p.token1;
+    if (!a || !b) {
+      const [x, y] = (p.pair || "").split("/");
+      a = uni.tokens[x]; b = uni.tokens[y];
+    }
+    if (!a || !b) { console.log(`  pool ${p.address}: cannot tell its tokens — skipped`); continue; }
+    const listed = (await registry.isWhitelisted(a)) && (await registry.isWhitelisted(b));
+    if (!listed) { console.log(`  pool ${p.address}: a token is not listed — skipped`); continue; }
+    await sendOrQueue(registry, "setPoolFeeTier", [a, b, p.fee], {
+      network, label: `approved pool ${p.pair || "tUSDG/tWETH"} (fee ${p.fee})`,
+    });
+  }
+
+  // Production ships with every venue None (item 7). Testnet keeps the mock.
+  await guardNoYieldVenues(network, registry, [usdg, weth, ...stocks.map((s) => uni.tokens[s])]);
 
   // --- 5. VaultFactory ---------------------------------------------------
 
@@ -356,7 +407,7 @@ async function main() {
     yieldVenue4626: venueAddress,
     verifiedBorrower: borrower.address,
     keeper: keeper ? keeper.address : null,
-    tokens: { tUSDG: usdg, tWETH: weth },
+    tokens: { tUSDG: usdg, tWETH: weth, ...Object.fromEntries(stocks.map((s) => [s, uni.tokens[s]])) },
     uniswap: {
       factory: uni.uniswapFactory,
       router: uni.swapRouter,
@@ -376,6 +427,9 @@ async function main() {
   console.log(`Gas spent: ${ethers.formatEther(spent)} ETH`);
   console.log(`Remaining: ${ethers.formatEther(await ethers.provider.getBalance(deployer.address))} ETH`);
   console.log(`\nExplorer: https://explorer.testnet.chain.robinhood.com/address/${await factory.getAddress()}`);
+  console.log("\nNEXT:");
+  console.log("  - Start the heartbeat bot against the new AssetRegistry (item 16).");
+  console.log("  - If anything above was ANNOUNCED, run scripts/execute-timelocked.js after the delay.");
   console.log("=".repeat(70));
 }
 
