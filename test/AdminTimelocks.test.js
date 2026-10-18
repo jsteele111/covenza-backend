@@ -185,7 +185,7 @@ describe("Admin timelocks — AssetRegistry integration addresses", function () 
     const [operator, attacker] = await ethers.getSigners();
     const Registry = await ethers.getContractFactory("AssetRegistry", operator);
     const registry = await Registry.deploy(
-      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth
+      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth, 0
     );
     return { registry, operator, attacker };
   }

@@ -69,7 +69,7 @@ describe("Group D — guard rails and edge cases", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await weth.getAddress()
+      await uniFactory.getAddress(), await weth.getAddress(), 0
     );
     await registry.addAsset(await weth.getAddress(), aTokenWeth);
     await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./OperatorControlled.sol";
+import "./Timelocked.sol";
 import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence checks
 
 /**
@@ -43,7 +44,7 @@ import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence c
  *         whose issuer can pause or freeze transfers may be listed, but see
  *         item 14 for what that does to settlement.
  */
-contract AssetRegistry is OperatorControlled {
+contract AssetRegistry is OperatorControlled, Timelocked {
 
     // --- State variables ---
 
@@ -237,9 +238,8 @@ contract AssetRegistry is OperatorControlled {
      *         public pool, which is costly and visible.
      *
      *         Vaults record the tier at entry and keep it while the position
-     *         is open, so changing this affects new positions only. It is
-     *         instant for now; MAINNET-READINESS item 12 brings it under the
-     *         timelock with the other parameters live loans depend on.
+     *         is open, so changing this affects new positions only. Changing
+     *         an existing choice waits on the timelock (item 12).
      */
     mapping(address => mapping(address => uint24)) private _poolFeeTier;
 
@@ -282,8 +282,9 @@ contract AssetRegistry is OperatorControlled {
         address _aavePool,
         address _swapRouter,
         address _uniswapFactory,
-        address _weth
-    ) OperatorControlled(_operator) {
+        address _weth,
+        uint256 _timelockDelay
+    ) OperatorControlled(_operator) Timelocked(_timelockDelay) {
         require(_aavePool != address(0),       "Invalid Aave pool address");
         require(_swapRouter != address(0),     "Invalid swap router address");
         require(_uniswapFactory != address(0), "Invalid Uniswap factory address");
@@ -459,6 +460,11 @@ contract AssetRegistry is OperatorControlled {
         require(_everAdded[_asset], "Unknown asset");
         _validateVenue(_venue, assetConfig[_asset].aToken, _venueAddress);
 
+        // Pointing an asset at a venue is where borrowers' principal will be
+        // sent on their next supply, so it waits. Removing the venue (None)
+        // only stops new supply and stays instant.
+        if (_venue != YieldVenue.None) { _consumeIfDelayed(keccak256(msg.data)); }
+
         assetConfig[_asset].venue        = _venue;
         assetConfig[_asset].venueAddress = _venueAddress;
 
@@ -468,15 +474,15 @@ contract AssetRegistry is OperatorControlled {
     /**
      * @notice Tags an asset with its risk tier.
      *
-     * @dev    Separate from addAsset rather than a parameter of it, so adding
-     *         the tier system does not change existing call sites. Assets
-     *         default to BlueChip (enum zero) and must be tagged deliberately.
+     * @dev    An asset listed without a tier defaults to Speculative, the
+     *         most constrained tier; relaxing it takes this deliberate call.
+     *         (An earlier version of this comment said BlueChip. It was
+     *         changed, see _addAsset.)
      *
-     *         That default is permissive, which is a considered trade: the
-     *         whitelist is already operator-curated, so nothing reaches this
-     *         function without a deliberate listing decision. An untagged asset
-     *         being maximally CONSTRAINED would instead mean every existing
-     *         deployment silently stopped working.
+     *         Instant in both directions. A loan checks the WORST tier an asset
+     *         has held since origination, for both its risk ceiling and its
+     *         exposure cap, so re-tagging an asset safer cannot loosen a loan
+     *         that is already open, and re-tagging it riskier tightens it.
      */
     function setTier(address _asset, RiskTier _tier) external onlyOperator {
         require(_everAdded[_asset], "Unknown asset");
@@ -513,7 +519,7 @@ contract AssetRegistry is OperatorControlled {
      *         returned unchanged.
      */
     function highestTierSince(address _asset, uint256 _since)
-        external view returns (RiskTier)
+        public view returns (RiskTier)
     {
         TierChange[] storage h = _tierHistory[_asset];
         if (h.length == 0) { return assetConfig[_asset].tier; }
@@ -534,8 +540,15 @@ contract AssetRegistry is OperatorControlled {
         return _tierHistory[_asset].length;
     }
 
-    /// @notice Updates a tier's risk parameters. Applies to NEW loans only —
-    ///         vaults snapshot what they need at origination.
+    /**
+     * @notice Updates a tier's risk parameters.
+     * @dev    Most of these are read only at origination (deposit floor, term
+     *         limit, premium), so changing them affects new loans only. The
+     *         EXPOSURE CAP is different: open vaults read it on every swap.
+     *         (This comment previously said "applies to NEW loans only", which
+     *         was not true of the cap; MAINNET-READINESS item 12.) Raising a
+     *         cap therefore waits on the timelock; lowering one is instant.
+     */
     function setTierConfig(
         RiskTier _tier,
         uint256 _assumedVolBps,
@@ -544,6 +557,9 @@ contract AssetRegistry is OperatorControlled {
         uint256 _maxExposureBps,
         uint256 _insurancePremiumBps
     ) external onlyOperator {
+        if (_maxExposureBps > tierConfig[_tier].maxExposureBps) {
+            _consumeIfDelayed(keccak256(msg.data));
+        }
         _setTierConfig(_tier, _assumedVolBps, _minDepositBps, _maxTermSeconds,
                        _maxExposureBps, _insurancePremiumBps);
     }
@@ -573,8 +589,14 @@ contract AssetRegistry is OperatorControlled {
     }
 
     /// @notice Updates the entry impact ceiling. Zero disables the check.
+    /// @dev    Loosening (a higher ceiling, or zero, which switches the check
+    ///         off) waits on the timelock: open vaults apply it to their next
+    ///         swap. Tightening is instant.
     function setMaxEntryImpactBps(uint256 _newBps) external onlyOperator {
         require(_newBps <= 1000, "Entry impact cap too loose");
+        if (_newBps == 0 || (maxEntryImpactBps != 0 && _newBps > maxEntryImpactBps)) {
+            _consumeIfDelayed(keccak256(msg.data));
+        }
         maxEntryImpactBps = _newBps;
     }
 
@@ -587,6 +609,11 @@ contract AssetRegistry is OperatorControlled {
     }
 
     /// @notice Sets how much this asset extends the global swap-back grace by.
+    /// @dev    DECISION PENDING (item 12): the intended treatment is the
+    ///         timelock in both directions, since shortening grace hurts the
+    ///         borrower and lengthening it hurts the lender. Instant until
+    ///         that is confirmed. The GLOBAL grace, in setSettlementConfig,
+    ///         is already timelocked.
     function setGracePeriod(address _asset, uint256 _gracePeriod) external onlyOperator {
         require(_everAdded[_asset], "Unknown asset");
         require(_gracePeriod <= 14 days, "Grace extension too long");
@@ -609,6 +636,10 @@ contract AssetRegistry is OperatorControlled {
             IUniswapV3Factory(uniswapFactory).getPool(_tokenA, _tokenB, _fee) != address(0),
             "No pool at this fee tier"
         );
+
+        // Naming the first pool for a pair is instant: no position can exist
+        // in a pair with no approved pool. Changing it waits.
+        if (_poolFeeTier[_tokenA][_tokenB] != 0) { _consumeIfDelayed(keccak256(msg.data)); }
 
         _poolFeeTier[_tokenA][_tokenB] = _fee;
         _poolFeeTier[_tokenB][_tokenA] = _fee;
@@ -660,6 +691,12 @@ contract AssetRegistry is OperatorControlled {
         require(_twapWindow >= 60,                    "TWAP window too short");
         require(_twapToleranceBps > 0 && _twapToleranceBps <= 1000, "Tolerance must be 1-1000 bps");
         require(_bountyCapBps <= 1000,                "Bounty cap must be <= 1000 bps");
+
+        // Every one of these is read by open vaults at settlement, and every
+        // direction hurts someone: a wider tolerance or longer grace costs
+        // the lender, a higher bounty costs the borrower, a shorter window is
+        // easier to manipulate. So all changes wait (item 12).
+        _consumeIfDelayed(keccak256(msg.data));
 
         twapWindow           = _twapWindow;
         twapToleranceBps     = _twapToleranceBps;
@@ -782,6 +819,22 @@ contract AssetRegistry is OperatorControlled {
     function maxExposureBpsFor(address _asset) external view returns (uint256) {
         return tierConfig[assetConfig[_asset].tier].maxExposureBps;
     }
+
+    /// @notice The exposure cap a loan written at `_since` must apply to
+    ///         `_asset`: the cap of the riskiest tier the asset has held since
+    ///         then. Krait observation: reading the CURRENT tier meant
+    ///         re-tagging an asset safer loosened the cap on loans already open.
+    function maxExposureBpsSince(address _asset, uint256 _since) external view returns (uint256) {
+        return tierConfig[highestTierSince(_asset, _since)].maxExposureBps;
+    }
+
+    /// @notice Announces a timelocked change. `_id` is keccak256 of the exact
+    ///         calldata of the setter call that will follow, so the
+    ///         announcement authorises those arguments and no others.
+    function queueAction(bytes32 _id) external onlyOperator { _queue(_id); }
+
+    /// @notice Abandons an announced change. Instant: it reduces risk.
+    function cancelAction(bytes32 _id) external onlyOperator { _cancel(_id); }
 
     /// @notice Annualised insurance premium for holding this asset, in bps of
     ///         principal. Charged to the borrower, priced on the full term.

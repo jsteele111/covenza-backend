@@ -106,7 +106,7 @@ describe("Production deployment guards", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry")).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress()
+      await uniFactory.getAddress(), await usdx.getAddress(), 0
     );
 
     const vault4626 = await (await ethers.getContractFactory("MockERC4626"))
@@ -138,7 +138,7 @@ describe("Production deployment guards", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry")).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress()
+      await uniFactory.getAddress(), await usdx.getAddress(), 0
     );
     await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
 

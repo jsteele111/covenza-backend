@@ -157,12 +157,23 @@ contract InsurancePool is Timelocked, OperatorControlled {
     }
 
     /// @notice Updates the per-settlement draw cap (bps of loan principal).
+    /// @dev    Waits on the timelock in both directions (item 12): lowering it
+    ///         cuts cover lenders already priced in; raising it lets a single
+    ///         settlement take more of a reserve other lenders rely on.
+    ///         Announce with queueAction(keccak256(calldata)).
     function setDrawCapBps(uint256 _newBps) external onlyOperator {
         require(_newBps > 0 && _newBps <= 10000, "Draw cap must be 1-10000 bps");
+        _consumeIfDelayed(keccak256(msg.data));
         uint256 previous = drawCapBps;
         drawCapBps = _newBps;
         emit DrawCapUpdated(previous, _newBps);
     }
+
+    /// @notice Announces a timelocked change by the hash of its calldata.
+    function queueAction(bytes32 _id) external onlyOperator { _queue(_id); }
+
+    /// @notice Abandons an announced change. Instant: it reduces risk.
+    function cancelAction(bytes32 _id) external onlyOperator { _cancel(_id); }
 
     // --- Vault registration (factory-only) ---
 

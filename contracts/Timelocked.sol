@@ -95,6 +95,18 @@ abstract contract Timelocked {
         emit ActionCancelled(_id);
     }
 
+    /// @dev For setters whose changes reach loans already open (item 12).
+    ///      The action id is the hash of the exact call, so the queue entry
+    ///      authorises those arguments and no others. With a zero delay, used
+    ///      only in local tests and on testnet, queueing adds nothing (an
+    ///      operator could queue and execute in one transaction), so it is
+    ///      skipped. Production deployments refuse a delay under 24 hours
+    ///      (scripts/lib/production-guards.js).
+    function _consumeIfDelayed(bytes32 _id) internal {
+        if (timelockDelay == 0) { return; }
+        _consume(_id);
+    }
+
     /// @dev Consumes the queue entry, so an approval cannot be replayed. A
     ///      second execution must queue and wait again.
     function _consume(bytes32 _id) internal {

@@ -24,7 +24,7 @@ describe("Item 15 — token safety and timelock expiry", function () {
     await kyc.verify(borrower.address);
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await nr.getAddress());
+      operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await nr.getAddress(), 0);
     await registry.addAssetWithTier(await nr.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);

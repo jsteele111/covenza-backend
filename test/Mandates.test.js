@@ -60,7 +60,7 @@ describe("Mandates", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), usdxAddr
+      await uniFactory.getAddress(), usdxAddr, 0
     );
     await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
     await registry.setSettlementConfig(1800, 200, 3600, 2, 100);

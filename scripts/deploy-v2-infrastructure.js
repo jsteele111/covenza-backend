@@ -181,7 +181,7 @@ async function main() {
     await aave.getAddress(),
     await router.getAddress(),
     await uniFactory.getAddress(),
-    await weth.getAddress()
+    await weth.getAddress(), TIMELOCK_DELAY
   );
   await registry.waitForDeployment();
   console.log("✅ AssetRegistry deployed:", await registry.getAddress());

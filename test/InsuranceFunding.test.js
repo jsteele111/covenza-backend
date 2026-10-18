@@ -54,7 +54,7 @@ describe("Insurance funding and cancellation", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), usdxAddr
+      await uniFactory.getAddress(), usdxAddr, 0
     );
     await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
     // Explicit: a never-seen asset defaults to Speculative, not BlueChip. This

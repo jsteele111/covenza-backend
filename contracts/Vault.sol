@@ -731,7 +731,9 @@ contract Vault {
      *      concentration limit means.
      */
     function _enforceExposureCap(address tokenOut, uint24 poolFee) internal view {
-        uint256 capBps = registry.maxExposureBpsFor(tokenOut);
+        // The riskiest tier the asset has held since this loan began, not its
+        // current tier: re-tagging an asset safer must not loosen an open loan.
+        uint256 capBps = registry.maxExposureBpsSince(tokenOut, originatedAt);
         if (capBps >= 10000) { return; }
 
         uint256 held = heldAmount[tokenOut];

@@ -23,7 +23,7 @@ describe("Group A — AssetRegistry", function () {
 
     const Registry = await ethers.getContractFactory("AssetRegistry", operator);
     const registry = await Registry.deploy(
-      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth
+      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth, 0
     );
 
     const Mock = await ethers.getContractFactory("MockERC20", operator);
@@ -40,10 +40,10 @@ describe("Group A — AssetRegistry", function () {
     const Registry = await ethers.getContractFactory("AssetRegistry");
     const good = "0x0000000000000000000000000000000000000A01";
     await expect(
-      Registry.deploy(ethers.ZeroAddress, good, good, good, good)
+      Registry.deploy(ethers.ZeroAddress, good, good, good, good, 0)
     ).to.be.revertedWith("Invalid operator address");
     await expect(
-      Registry.deploy(operator.address, ethers.ZeroAddress, good, good, good)
+      Registry.deploy(operator.address, ethers.ZeroAddress, good, good, good, 0)
     ).to.be.revertedWith("Invalid Aave pool address");
   });
 

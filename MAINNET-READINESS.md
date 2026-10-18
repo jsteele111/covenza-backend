@@ -359,7 +359,7 @@ first review did not walk.
 |---|---|---|---|
 | 10 | Insurance pool drainable via an instant factory repoint | HIGH | **FIXED** |
 | 11 | Swap router and Uniswap factory repointable under live vaults | HIGH | **FIXED** |
-| 12 | Other live-loan parameters change instantly | MEDIUM | Open |
+| 12 | Other live-loan parameters change instantly | MEDIUM | **FIXED** (per-asset grace pending) |
 | 13 | A mandate can be filled repeatedly | MEDIUM | Open — design |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
@@ -425,7 +425,33 @@ smaller change: nothing in the tests, scripts or frontend called it.
 
 ---
 
-## 12. Other live-loan parameters change instantly — MEDIUM — open
+## 12. Other live-loan parameters change instantly — MEDIUM — **FIXED** (per-asset grace pending)
+
+> **Fixed 18 October 2026.** `AssetRegistry` is now `Timelocked`, and the
+> registry and `InsurancePool` gain `queueAction(id)` / `cancelAction(id)`,
+> where `id` is keccak256 of the exact calldata of the setter call that will
+> follow. The rule is by direction:
+>
+> | Setter | Waits | Instant |
+> |---|---|---|
+> | `setSettlementConfig` (tolerance, window, global grace, bounty) | every change | — |
+> | `setMaxEntryImpactBps` | raising it, or 0 (off) | lowering it |
+> | `setTierConfig` | raising a tier's exposure cap | everything else (read at origination only) |
+> | `setPoolFeeTier` | changing a pair's pool | naming the first one |
+> | `setVenue` | pointing at Aave or an ERC-4626 vault | setting None |
+> | `InsurancePool.setDrawCapBps` | every change | — |
+> | `setTier` | — | both ways: loans read the worst tier since origination |
+> | `setGracePeriod` (per asset) | **decision pending** | currently instant |
+>
+> The exposure cap now reads the worst tier since origination
+> (`maxExposureBpsSince`), closing the Krait observation below, and the
+> `setTierConfig` and `setTier` comments are corrected. With a zero delay
+> (tests, testnet) the queue is skipped, since it would add nothing; the
+> production guard refuses a delay under 24 hours. Sixteen tests in
+> `ParameterTimelocks.test.js`, all with a real 48-hour delay. **Limit:** a
+> change still reaches a loan already in its grace window once it lands; the
+> timelock gives warning, not immunity.
+
 
 Several operator setters still take effect immediately and are read live by
 open vaults:
@@ -692,10 +718,9 @@ full post-swap balance in the exit direction, not just the increment.
 - **Self-referral.** On direct origination the lender names the referrer, so a
   lender can name themselves and take the referrer share of the protocol fee.
   Mandate fills hard-code no referrer. Decide which is intended.
-- **The exposure cap reads the asset's current tier**, so `setTier` to a safer
-  tier loosens the cap on live loans. Same class as item 12.
-- **Stale NatSpec on `setTier`**: says unassessed assets default to Blue chip;
-  they now default to Speculative.
+- ~~**The exposure cap reads the asset's current tier**~~ — **fixed with item 12**:
+  the cap now uses the worst tier since origination.
+- ~~**Stale NatSpec on `setTier`**~~ — **fixed with item 12**.
 
 ---
 
@@ -703,10 +728,9 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
-**Done (18 October 2026):** items 15, 17 and 20. 276 tests passing.
+**Done (18 October 2026):** items 12 (except per-asset grace), 15, 17 and 20, and two Krait observations. 292 tests passing.
 
-**Before freeze:** item 12 (per-setter timelock or snapshot, plus the comment),
-item 13 (decide mandate semantics), item 16 (sequencer-aware grace), the Krait
+**Before freeze:** the per-asset grace decision (item 12), item 13 (decide mandate semantics), item 16 (sequencer-aware grace), the Krait
 observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable

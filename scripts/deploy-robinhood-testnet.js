@@ -179,7 +179,7 @@ async function main() {
     deployer.address,      // aavePool placeholder — Aave is not on this chain
     uni.swapRouter,
     uni.uniswapFactory,
-    weth
+    weth, TIMELOCK_DELAY
   );
   await registry.waitForDeployment();
   console.log(`AssetRegistry   ${await registry.getAddress()}`);

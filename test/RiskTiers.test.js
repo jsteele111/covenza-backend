@@ -67,7 +67,7 @@ describe("Risk tiers", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress()
+      await uniFactory.getAddress(), await usdx.getAddress(), 0
     );
     for (const t of [usdx, weth, aapl, meme]) {
       await registry.addAsset(await t.getAddress(), ethers.ZeroAddress);
