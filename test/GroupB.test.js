@@ -106,6 +106,8 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     // Vaults are EIP-1167 clones of one implementation, so the factory no
     // longer embeds Vault bytecode and needs no library link. The
     // IMPLEMENTATION does — it delegatecalls UniswapTwap.
+    // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+    await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
     const vaultImpl = await (await ethers.getContractFactory("Vault", {

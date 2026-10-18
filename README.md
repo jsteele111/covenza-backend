@@ -15,20 +15,20 @@ It is **low-collateral, not uncollateralised**, and it is **non-liquidating**. T
 
 ## Audit scope
 
-Counted at `main` on 1 October 2026, as non-blank, non-comment lines. The exact frozen commit will be confirmed with the auditor before the engagement starts.
+Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen commit will be confirmed with the auditor before the engagement starts.
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 551 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps with tier ceiling, exposure caps and entry-impact check, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
+| `contracts/Vault.sol` | 587 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
 | `contracts/VaultFactory.sol` | 535 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel), pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
-| `contracts/AssetRegistry.sol` | 336 | Operator-curated whitelist, risk tiers with tier history, on-chain deposit floors, per-asset yield venue and grace period, immutable integration addresses, settlement config |
+| `contracts/AssetRegistry.sol` | 356 | Operator-curated whitelist, risk tiers with tier history, on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config |
 | `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
 | `contracts/InsurancePool.sol` | 104 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
 | `contracts/Timelocked.sol` | 38 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs |
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **1,892** | 1,803 written for Covenza + 89 vendored |
+| **Total** | **1,948** | 1,859 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (6 test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -93,7 +93,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**256 tests** across 14 suites.
+**267 tests** across 14 suites.
 
 ```bash
 npm install
@@ -165,7 +165,7 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
 - **Some live-loan parameters still change instantly** (settlement tolerance, exposure caps, grace, draw cap). Bounded, but a lender priced the loan against the values in force when it was written. Item 12 in the self-review.
 - **A mandate can be filled more than once**, up to the lender's allowance; `maxPrincipal` limits each fill, not the total. Item 13.
-- **A borrower can deliberately make settlement revert** by routing a dust swap through a thin pool, which redirects the whole position's exit there. Item 20; fix planned before freeze.
+- **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
 - **Settlement has no fallback if a held asset cannot be swapped back**, for example a tokenised equity frozen by its issuer. The loan stays unsettled until it can be. Item 14.
 
 ---
@@ -177,7 +177,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 256 tests, 14 suites
+test/                 267 tests, 14 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)

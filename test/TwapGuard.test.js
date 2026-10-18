@@ -97,6 +97,8 @@ describe("TWAP availability guard", function () {
     // Vaults are EIP-1167 clones of one implementation, so the factory no
     // longer embeds Vault bytecode and needs no library link. The
     // IMPLEMENTATION does — it delegatecalls UniswapTwap.
+    // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+    await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
     const vaultImpl = await (await ethers.getContractFactory("Vault", {
@@ -138,22 +140,32 @@ describe("TWAP availability guard", function () {
 
   // --- Rejection cases ---
 
-  it("Rejects a swap when no pool exists at the chosen fee tier", async function () {
+  it("Rejects a swap at any fee tier other than the approved pool", async function () {
     const { vault, borrower, usdx } = await loadFixture(fixture);
+
+    // KRAIT-003 / item 20: the borrower no longer chooses the pool.
+    await expect(
+      vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), ALT_FEE)
+    ).to.be.revertedWith("Swap must use the approved pool");
+  });
+
+  it("Refuses to approve a fee tier where no pool exists", async function () {
+    const { registry, weth, usdx } = await loadFixture(fixture);
 
     // Nothing registered at ALT_FEE — getPool returns address(0).
     await expect(
-      vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), ALT_FEE)
-    ).to.be.revertedWith("No TWAP history for this pair and fee tier");
+      registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), ALT_FEE)
+    ).to.be.revertedWith("No pool at this fee tier");
   });
 
   it("Rejects a swap into a pool that has liquidity but no TWAP history", async function () {
-    const { vault, borrower, usdx, poolWithWindow } = await loadFixture(fixture);
+    const { vault, borrower, weth, usdx, registry, poolWithWindow } = await loadFixture(fixture);
 
     // Cardinality 1: the pool exists, the router would happily fill the
     // swap, but observe() reverts for any non-zero window. This is the
-    // fund-freeze case.
+    // fund-freeze case. Even an operator-approved pool must pass it.
     await poolWithWindow(0);
+    await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), ALT_FEE);
 
     await expect(
       vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), ALT_FEE)
@@ -161,11 +173,12 @@ describe("TWAP availability guard", function () {
   });
 
   it("Rejects a swap when the pool's history is shorter than the TWAP window", async function () {
-    const { vault, borrower, usdx, poolWithWindow } = await loadFixture(fixture);
+    const { vault, borrower, weth, usdx, registry, poolWithWindow } = await loadFixture(fixture);
 
     // Ten minutes of history against an 1800s window — a pool mid-way
-    // through cardinality expansion.
+    // through cardinality expansion. Approved, but not usable.
     await poolWithWindow(600);
+    await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), ALT_FEE);
 
     await expect(
       vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), ALT_FEE)
@@ -189,16 +202,16 @@ describe("TWAP availability guard", function () {
 
   // --- The per-tier property ---
 
-  it("Accepts and rejects the SAME asset at different fee tiers", async function () {
+  it("Accepts the SAME asset only at its approved fee tier", async function () {
     const { vault, borrower, usdx, poolWithWindow } = await loadFixture(fixture);
 
     // Exactly the AAPL/USDG situation: healthy at one tier, unquotable at
-    // another. Whitelisting is per-asset, so only a per-tier check catches this.
+    // another. The approved-pool rule now refuses the other tier outright.
     await poolWithWindow(0);
 
     await expect(
       vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), ALT_FEE)
-    ).to.be.revertedWith("No TWAP history for this pair and fee tier");
+    ).to.be.revertedWith("Swap must use the approved pool");
 
     await expect(
       vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), POOL_FEE)

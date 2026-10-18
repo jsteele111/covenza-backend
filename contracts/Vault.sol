@@ -247,7 +247,13 @@ contract Vault {
 
     address[] public heldAssets;
     mapping(address => bool)   public isHeld;
-    mapping(address => uint24) public swapFeeTierOf;  // pool fee tier used when swapping in; reused for swap-back TWAP lookup
+    mapping(address => uint24) public swapFeeTierOf;  // pool fee tier recorded at first entry; every later swap in or out of the asset uses it
+
+    /// @notice How much of each held asset this vault BOUGHT, measured by
+    ///         balance change. Swap-back and settlement sell this amount and
+    ///         no more, so tokens sent to the vault directly are never pushed
+    ///         into a forced exit. See _forcedSwapBackAll() and KRAIT-003.
+    mapping(address => uint256) public heldAmount;
 
     // --- Settlement outcome (readable post-settlement) ---
 
@@ -624,6 +630,16 @@ contract Vault {
         require(tokenOut != asset,                  "Use swapBack() for the loan asset");
         require(registry.isWhitelisted(tokenOut),   "Destination asset not whitelisted");
 
+        // The protocol names the pool, not the borrower (KRAIT-003, item 20).
+        // An open position keeps the tier it was bought at, so a registry
+        // change never redirects an exit that is already committed; a new
+        // position takes the registry's current choice.
+        uint24 approvedFee = isHeld[tokenOut]
+            ? swapFeeTierOf[tokenOut]
+            : registry.poolFeeTier(tokenOut, asset);
+        require(approvedFee != 0,        "No approved pool for this pair");
+        require(poolFee == approvedFee,  "Swap must use the approved pool");
+
         // Refuse entry into a position we could not force an exit from.
         // _forcedSwapBackAll() quotes (tokenOut -> asset) at this same fee
         // tier; if that quote is unobtainable, settlement would revert and the
@@ -662,10 +678,11 @@ contract Vault {
         _enforceDepositInvariant(amountIn);
 
         uint256 amountOut = _executeSwap(asset, tokenOut, amountIn, minAmountOut, poolFee);
-        _trackHeldAsset(tokenOut, poolFee);
+        _trackHeldAsset(tokenOut, poolFee, amountOut);
 
         _enforceEntryImpact(tokenOut, amountIn, amountOut, poolFee);
         _enforceExposureCap(tokenOut, poolFee);
+        _enforceExitable(tokenOut, poolFee);
 
         emit SwapExecuted(asset, tokenOut, amountIn, amountOut, false);
     }
@@ -722,7 +739,7 @@ contract Vault {
         uint256 capBps = registry.maxExposureBpsFor(tokenOut);
         if (capBps >= 10000) { return; }
 
-        uint256 held = IERC20(tokenOut).balanceOf(address(this));
+        uint256 held = heldAmount[tokenOut];
         uint256 value = UniswapTwap.quote(
             registry.uniswapFactory(), tokenOut, asset, poolFee, held, registry.twapWindow()
         );
@@ -731,6 +748,65 @@ contract Vault {
             value <= (principal * capBps) / 10000,
             "Exceeds exposure cap for this asset"
         );
+    }
+
+    /// @dev Carries the simulated exit output out of simulateExit()'s revert.
+    error ExitQuote(uint256 amountOut);
+
+    /**
+     * @dev Refuses a position the vault could not sell back in one go at
+     *      settlement, measured on the WHOLE holding rather than the swap
+     *      that just added to it.
+     *
+     *      _enforceEntryImpact() checks each purchase on its own. A position
+     *      built from many small purchases passes every one of those checks
+     *      and can still be too large to exit at once: the forced swap-back
+     *      sells everything in one call, misses the TWAP floor, and settle()
+     *      reverts for everyone (KRAIT-003, item 20).
+     *
+     *      So after each purchase the vault actually performs the exit it
+     *      would face at settlement, through the same router and pool, then
+     *      undoes it by reverting. This is the technique Uniswap's own Quoter
+     *      uses; the revert discards every state change, and the only thing
+     *      carried out is the output amount. The position is accepted only if
+     *      that output clears the same floor settlement applies.
+     *
+     *      It cannot see the future: liquidity withdrawn after entry (for
+     *      example by a borrower who was also the pool's main provider) can
+     *      still leave a position unsellable later. Item 14 is the backstop.
+     */
+    function _enforceExitable(address held, uint24 feeTier) internal {
+        uint256 amount = heldAmount[held];
+        uint256 twapOut = UniswapTwap.quote(
+            registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
+        );
+        uint256 floorOut = (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+
+        uint256 simulatedOut;
+        try this.simulateExit(held, amount, feeTier) {
+            // simulateExit always reverts; reaching here would mean it did not.
+            revert("Exit simulation did not revert");
+        } catch (bytes memory reason) {
+            // Any revert other than ExitQuote (the pool could not take the
+            // trade at all) counts as an exit of zero.
+            if (reason.length == 36 && bytes4(reason) == ExitQuote.selector) {
+                assembly { simulatedOut := mload(add(reason, 36)) }
+            }
+        }
+
+        require(simulatedOut >= floorOut, "Position too large to exit within tolerance");
+    }
+
+    /**
+     * @notice Internal use only: performs a full exit of `amount` of `held`
+     *         and reverts with the output, so nothing it does persists.
+     * @dev    External only because try/catch needs an external call. Only
+     *         this vault may call it, and it can never complete.
+     */
+    function simulateExit(address held, uint256 amount, uint24 feeTier) external {
+        require(msg.sender == address(this), "Only the vault itself");
+        uint256 out = _executeSwap(held, asset, amount, 0, feeTier);
+        revert ExitQuote(out);
     }
 
     /**
@@ -762,6 +838,7 @@ contract Vault {
         require(isHeld[heldAsset], "Not a held asset");
         require(amountIn > 0,      "Amount must be greater than zero");
         require(minAmountOut > 0,  "minAmountOut must be greater than zero");
+        require(amountIn <= heldAmount[heldAsset], "Exceeds the amount this vault bought");
 
         uint24 feeTier = swapFeeTierOf[heldAsset];
         uint256 twapOut = UniswapTwap.quote(
@@ -771,6 +848,7 @@ contract Vault {
         if (minAmountOut < floorOut) { minAmountOut = floorOut; }
 
         uint256 amountOut = _executeSwap(heldAsset, asset, amountIn, minAmountOut, feeTier);
+        heldAmount[heldAsset] -= amountIn;
         _untrackIfEmptied(heldAsset);
 
         emit SwapExecuted(heldAsset, asset, amountIn, amountOut, true);
@@ -786,7 +864,14 @@ contract Vault {
         address router = registry.swapRouter();
         require(IERC20(tokenIn).approve(router, amountIn), "Swap approval failed");
 
-        amountOut = ISwapRouter(router).exactInputSingle(
+        // Item 17: the vault measures what it received rather than taking
+        // the router's word for it, and enforces the minimum itself. The
+        // router's own amountOutMinimum check stays as a first line; this is
+        // the one the vault relies on, and the measured figure is what every
+        // later check and the held-amount record use.
+        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        ISwapRouter(router).exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
                 tokenIn:  tokenIn,
                 tokenOut: tokenOut,
@@ -797,19 +882,29 @@ contract Vault {
                 sqrtPriceLimitX96: 0
             })
         );
+
+        amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
+        require(amountOut >= minAmountOut, "Received less than minimum");
     }
 
-    function _trackHeldAsset(address _asset, uint24 poolFee) internal {
+    /// @dev The tier is recorded once, at first entry, and never overwritten
+    ///      while the position is open. Overwriting it on every swap was the
+    ///      KRAIT-003 entry point: a dust swap re-pointed the whole exit.
+    function _trackHeldAsset(address _asset, uint24 poolFee, uint256 amount) internal {
         if (!isHeld[_asset]) {
             isHeld[_asset] = true;
             heldAssets.push(_asset);
+            swapFeeTierOf[_asset] = poolFee;
         }
-        swapFeeTierOf[_asset] = poolFee;
+        heldAmount[_asset] += amount;
     }
 
+    /// @dev Untracks on the vault's own record reaching zero, not on balance:
+    ///      a token sent in from outside must not keep a position "open".
     function _untrackIfEmptied(address _asset) internal {
-        if (IERC20(_asset).balanceOf(address(this)) == 0 && isHeld[_asset]) {
+        if (heldAmount[_asset] == 0 && isHeld[_asset]) {
             isHeld[_asset] = false;
+            delete swapFeeTierOf[_asset];
             for (uint256 i = 0; i < heldAssets.length; i++) {
                 if (heldAssets[i] == _asset) {
                     heldAssets[i] = heldAssets[heldAssets.length - 1];
@@ -971,31 +1066,34 @@ contract Vault {
     ///      the TWAP-implied value, or the whole settlement reverts.
     ///      Settlement happens in the loan asset, or not at all.
     function _forcedSwapBackAll() internal {
-        address router = registry.swapRouter();
         uint32 twapWindow = registry.twapWindow();
         uint256 tolBps = registry.twapToleranceBps();
 
         while (heldAssets.length > 0) {
             address held = heldAssets[heldAssets.length - 1];
+
+            // Sell what the vault BOUGHT, not whatever it happens to hold.
+            // Selling the whole balance let anyone stall settlement by
+            // sending the vault more of the asset than the pool could absorb
+            // (KRAIT-003): the oversized sale missed the floor and reverted.
+            // Tokens sent in directly stay in the vault, untouched.
+            uint256 amount = heldAmount[held];
             uint256 bal = IERC20(held).balanceOf(address(this));
-            if (bal > 0) {
+            if (bal < amount) { amount = bal; }
+
+            if (amount > 0) {
                 uint24 feeTier = swapFeeTierOf[held];
                 uint256 twapQuote = UniswapTwap.quote(
-                    registry.uniswapFactory(), held, asset, feeTier, bal, twapWindow
+                    registry.uniswapFactory(), held, asset, feeTier, amount, twapWindow
                 );
                 uint256 minOut = (twapQuote * (10000 - tolBps)) / 10000;
 
-                require(IERC20(held).approve(router, bal), "Swap-back approval failed");
-                uint256 out = ISwapRouter(router).exactInputSingle(
-                    ISwapRouter.ExactInputSingleParams({
-                        tokenIn: held, tokenOut: asset, fee: feeTier,
-                        recipient: address(this),
-                        amountIn: bal, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
-                    })
-                );
-                emit ForcedSwapBack(held, bal, out);
+                uint256 out = _executeSwap(held, asset, amount, minOut, feeTier);
+                emit ForcedSwapBack(held, amount, out);
             }
+            heldAmount[held] = 0;
             isHeld[held] = false;
+            delete swapFeeTierOf[held];
             heldAssets.pop();
         }
     }
@@ -1096,6 +1194,13 @@ contract Vault {
         returns (bool quotable, uint256 twapOut, uint256 minimumOut)
     {
         if (amountIn == 0) return (false, 0, 0);
+
+        // Same pool rule as swap(): a quote for a pool the vault would refuse
+        // is not a quote.
+        uint24 approvedFee = isHeld[tokenOut]
+            ? swapFeeTierOf[tokenOut]
+            : registry.poolFeeTier(tokenOut, asset);
+        if (approvedFee == 0 || poolFee != approvedFee) return (false, 0, 0);
 
         // Named uniFactory, not factory: this vault already has a `factory`
         // state variable holding the VaultFactory, and shadowing it here would

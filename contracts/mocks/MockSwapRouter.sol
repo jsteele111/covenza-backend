@@ -43,6 +43,25 @@ contract MockSwapRouter {
 
     event RateSet(address indexed tokenIn, address indexed tokenOut, uint256 num, uint256 den);
 
+    // Optional DEPTH per direction: input beyond `depth` fills at one tenth of
+    // the rate, so one large sale does worse than the same amount in small
+    // ones. Zero (the default) means unlimited, preserving earlier behaviour.
+    mapping(address => mapping(address => uint256)) public depth;
+
+    // Optional UNDERPAYMENT, in bps of the computed output (default 10000 =
+    // pays in full). The router still REPORTS the full amount and checks its
+    // own minimum against it, modelling a router or token that says one
+    // thing and delivers another.
+    uint256 public payoutBps = 10000;
+
+    function setDepth(address tokenIn, address tokenOut, uint256 _depth) external {
+        depth[tokenIn][tokenOut] = _depth;
+    }
+
+    function setPayoutBps(uint256 _bps) external {
+        payoutBps = _bps;
+    }
+
     function setRate(address tokenIn, address tokenOut, uint256 num, uint256 den) external {
         require(den > 0, "Zero denominator");
         rates[tokenIn][tokenOut] = Rate(num, den);
@@ -55,7 +74,12 @@ contract MockSwapRouter {
         Rate memory r = rates[params.tokenIn][params.tokenOut];
         require(r.den > 0, "No rate configured for pair");
 
-        amountOut = (params.amountIn * r.num) / r.den;
+        uint256 d = depth[params.tokenIn][params.tokenOut];
+        if (d == 0 || params.amountIn <= d) {
+            amountOut = (params.amountIn * r.num) / r.den;
+        } else {
+            amountOut = (d * r.num) / r.den + ((params.amountIn - d) * r.num) / (r.den * 10);
+        }
         require(amountOut >= params.amountOutMinimum, "Too little received");
 
         require(
@@ -63,7 +87,7 @@ contract MockSwapRouter {
             "Router pull failed"
         );
         require(
-            IERC20(params.tokenOut).transfer(params.recipient, amountOut),
+            IERC20(params.tokenOut).transfer(params.recipient, (amountOut * payoutBps) / 10000),
             "Router payout failed - fund the router with output tokens"
         );
     }

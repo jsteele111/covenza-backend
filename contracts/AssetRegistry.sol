@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./OperatorControlled.sol";
+import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence checks
 
 /**
  * @title AssetRegistry
@@ -207,6 +208,32 @@ contract AssetRegistry is OperatorControlled {
 
     mapping(address => AssetConfig) public assetConfig;
 
+    /**
+     * @notice The ONE Uniswap V3 fee tier a vault may trade each pair
+     *         through. Zero means no approved pool: swaps in that pair are
+     *         refused. Stored symmetrically, so (a, b) and (b, a) agree.
+     *
+     * @dev    WHY THE PROTOCOL CHOOSES THE POOL, NOT THE BORROWER. Every
+     *         pair can exist at several fee tiers, and before this the
+     *         borrower named the tier on each swap. That let them pick the
+     *         pool their own settlement would be forced through. KRAIT-003
+     *         (MAINNET-READINESS item 20): build a position in a deep pool,
+     *         then a dust swap through a thin pool (possibly their own)
+     *         re-pointed the whole exit at it, settlement missed the TWAP
+     *         floor and reverted, and the borrower held a free option on a
+     *         non-liquidating loan. Pinning the first tier a vault used would
+     *         not fix it: the borrower could simply make the thin pool the
+     *         first. Naming the pool here means a borrower who wants to stall
+     *         settlement must dominate the liquidity of the protocol's chosen
+     *         public pool, which is costly and visible.
+     *
+     *         Vaults record the tier at entry and keep it while the position
+     *         is open, so changing this affects new positions only. It is
+     *         instant for now; MAINNET-READINESS item 12 brings it under the
+     *         timelock with the other parameters live loans depend on.
+     */
+    mapping(address => mapping(address => uint24)) private _poolFeeTier;
+
     /// @notice Enumerable list of every asset ever added (whitelisted or
     ///         since removed) — removal flips the flag but keeps the entry,
     ///         so historical vaults can still look up aToken addresses.
@@ -219,6 +246,7 @@ contract AssetRegistry is OperatorControlled {
     event AssetRemoved(address indexed asset);
     event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
+    event PoolFeeTierUpdated(address indexed tokenA, address indexed tokenB, uint24 fee);
     event TierUpdated(address indexed asset, RiskTier tier);
     event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
         uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
@@ -556,6 +584,31 @@ contract AssetRegistry is OperatorControlled {
 
         assetConfig[_asset].gracePeriod = _gracePeriod;
         emit GracePeriodUpdated(_asset, _gracePeriod);
+    }
+
+    /**
+     * @notice Names the Uniswap V3 pool (by fee tier) vaults must use for a
+     *         pair. Both assets must be whitelisted and the pool must exist.
+     */
+    function setPoolFeeTier(address _tokenA, address _tokenB, uint24 _fee) external onlyOperator {
+        require(_tokenA != _tokenB, "Identical tokens");
+        require(
+            assetConfig[_tokenA].whitelisted && assetConfig[_tokenB].whitelisted,
+            "Asset not whitelisted"
+        );
+        require(
+            IUniswapV3Factory(uniswapFactory).getPool(_tokenA, _tokenB, _fee) != address(0),
+            "No pool at this fee tier"
+        );
+
+        _poolFeeTier[_tokenA][_tokenB] = _fee;
+        _poolFeeTier[_tokenB][_tokenA] = _fee;
+        emit PoolFeeTierUpdated(_tokenA, _tokenB, _fee);
+    }
+
+    /// @notice The approved fee tier for a pair, or zero if none.
+    function poolFeeTier(address _tokenA, address _tokenB) external view returns (uint24) {
+        return _poolFeeTier[_tokenA][_tokenB];
     }
 
     /**

@@ -364,10 +364,10 @@ first review did not walk.
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | Open |
 | 16 | Sequencer downtime can consume the grace window | MEDIUM | Open |
-| 17 | Swaps trust the router's minimum-output check | LOW | Open |
+| 17 | Swaps trust the router's minimum-output check | LOW | **FIXED** |
 | 18 | `swapBack` had no price floor: borrower could drain principal (KRAIT-001) | CRITICAL | **FIXED** |
 | 19 | Insurance paid unpaid interest at a lender-chosen APR (KRAIT-002) | HIGH | **FIXED** |
-| 20 | Borrower can make forced swap-back revert at will (KRAIT-003) | MEDIUM | Open |
+| 20 | Borrower can make forced swap-back revert at will (KRAIT-003) | MEDIUM | **FIXED** (residual: see item 14) |
 
 Items 16 and 17 surfaced while completing the Krait readiness assessment
 (report: https://krait.zealynx.io/shared/mEyG-WH0MhK1), after items 10–15 were
@@ -538,7 +538,14 @@ Accrue the bounty from that point, not from the original grace end.
 
 ---
 
-## 17. Swaps trust the router's minimum-output check — LOW — open
+## 17. Swaps trust the router's minimum-output check — LOW — **FIXED**
+
+> **Fixed 18 October 2026.** `_executeSwap` measures the output token's
+> balance before and after, requires the delta to meet the minimum
+> ("Received less than minimum"), and returns the measured figure. Every later
+> check and the new held-amount record use it. Tests: `KraitFindings.test.js`,
+> "Item 17".
+
 
 `Vault._executeSwap` and `_forcedSwapBackAll` pass `amountOutMinimum` to the
 router and rely on the router to enforce it. The vault never checks its own
@@ -616,7 +623,32 @@ protected by the pool. The deposit absorbs loss first and still covers
 interest where it is large enough; the pool then restores principal, up to
 the cap. Public materials must say "principal", not "made whole".
 
-## 20. Borrower can make forced swap-back revert at will — MEDIUM — open
+## 20. Borrower can make forced swap-back revert at will — MEDIUM — **FIXED**
+
+> **Fixed 18 October 2026**, going further than Krait's recommendation.
+> Pinning the first fee tier a vault used would not have been enough: the
+> borrower could make their own thin pool the first. So:
+>
+> - **The protocol names the pool.** `AssetRegistry.setPoolFeeTier` approves
+>   one fee tier per pair; `Vault.swap` refuses any other ("Swap must use the
+>   approved pool"). An open position keeps the tier it was bought at, so a
+>   registry change affects new positions only. The setter is instant for now
+>   and moves under the timelock with item 12.
+> - **The vault records what it bought** (`heldAmount`, from measured balance
+>   changes, item 17). Swap-back and settlement sell that amount and no more,
+>   so tokens sent in directly can no longer push an exit past the pool's
+>   depth. They stay in the vault.
+> - **The whole position must be sellable at entry.** After every purchase the
+>   vault performs the full exit it would face at settlement and reverts it
+>   (the Uniswap Quoter technique), refusing the purchase if the result misses
+>   the settlement floor ("Position too large to exit within tolerance").
+>
+> Ten regression tests in `KraitFindings.test.js`; all ten fail against
+> `27a30d7`. **Residual:** liquidity withdrawn after entry, for example by a
+> borrower who is also the approved pool's main provider, can still leave a
+> position unsellable. That is item 14's job. Deployment scripts must now call
+> `setPoolFeeTier` for every tradeable pair.
+
 
 `_trackHeldAsset` overwrites an asset's fee tier with the tier of the **most
 recent** swap into it, however small, and `_forcedSwapBackAll` sells the whole
@@ -655,10 +687,11 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
+**Done (18 October 2026):** items 17 and 20. 267 tests passing.
+
 **Before freeze:** item 12 (per-setter timelock or snapshot, plus the comment),
 item 13 (decide mandate semantics), item 15 (SafeERC20 or listing rule;
-timelock expiry), item 16 (sequencer-aware grace), item 17 (balance-delta
-check), item 20 (pin fee tier; impact on full balance), the Krait
+timelock expiry), item 16 (sequencer-aware grace), the Krait
 observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable
