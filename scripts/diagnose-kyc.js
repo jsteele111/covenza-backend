@@ -55,8 +55,24 @@ async function main() {
     const reg = await ethers.getContractAt("KYCRegistry", addr);
     console.log(`\n--- ${label} (${addr}) ---`);
     try {
-      console.log(`  isVerified   ${await reg.isVerified(WALLET)}`);
+      console.log(`  isVerified   ${await reg.isVerified(WALLET)}   (admitted and not revoked; ignores expiry)`);
       console.log(`  nonce        ${await reg.nonces(WALLET)}`);
+    } catch (e) {
+      console.log(`  read failed: ${(e.shortMessage || e.message).slice(0, 70)}`);
+    }
+    // KYC v2 (#7): what origination actually checks.
+    try {
+      const v = await reg.verificationOf(WALLET);
+      const until = Number(v.validUntil);
+      console.log(`  claims       ${v.claims} (1 KYC, 2 sanctions, 4 jurisdiction; 7 = all)`);
+      console.log(`  validUntil   ${until ? new Date(until * 1000).toISOString() : "-"}${until && until * 1000 < Date.now() ? "  EXPIRED" : ""}`);
+      console.log(`  manual grant ${v.manual}${v.manual ? `  case ${v.caseRef}` : ""}`);
+      if (label === "current") {
+        const b = await factory.requiredBorrowerClaims();
+        const l = await factory.requiredLenderClaims();
+        console.log(`  eligible as borrower (claims ${b}): ${await reg.isEligible(WALLET, b)}`);
+        console.log(`  eligible as lender   (claims ${l}): ${await reg.isEligible(WALLET, l)}`);
+      }
     } catch (e) {
       console.log(`  read failed: ${(e.shortMessage || e.message).slice(0, 70)}`);
     }

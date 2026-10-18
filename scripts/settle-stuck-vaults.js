@@ -2,7 +2,7 @@
 // factory — as the KEEPER account, not the lender.
 //
 // Usage:
-//   npx hardhat run scripts/settle-stuck-vaults.js --network arbitrumSepolia
+//   npx hardhat run scripts/settle-stuck-vaults.js --network robinhoodTestnet
 //
 // Why this exists: the two failed lifecycle-proof runs (the TWAP tick-sign
 // bug, then the unfunded keeper) each left a vault originated, deposited,
@@ -155,4 +155,4 @@ async function main() {
 main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
-});
+});

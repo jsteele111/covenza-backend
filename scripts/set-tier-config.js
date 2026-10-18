@@ -16,6 +16,7 @@
  */
 
 const hre = require("hardhat");
+const { sendOrQueue } = require("./lib/timelock");
 const fs = require("fs");
 const path = require("path");
 
@@ -70,11 +71,16 @@ async function main() {
     return;
   }
 
-  await (await registry.setTierConfig(
-    TIER, next.vol, next.minDep, next.maxTerm, next.maxExp, next.prem
-  )).wait();
+  // Raising the exposure cap waits on the timelock (item 12); everything else
+  // is instant. sendOrQueue sends, announces or prints Safe transactions.
+  const result = await sendOrQueue(registry, "setTierConfig",
+    [TIER, next.vol, next.minDep, next.maxTerm, next.maxExp, next.prem],
+    { network: hre.network.name, label: `tier ${TIER} config` });
+  if (result !== "executed") return;
 
-  console.log("\nApplied. Existing loans are unaffected — vaults snapshot at origination.");
+  console.log("\nApplied. Deposit floor, term and premium are snapshotted at origination, so");
+  console.log("open loans keep theirs. The exposure cap is not: open loans use the lowest cap");
+  console.log("in force since they began, so a lowered cap tightens them too.");
   console.log("Re-run model-insurance-solvency.js to see the effect on coverage.");
 }
 

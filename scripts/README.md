@@ -1,59 +1,96 @@
 # Scripts
 
-Every script here works against the current v2.1 contracts. Anything targeting
-the v1 contracts has been removed — see git history if you need it.
+Operational scripts for the Robinhood Chain deployment. None of them is in the
+audit scope. Every script in this folder works against the current contracts;
+scripts written for earlier versions (Arbitrum Sepolia, the single-key KYC
+registry) are in [`legacy/`](legacy/) and are not maintained.
+
+Most read and write `deployed-addresses.json` (what is deployed where) and
+`uniswap-testnet.json` (the test Uniswap V3, its tokens and pools). Run them
+with `npx hardhat run scripts/<name>.js --network robinhoodTestnet` unless the
+table says otherwise. Each file's header explains why it exists and its
+environment variables.
 
 ## Deployment
 
 | Script | Purpose |
 |---|---|
-| `deploy-v2-infrastructure.js` | Full stack deploy: mock tokens, mock Aave/Uniswap, InsurancePool, AssetRegistry, VaultFactory. Reuses the existing KYCRegistry rather than redeploying it, since that contract is unchanged and redeploying would reset every verified badge. Prints ready-to-paste `hardhat verify` commands. |
-| `redeploy-factory-v21.js` | Replaces **only** the VaultFactory, reusing the live KYCRegistry, AssetRegistry and InsurancePool. Used for the v2.1 protocol fee upgrade. Verifies the deployer is the pool operator before starting, and confirms reserves survive the rewire. |
+| `deploy-uniswap-testnet.js` | Deploys real Uniswap V3 (factory, SwapRouter02) to testnet with a tUSDG/tWETH pool we control, and warms its oracle. Uniswap is not on Robinhood testnet. |
+| `deploy-robinhood-testnet.js` | Full protocol deploy against that Uniswap: KYCRegistry, InsurancePool, AssetRegistry, TWAP library, Vault implementation, VaultLens, VaultFactory. Lists assets (and any stock tokens already in `uniswap-testnet.json`), names the approved pool for every pair, seeds the insurance pool. Timelocked calls go through `lib/timelock.js`. |
+| `deploy-stock-token-testnet.js` | Adds a test tokenised equity: deploys it, opens and seeds a tUSDG pool, warms the oracle, lists it as Standard tier with a 72-hour grace, names its approved pool. |
+| `redeploy-factory-v21.js` | Replaces only the factory, Vault implementation, TWAP library and VaultLens, reusing the registries and pool. Refuses if any reused contract is an older version. |
+| `list-asset.js` | Lists an already-deployed token on the current registry and names its approved pool. For use after a registry redeploy. |
+| `set-tier-config.js` | Changes one tier's parameters, keeping the others. Raising an exposure cap waits on the timelock. |
+| `execute-timelocked.js` | Executes admin calls announced earlier, once their delay has passed. `LIST_ONLY=1` to just report. |
+| `lib/timelock.js` | Shared helper: sends a timelocked call if it can take effect now, otherwise announces it and records it in `pending-timelock.json`; prints Safe transactions when control is with a Safe. |
+| `lib/production-guards.js` | Refuses a mainnet deploy carrying testnet values (zero timelock, 60 s TWAP, outage detection off, deployer as attester, any yield venue). |
+| `check-sizes.js` | Bytecode size of every contract against the 24,576-byte limit (`npx hardhat run scripts/check-sizes.js`). |
 
-```bash
-npx hardhat run scripts/deploy-v2-infrastructure.js --network arbitrumSepolia
-npx hardhat run scripts/redeploy-factory-v21.js     --network arbitrumSepolia
+## Heartbeat bot (item 16)
+
+| Script | Purpose |
+|---|---|
+| `heartbeat-bot.js` | Calls `AssetRegistry.heartbeat()` every 5 minutes, with Telegram alerts. Plain Node: `node scripts/heartbeat-bot.js`, or under pm2 with `ecosystem.config.js`. See the main README. |
+| `generate-heartbeat-key.js` | Creates the bot's gas-only key straight into `.env` and prints its address (`node scripts/generate-heartbeat-key.js`). |
+
+## Identity (KYC v2)
+
+| Script | Purpose |
+|---|---|
+| `manage-attesters.js` | Adds, removes or rotates a recognised identity provider. Additions and rotations are announced first and executed after the delay. |
+| `check-verifier-key.js` | Lists the providers whose attestations the registry accepts. |
+| `generate-verifier-key.js` | Generates a keypair for a test attester (`node scripts/generate-verifier-key.js`). |
+| `mock-verify.js` | Signs one EIP-712 attestation locally, for testing without a provider. |
+| `mock-verify-server.js` | Local HTTP server (port 4000) standing in for a provider, so the frontend's verification flow works in development (`node scripts/mock-verify-server.js`). |
+| `lib/kyc-attestation.js` | Shared EIP-712 attestation builder used by both mock verifiers. |
+| `diagnose-kyc.js` | What the registry says about a wallet: claims, expiry, manual grant, and eligibility as borrower and lender. |
+
+## Governance handover
+
+| Script | Purpose |
+|---|---|
+| `check-safe-support.js` | Checks Safe's contracts exist on the chain. |
+| `create-safes.js` | Creates the operator and owner Safes. |
+| `transfer-control.js` | Nominates the Safes as operator and owner (step one of two). |
+| `safe-accept-roles.js` | Accepts the roles from inside each Safe (step two). |
+| `verify-handover.js` | Proves the old key is refused and the Safe governs. |
+| `verify-two-step.js` | Proves on chain that the deployed contracts hold the two-step transfer, then restores state. |
+
+## Proofs on testnet
+
+| Script | Purpose |
+|---|---|
+| `lifecycle-proof-robinhood.js` | Full loan lifecycle against real Uniswap, moving prices by trading. |
+| `prove-insurance-draw.js` | Forces a loss beyond the deposit and shows the insurance pool paying. |
+| `prove-keeper-bounty.js` | An abandoned loan settled by a stranger, who is paid the bounty. |
+| `force-loss-testnet.js` | Crashes a test pool's price so a live loan settles at a loss. |
+| `settle-stuck-vaults.js` | Settles every expired, unsettled vault as the keeper account. |
+| `preflight-mandate.js` | Checks balances, allowances, eligibility and the deposit floor before a manual mandate walkthrough. |
+
+## Diagnostics and accounts
+
+| Script | Purpose |
+|---|---|
+| `diagnose-chain.js` | Checks the live state the deploy and proof scripts depend on (pool history, reserves, addresses). |
+| `diagnose-vault.js` | Everything `payDeposit()` and `settle()` gate on for one vault, with decoded revert reasons. |
+| `show-accounts.js` | Addresses and balances of every configured account. |
+| `fund-accounts.js` | Shares ETH from the deployer to the borrower and keeper accounts. |
+| `generate-keeper.js` | Generates a throwaway testnet keeper wallet. |
+| `model-insurance-solvency.js` | Models expected insurance draws against premium income per tier (item 8). |
+
+## Environment (`.env`)
+
 ```
-
-Both read and write `deployed-addresses.json`, which is the single source of
-truth for what is deployed where.
-
-## Proof and settlement
-
-| Script | Purpose |
-|---|---|
-| `lifecycle-proof.js` | Originates and settles three vaults, one at each settlement access tier, including a deliberate 20% adverse price move to prove the deposit → insurance → lender waterfall and the zero-protocol-fee-on-loss property. Takes 5–8 minutes; it waits out real grace periods. |
-| `settle-stuck-vaults.js` | Settles every expired-but-unsettled vault **as the keeper account**, earning the time-accrued bounty. Both cleanup utility and a live demonstration of tier-3 settlement. |
-
-`lifecycle-proof.js` requires `KEEPER_PRIVATE_KEY` in `.env` — the tier-3 proof
-needs a genuinely third-party account, since `settle()` excludes the lender and
-borrower from the bounty branch.
-
-## KYC verifier key
-
-The KYCRegistry verifies wallets via a signed attestation from an
-operator-rotatable verifier key. These manage that key.
-
-| Script | Purpose |
-|---|---|
-| `generate-verifier-key.js` | Generates a fresh keypair. Print the address into `.env` as `VERIFIER_ADDRESS`. |
-| `set-verifier-key.js` | Points the deployed KYCRegistry at a new verifier key. Operator only. |
-| `check-verifier-key.js` | Reads back the currently configured key. |
-| `mock-verify.js` | Signs a single attestation locally, for testing the verification path without a real KYC provider. |
-| `mock-verify-server.js` | Local HTTP server on port 4000 standing in for the production verifier function, so the frontend's KYC flow works in development. |
-
-## Utilities
-
-| Script | Purpose |
-|---|---|
-
-## Environment
-
-```
-ARBITRUM_SEPOLIA_RPC_URL=     # RPC endpoint
+ROBINHOOD_TESTNET_RPC_URL=    # optional; defaults to the public RPC
+ROBINHOOD_MAINNET_RPC_URL=
 DEVTEST_PRIVATE_KEY=          # deployer / operator / lender
 BORROWER_PRIVATE_KEY=         # borrower
-KEEPER_PRIVATE_KEY=           # third-party keeper, for tier-3 settlement
-VERIFIER_ADDRESS=             # public address of the KYC verifier key
+KEEPER_PRIVATE_KEY=           # third-party keeper, for the bounty tier
+HEARTBEAT_PRIVATE_KEY=        # heartbeat bot, gas money only
+TELEGRAM_BOT_TOKEN=           # heartbeat alerts
+TELEGRAM_CHAT_ID=
+ATTESTER_KEY=                 # address of the initial attester (production: a provider, never the deployer)
+VERIFIER_PRIVATE_KEY=         # mock attester's signing key, testnet only
 TREASURY_ADDRESS=             # protocol fee recipient
+TIMELOCK_DELAY=               # seconds; 0 on testnet, at least 86400 on mainnet
 ```

@@ -73,6 +73,11 @@ async function main() {
   // legitimate — the mandate simply shows zero fillable until it is set.
   console.log(`  ${capacity >= principal ? "OK  " : "note"}  ${"allowance to factory".padEnd(34)} ${ethers.formatEther(lAllow)} tUSDG${capacity < principal ? "   <-- raise in the UI before publishing" : ""}`);
   check(lEth > 0n, "has gas", `${ethers.formatEther(lEth)} ETH`);
+  // Lenders are screened too (#7): the factory's lender requirement, checked
+  // at fill time against an attestation that may since have expired.
+  const lenderClaims = await factory.requiredLenderClaims();
+  check(await kyc.isEligible(lender.address, lenderClaims), "eligible (current attestation)",
+        `${lender.address}, needs claims ${lenderClaims}`);
 
   // --- borrower side ---
   console.log("\n--- borrower (fills) ---");
@@ -85,7 +90,11 @@ async function main() {
   const premium = (principal * premiumBps * termSecs) / (10000n * 31536000n);
   const owed = deposit + premium;
 
-  check(await kyc.isVerified(borrower.address), "KYC verified", borrower.address);
+  // isEligible, not isVerified: it also checks the attestation has not
+  // expired and carries every claim the factory requires (#7).
+  const borrowerClaims = await factory.requiredBorrowerClaims();
+  check(await kyc.isEligible(borrower.address, borrowerClaims), "eligible (current attestation)",
+        `${borrower.address}, needs claims ${borrowerClaims}`);
   check(bBal >= owed, "balance covers deposit + premium",
         `${ethers.formatEther(bBal)} tUSDG held, ${ethers.formatEther(owed)} needed`);
   console.log(`        ${"".padEnd(34)} (deposit ${ethers.formatEther(deposit)} + premium ${ethers.formatEther(premium)})`);

@@ -8,8 +8,9 @@
  * failures all reporting "code too large" from a fixture, with nothing in the
  * output pointing at the actual cause.
  *
- * VaultFactory is the one to watch. It embeds Vault's full creation bytecode,
- * so every byte added to Vault lands in the factory too.
+ * Vault is the one to watch: 23,965 bytes after item 14's in-kind settlement,
+ * which is why quoteSwapOut moved to VaultLens. (VaultFactory used to embed
+ * Vault's bytecode; it now clones a deployed implementation instead.)
  *
  * Usage:
  *   npx hardhat run scripts/check-sizes.js

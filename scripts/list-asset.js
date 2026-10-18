@@ -7,6 +7,10 @@
  * second tAAPL against a second pool, orphaning the one whose oracle is warm
  * and whose price history the existing loans were priced against.
  *
+ * Also names the approved pool for the asset's pair with tUSDG, from
+ * uniswap-testnet.json, when there is one and none is named yet. Without it
+ * every swap into the asset is refused (KRAIT-003 / item 20).
+ *
  * Usage:
  *   SYMBOL=tAAPL TIER=1 GRACE_HOURS=72 npx hardhat run scripts/list-asset.js --network robinhoodTestnet
  *   ASSET=0x… TIER=1 GRACE_HOURS=72 npx hardhat run scripts/list-asset.js --network robinhoodTestnet
@@ -80,6 +84,23 @@ async function main() {
     console.log(`Tier history entries: ${await registry.tierHistoryLength(asset)}`);
   } catch {
     console.log("Tier history: unavailable — this registry predates it.");
+  }
+
+  // --- Approved pool for the pair with tUSDG ---
+  const usdg = uni.tokens.tUSDG;
+  const sym = SYMBOL || Object.keys(uni.tokens).find((k) => uni.tokens[k].toLowerCase() === asset.toLowerCase());
+  const pool = uni.pools.find((p) =>
+    (p.pair && sym && p.pair === `tUSDG/${sym}`) ||
+    (p.token0 && [p.token0, p.token1].map((x) => x.toLowerCase()).includes(asset.toLowerCase())));
+  if (asset.toLowerCase() === usdg.toLowerCase()) {
+    // tUSDG itself: nothing to pair with here.
+  } else if (!pool) {
+    console.log("No pool for this asset in uniswap-testnet.json — name one with setPoolFeeTier before borrowers can swap into it.");
+  } else if (Number(await registry.poolFeeTier(asset, usdg)) !== 0) {
+    console.log(`Approved pool already named (fee ${await registry.poolFeeTier(asset, usdg)}).`);
+  } else {
+    await (await registry.setPoolFeeTier(asset, usdg, pool.fee)).wait();
+    console.log(`Approved pool named: tUSDG/${sym || asset} at fee ${pool.fee}.`);
   }
 
   for (const days of [7, 30]) {
