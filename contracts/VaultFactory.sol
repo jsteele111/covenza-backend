@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/proxy/Clones.sol";
 
 import "./Vault.sol";
-import "./KYCRegistry.sol";
+import "./interfaces/IIdentityAdapter.sol";
 import "./AssetRegistry.sol";
 import "./InsurancePool.sol";
 import "./interfaces/IERC20.sol";
@@ -48,7 +48,21 @@ contract VaultFactory is Timelocked {
 
     // --- State variables ---
 
-    KYCRegistry   public kycRegistry;
+    /// @notice The identity adapter. Named for history; any IIdentityAdapter
+    ///         (the attester-based KYCRegistry today, a ZK adapter later).
+    IIdentityAdapter public kycRegistry;
+
+    /// @notice Claims a borrower must hold at origination: KYC passed,
+    ///         sanctions clear, eligible jurisdiction. Checked at the point of
+    ///         use, because attestations expire.
+    uint256 public requiredBorrowerClaims = IdentityClaims.ALL;
+
+    /// @notice Claims a lender must hold at origination. Starts at sanctions
+    ///         screening only: a light AML check on the source of lending
+    ///         capital without full KYC. Zero means lenders are not checked.
+    uint256 public requiredLenderClaims = IdentityClaims.SANCTIONS_CLEAR;
+
+    event RequiredClaimsUpdated(uint256 borrowerClaims, uint256 lenderClaims);
     AssetRegistry public assetRegistry;
     InsurancePool public insurancePool;
     address       public owner;
@@ -199,7 +213,7 @@ contract VaultFactory is Timelocked {
         require(_vaultImplementation != address(0), "Invalid vault implementation address");
         require(_vaultImplementation.code.length > 0, "Vault implementation has no code");
 
-        kycRegistry         = KYCRegistry(_kycRegistry);
+        kycRegistry         = IIdentityAdapter(_kycRegistry);
         assetRegistry       = AssetRegistry(_assetRegistry);
         insurancePool       = InsurancePool(_insurancePool);
         treasury            = _treasury;
@@ -350,7 +364,11 @@ contract VaultFactory is Timelocked {
     function _deployVault(OriginationParams memory p) internal returns (address) {
 
         // --- Gates ---
-        require(kycRegistry.isVerified(p.borrower),     "Borrower is not KYC verified");
+        require(kycRegistry.isEligible(p.borrower, requiredBorrowerClaims), "Borrower is not KYC verified");
+        require(
+            requiredLenderClaims == 0 || kycRegistry.isEligible(p.lender, requiredLenderClaims),
+            "Lender is not eligible"
+        );
         require(assetRegistry.isWhitelisted(p.asset),   "Loan asset is not whitelisted");
 
         // --- Basic validation ---
@@ -956,6 +974,30 @@ contract VaultFactory is Timelocked {
         emit ProtocolFeeRateUpdated(previous, _newBps);
     }
 
+    /**
+     * @notice Sets the claims borrowers and lenders must hold at origination.
+     * @dev    Removing a claim from either requirement admits people who were
+     *         previously refused, so it waits on the timelock (announce with
+     *         queueAction(keccak256(calldata))). Adding one is instant. The
+     *         borrower requirement can never be empty.
+     */
+    function setRequiredClaims(uint256 _borrowerClaims, uint256 _lenderClaims) external onlyOwner {
+        require(_borrowerClaims != 0, "Borrowers must be screened");
+        require(((_borrowerClaims | _lenderClaims) & ~IdentityClaims.ALL) == 0, "Unknown claims");
+        bool loosens = (_borrowerClaims & requiredBorrowerClaims) != requiredBorrowerClaims
+                    || (_lenderClaims & requiredLenderClaims) != requiredLenderClaims;
+        if (loosens) { _consumeIfDelayed(keccak256(msg.data)); }
+        requiredBorrowerClaims = _borrowerClaims;
+        requiredLenderClaims   = _lenderClaims;
+        emit RequiredClaimsUpdated(_borrowerClaims, _lenderClaims);
+    }
+
+    /// @notice Announces a timelocked change by the hash of its calldata.
+    function queueAction(bytes32 _id) external onlyOwner { _queue(_id); }
+
+    /// @notice Abandons an announced change. Instant.
+    function cancelAction(bytes32 _id) external onlyOwner { _cancel(_id); }
+
     /// @notice Approves or removes an integrator as an eligible referrer.
     ///         Affects new loans only: each vault records its referrer at
     ///         origination.
@@ -1045,7 +1087,7 @@ contract VaultFactory is Timelocked {
 
         _consume(_registriesId(_kycRegistry, _assetRegistry, _insurancePool));
 
-        kycRegistry   = KYCRegistry(_kycRegistry);
+        kycRegistry   = IIdentityAdapter(_kycRegistry);
         assetRegistry = AssetRegistry(_assetRegistry);
         insurancePool = InsurancePool(_insurancePool);
         emit RegistriesUpdated(_kycRegistry, _assetRegistry, _insurancePool);

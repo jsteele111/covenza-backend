@@ -147,8 +147,12 @@ async function main() {
   await kyc.waitForDeployment();
   console.log(`\nKYCRegistry     ${await kyc.getAddress()}`);
 
-  await (await kyc.verify(borrower.address)).wait();
-  console.log(`  verified borrower ${borrower.address}`);
+  // Manual grant (#7): all three claims, 30 days, with a case reference.
+  // With a zero testnet delay it applies at once.
+  await (await kyc.verify(borrower.address, 7, ethers.id("testnet-demo-borrower"))).wait();
+  console.log(`  manually granted borrower ${borrower.address} (30 days)`);
+  await (await kyc.verify(deployer.address, 7, ethers.id("testnet-demo-lender"))).wait();
+  console.log(`  manually granted lender ${deployer.address} (lenders need sanctions screening)`);
 
   // --- 2. ERC-4626 yield venue over tUSDG ------------------------------
   //

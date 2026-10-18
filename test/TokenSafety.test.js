@@ -21,7 +21,8 @@ describe("Item 15 — token safety and timelock expiry", function () {
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
-    await kyc.verify(borrower.address);
+    await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+    await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await nr.getAddress(), 0);

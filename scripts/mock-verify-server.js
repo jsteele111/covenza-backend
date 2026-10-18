@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const { buildAttestation, CLAIMS } = require("./lib/kyc-attestation");
 const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
@@ -74,27 +75,25 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ error: "A valid borrowerAddress is required." });
     }
 
-    const alreadyVerified = await registry.isVerified(borrowerAddress);
-    if (alreadyVerified) {
-      return res.status(409).json({ error: "This address is already verified." });
-    }
+    // KYCRegistry v2 (#7): EIP-712, with claims and an expiry. Re-issuing
+    // for an already-verified wallet is a renewal, so it is no longer refused.
+    // Testnet stand-in: attests all three claims for 180 days.
+    const a = await buildAttestation(verifierWallet, registry, borrowerAddress, {
+      claims: CLAIMS.ALL,
+      validForSecs: 180 * 86400,
+    });
 
-    const nonce = await registry.nonces(borrowerAddress);
-    const expiry = Math.floor(Date.now() / 1000) + 60 * 60; // valid for 1 hour
+    console.log(`Issued attestation for ${borrowerAddress} (nonce ${a.nonce}, valid until ${a.validUntil})`);
 
-    const structHash = ethers.solidityPackedKeccak256(
-      ["address", "uint256", "uint256", "address"],
-      [borrowerAddress, expiry, nonce, REGISTRY_ADDRESS]
-    );
-    const signature = await verifierWallet.signMessage(ethers.getBytes(structHash));
-
-    console.log(`Issued attestation for ${borrowerAddress} (nonce ${nonce})`);
-
+    // Submit with: verifyWithSignature(wallet, claims, validUntil, deadline, signature)
     res.json({
       borrowerAddress,
-      expiry,
-      nonce: nonce.toString(),
-      signature,
+      claims: a.claims,
+      validUntil: a.validUntil,
+      deadline: a.deadline,
+      expiry: a.deadline,            // kept for older interface code; same as deadline
+      nonce: a.nonce,
+      signature: a.signature,
       registryAddress: REGISTRY_ADDRESS
     });
   } catch (error) {
@@ -125,4 +124,4 @@ app.listen(PORT, async () => {
   } catch {
     console.log("Status:   registry predates recognised attesters (no isRecognisedAttester).");
   }
-});
+});

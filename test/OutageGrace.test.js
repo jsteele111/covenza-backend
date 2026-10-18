@@ -34,7 +34,8 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     await weth.mint(await router.getAddress(), E("1000"));
     await usdx.mint(await router.getAddress(), E("1000"));
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
-    await kyc.verify(borrower.address);
+    await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+    await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);
     await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);

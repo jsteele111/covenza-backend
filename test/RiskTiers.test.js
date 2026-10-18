@@ -63,7 +63,8 @@ describe("Risk tiers", function () {
 
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator))
       .deploy(operator.address, operator.address, 0);
-    await kyc.verify(borrower.address);
+    await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+    await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await aave.getAddress(), await router.getAddress(),

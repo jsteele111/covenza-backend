@@ -40,8 +40,9 @@ async function stack() {
   await usdx.mint(await router.getAddress(), E("1000"));
 
   const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
-  await kyc.verify(borrower.address);
-  await kyc.verify(attacker.address);
+  await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+  await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
+  await kyc.verify(attacker.address, 7, ethers.id("test-fixture"));
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
     operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);

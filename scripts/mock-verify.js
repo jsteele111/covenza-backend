@@ -1,5 +1,6 @@
 const hre = require("hardhat");
 const fs = require("fs");
+const { buildAttestation, CLAIMS } = require("./lib/kyc-attestation");
 const path = require("path");
 
 async function main() {
@@ -26,27 +27,24 @@ async function main() {
 
   const registry = await hre.ethers.getContractAt("KYCRegistry", registryAddress);
 
-  // --- Read the borrower's current nonce on-chain (must match what the contract checks) ---
-  const nonce = await registry.nonces(borrowerAddress);
-
-  // --- Attestation is valid for 1 hour from now ---
-  const expiry = Math.floor(Date.now() / 1000) + 60 * 60;
-
-  // --- Build the exact same hash the contract computes, then sign it ---
-  const structHash = hre.ethers.solidityPackedKeccak256(
-    ["address", "uint256", "uint256", "address"],
-    [borrowerAddress, expiry, nonce, registryAddress]
-  );
-
+  // --- EIP-712 attestation in the KYCRegistry v2 format (#7) ---
   const verifierWallet = new hre.ethers.Wallet(verifierPrivateKey);
-  const signature = await verifierWallet.signMessage(hre.ethers.getBytes(structHash));
+  const a = await buildAttestation(verifierWallet, registry, borrowerAddress, {
+    claims: CLAIMS.ALL,
+    validForSecs: 180 * 86400,
+  });
+  const { nonce, signature } = a;
+  const expiry = a.deadline;
 
   console.log("\n=== Mock KYC Verification Attestation ===\n");
   console.log("Network:   ", hre.network.name);
   console.log("Registry:  ", registryAddress);
   console.log("Borrower:  ", borrowerAddress);
   console.log("Nonce:     ", nonce.toString());
-  console.log("Expiry:    ", expiry, `(${new Date(expiry * 1000).toISOString()})`);
+  console.log("Claims:    ", a.claims, "(KYC, sanctions, jurisdiction)");
+  console.log("Valid to:  ", a.validUntil, `(${new Date(a.validUntil * 1000).toISOString()})`);
+  console.log("Submit by: ", expiry, `(${new Date(expiry * 1000).toISOString()})`);
+  console.log("Call:       verifyWithSignature(borrower, claims, validUntil, deadline, signature)");
   console.log("Signature: ", signature);
   console.log("\n===========================================\n");
 }
@@ -54,4 +52,4 @@ async function main() {
 main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
-});
+});

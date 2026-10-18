@@ -84,9 +84,22 @@ async function main() {
     if (!ethers.isAddress(OLD_KEY) || !ethers.isAddress(KEY)) {
       throw new Error("OLD_KEY and KEY must both be valid addresses.");
     }
-    console.log(`\nRotating ${OLD_KEY} -> ${KEY}, keeping the provider's name.`);
-    await (await registry.rotateAttester(OLD_KEY, KEY)).wait();
-    console.log("Done.");
+    // Rotation recognises a new key, so it waits on the timelock like an
+    // addition (#7: closes the Krait timelock-bypass observation). Run once to
+    // announce, and again after the delay to execute.
+    const rid = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ["string", "address", "address"], ["rotateAttester", OLD_KEY, KEY]));
+    if (Number(await registry.queuedAt(rid)) === 0) {
+      await (await registry.queueRotateAttester(OLD_KEY, KEY)).wait();
+      const delay = Number(await registry.timelockDelay());
+      console.log(`\nRotation ${OLD_KEY} -> ${KEY} announced. Run again in ${delay}s to execute.`);
+    } else if (await registry.isExecutable(rid)) {
+      await (await registry.rotateAttester(OLD_KEY, KEY)).wait();
+      console.log(`\nRotated ${OLD_KEY} -> ${KEY}, keeping the provider's name.`);
+    } else {
+      const left = Number(await registry.timeUntilExecutable(rid));
+      console.log(`\nRotation already announced. ${left}s remaining before it can be executed.`);
+    }
   } else if (ACTION !== "list") {
     throw new Error(`Unknown ACTION "${ACTION}". Use list, add, remove or rotate.`);
   }

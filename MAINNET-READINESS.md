@@ -749,7 +749,12 @@ full post-swap balance in the exit direction, not just the increment.
 
 ## Krait observations (not findings, but on the list)
 
-- **Attester timelock can be walked around.** `KYCRegistry.rotateAttester`
+- ~~**Attester timelock can be walked around.**~~ — **fixed 18 October 2026**
+  in the KYC adapter redesign: `rotateAttester` must be announced and wait,
+  and the manual `verify()` is timelocked, lasts 30 days, is once per wallet
+  per year, carries a case reference, is marked manual, and is limited to five
+  in any 30 days. `KYCRegistry.test.js`. Original note:
+  `KYCRegistry.rotateAttester`
   adds the new key instantly, and `verify()` admits any wallet instantly. The
   README says adding an attester is timelocked; against the operator it
   currently protects nothing. Same pattern as item 10. Fold into the KYC
@@ -769,10 +774,14 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
-**Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 16, 17 and 20, and three Krait observations. 311 tests passing.
+**Done (18 October 2026):** items 12 (except per-asset grace), 13, 15, 16, 17 and 20, the KYC adapter redesign, and four Krait observations. 335 tests passing.
 
-**Before freeze:** the per-asset grace decision (item 12), the heartbeat bot (item 16), the Krait
-observations, and update `redeploy-factory-v21.js`.
+**Before freeze:** the per-asset grace decision (item 12), the heartbeat bot
+(item 16), and the deployment scripts (`redeploy-factory-v21.js`, pool approvals,
+announcing timelocked changes). All four Krait observations are closed.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable
-assets), alongside item 8 (insurance solvency) and the KYC adapter work.
+assets), alongside item 8 (insurance solvency). The KYC adapter work is
+**done (18 October 2026)**: `IIdentityAdapter`, expiring claim-bearing EIP-712
+attestations checked at origination, lender screening, and the manual-grant
+safeguards. See `KYCRegistry.sol` and `IdentityAdapter.test.js`.

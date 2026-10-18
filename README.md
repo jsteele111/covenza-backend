@@ -20,16 +20,17 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | File | nSLOC | Responsibility |
 |---|---:|---|
 | `contracts/Vault.sol` | 585 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
-| `contracts/VaultFactory.sol` | 547 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
+| `contracts/VaultFactory.sol` | 566 | Clones vaults from one implementation. identity gating through `IIdentityAdapter` (borrowers need all three claims, lenders sanctions screening; loosening is timelocked), whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 431 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
-| `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
+| `contracts/KYCRegistry.sol` | 190 | Identity adapter backed by third-party attesters. EIP-712 attestations bound to chain and contract, carrying claim flags (KYC, sanctions, jurisdiction) and an expiry of at most 365 days, checked at every origination. Timelocked attester additions and rotations. Manual grants: timelocked, 30 days, once per wallet per year, case reference on chain, marked manual, at most 5 per 30 days. No identity data stored |
 | `contracts/InsurancePool.sol` | 105 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
 | `contracts/Timelocked.sol` | 51 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
+| `contracts/interfaces/IIdentityAdapter.sol` | 10 | The one identity question the protocol asks (`isEligible(wallet, claims)`), and the claim flags. Lets a ZK adapter replace KYCRegistry without changing the lending contracts |
 | `contracts/libraries/SafeTransfer.sol` | 31 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,078** | 1,989 written for Covenza + 89 vendored |
+| **Total** | **2,151** | 2,062 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -94,7 +95,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**311 tests** across 17 suites.
+**335 tests** across 18 suites.
 
 ```bash
 npm install
@@ -109,7 +110,8 @@ npx hardhat test
 | `GroupH.test.js` | 19 | Protocol fee: add-on behaviour, zero fee on loss, referrer split, approved referrers only, rate snapshotting |
 | `InsuranceFunding.test.js` | 15 | Premium funding and cancellation |
 | `Interest.test.js` | 11 | Annualised interest and minimum charge |
-| `KYCRegistry.test.js` | 46 | Attester signatures, revocation, two-step operator transfer, timelocked attesters, status |
+| `KYCRegistry.test.js` | 62 | EIP-712 attestations (expiry, claims, chain and contract binding, replay, renewal), the six manual-grant safeguards, revocation, two-step operator transfer, timelocked attester addition and rotation, status |
+| `IdentityAdapter.test.js` | 8 | Eligibility checked at origination: expired and partial attestations refused, lenders screened, requirements timelocked to loosen, any adapter accepted |
 | `Mandates.test.js` | 34 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface, total capacity |
 | `ProductionGuards.test.js` | 12 | Deploy guards, including outage detection left on |
 | `RiskTiers.test.js` | 25 | Tier floors, term limits, exposure caps, tier history (both directions) |
@@ -168,7 +170,7 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **The ERC-4626 venue on testnet is a mock.** No real venue exists on Robinhood Chain yet; mainnet ships with none.
 - **Outage detection depends on a heartbeat bot.** `AssetRegistry.heartbeat()` must be called every few minutes (`scripts/heartbeat-bot.js`, planned). If it stops, quiet periods are read as outages: the parties get extra time and keepers wait, capped at 72 hours per loan. Nobody is locked out, but the keeper backstop slows.
 - **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
-- **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
+- **No commercial identity provider is integrated yet.** Attester curation is the main control on who can borrow; attestations now expire within a year and carry the claims checked. A ZK adapter can be added later behind the same interface.
 - **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool or a new yield venue); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. The **per-asset grace extension** is still instant, pending a design decision. Item 12.
 - **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
 - **Settlement has no fallback if a held asset cannot be swapped back**, for example a tokenised equity frozen by its issuer. The loan stays unsettled until it can be. Item 14.
@@ -182,7 +184,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 311 tests, 17 suites
+test/                 335 tests, 18 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)
