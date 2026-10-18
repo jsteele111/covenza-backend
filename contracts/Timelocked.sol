@@ -34,6 +34,14 @@ abstract contract Timelocked {
     /// @notice Seconds that must elapse between queueing and executing.
     uint256 public immutable timelockDelay;
 
+    /// @notice How long a matured action stays executable before it lapses.
+    /// @dev    MAINNET-READINESS item 15. Without it an approval lived for
+    ///         ever: an action queued for a migration months ago could still
+    ///         be executed today, by whoever then holds the operator key, with
+    ///         no fresh warning to anyone. A lapsed action must be queued
+    ///         again, publicly, and wait the full delay again.
+    uint256 public constant EXECUTION_WINDOW = 14 days;
+
     /// @notice When each pending action was queued. Zero means not queued.
     mapping(bytes32 => uint256) public queuedAt;
 
@@ -50,7 +58,16 @@ abstract contract Timelocked {
     ///         lands — a delay nobody can observe protects nobody.
     function isExecutable(bytes32 _id) public view returns (bool) {
         uint256 q = queuedAt[_id];
-        return q != 0 && block.timestamp >= q + timelockDelay;
+        return q != 0
+            && block.timestamp >= q + timelockDelay
+            && block.timestamp <= q + timelockDelay + EXECUTION_WINDOW;
+    }
+
+    /// @notice The last moment a queued action may be executed, or zero if it
+    ///         was never queued.
+    function executionDeadline(bytes32 _id) external view returns (uint256) {
+        uint256 q = queuedAt[_id];
+        return q == 0 ? 0 : q + timelockDelay + EXECUTION_WINDOW;
     }
 
     /// @notice Seconds remaining before a queued action matures, or zero if it
@@ -63,7 +80,9 @@ abstract contract Timelocked {
     }
 
     function _queue(bytes32 _id) internal {
-        require(queuedAt[_id] == 0, "Already queued");
+        // A lapsed entry may be queued afresh; a live one may not.
+        uint256 q = queuedAt[_id];
+        require(q == 0 || block.timestamp > q + timelockDelay + EXECUTION_WINDOW, "Already queued");
         queuedAt[_id] = block.timestamp;
         emit ActionQueued(_id, block.timestamp + timelockDelay);
     }
@@ -82,6 +101,7 @@ abstract contract Timelocked {
         uint256 q = queuedAt[_id];
         require(q != 0, "Action was not queued");
         require(block.timestamp >= q + timelockDelay, "Timelock has not elapsed");
+        require(block.timestamp <= q + timelockDelay + EXECUTION_WINDOW, "Timelock approval expired");
         delete queuedAt[_id];
         emit ActionExecuted(_id);
     }

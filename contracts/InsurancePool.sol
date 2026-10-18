@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "./interfaces/IERC20.sol";
 import "./Timelocked.sol";
 import "./OperatorControlled.sol";
+import "./libraries/SafeTransfer.sol";
 
 /**
  * @title InsurancePool
@@ -188,8 +189,7 @@ contract InsurancePool is Timelocked, OperatorControlled {
         require(asset != address(0), "Invalid asset");
         require(amount > 0, "Amount must be greater than zero");
 
-        bool ok = IERC20(asset).transferFrom(msg.sender, address(this), amount);
-        require(ok, "Funding transfer failed");
+        SafeTransfer.safeTransferFrom(asset, msg.sender, address(this), amount);
 
         reserveOf[asset] += amount;
         emit Funded(asset, msg.sender, amount);
@@ -235,8 +235,7 @@ contract InsurancePool is Timelocked, OperatorControlled {
 
         if (paid > 0) {
             reserveOf[asset] -= paid;
-            bool ok = IERC20(asset).transfer(msg.sender, paid);
-            require(ok, "Draw transfer failed");
+            SafeTransfer.safeTransfer(asset, msg.sender, paid);
         }
 
         emit Drawn(asset, msg.sender, shortfall, paid);
@@ -289,8 +288,7 @@ contract InsurancePool is Timelocked, OperatorControlled {
         _consume(_withdrawId(asset, to, amount));
 
         reserveOf[asset] -= amount;
-        bool ok = IERC20(asset).transfer(to, amount);
-        require(ok, "Withdrawal transfer failed");
+        SafeTransfer.safeTransfer(asset, to, amount);
 
         emit AdminWithdrawal(asset, to, amount);
     }

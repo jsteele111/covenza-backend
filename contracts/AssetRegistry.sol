@@ -33,6 +33,15 @@ import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence c
  *         it to a vault's loan asset are always permitted regardless of
  *         whitelist status. A whitelist removal must never strand a
  *         borrower who is already holding the removed asset mid-loan.
+ *
+ *         LISTING RULE (MAINNET-READINESS item 15): never list a
+ *         fee-on-transfer or rebasing token. Every amount the protocol
+ *         records (principal, deposit, held amounts, reserves) assumes a
+ *         transfer delivers exactly what was sent and that balances do not
+ *         change by themselves. Tokens that return no data from transfer
+ *         (USDT-style) ARE supported, via SafeTransfer. A tokenised equity
+ *         whose issuer can pause or freeze transfers may be listed, but see
+ *         item 14 for what that does to settlement.
  */
 contract AssetRegistry is OperatorControlled {
 

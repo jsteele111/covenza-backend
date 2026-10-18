@@ -9,6 +9,7 @@ import "./AssetRegistry.sol";
 import "./InsurancePool.sol";
 import "./interfaces/IERC20.sol";
 import "./Timelocked.sol";
+import "./libraries/SafeTransfer.sol";
 
 /**
  * @title VaultFactory
@@ -405,19 +406,13 @@ contract VaultFactory is Timelocked {
         );
 
         // --- Fund vault with principal (pulled from the lender) ---
-        require(
-            IERC20(p.asset).transferFrom(p.lender, vaultAddress, p.principal),
-            "Principal transfer failed"
-        );
+        SafeTransfer.safeTransferFrom(p.asset, p.lender, vaultAddress, p.principal);
 
         // --- Insurance skim: pull from lender, fund the pool ---
         uint256 skim = quoteInsuranceSkim(p.principal, p.aprBps, p.duration, p.useSeconds);
         if (skim > 0) {
-            require(
-                IERC20(p.asset).transferFrom(p.lender, address(this), skim),
-                "Skim transfer failed"
-            );
-            require(IERC20(p.asset).approve(address(insurancePool), skim), "Skim approval failed");
+            SafeTransfer.safeTransferFrom(p.asset, p.lender, address(this), skim);
+            SafeTransfer.safeApprove(p.asset, address(insurancePool), skim);
             insurancePool.fund(p.asset, skim);
         }
 
@@ -855,22 +850,13 @@ contract VaultFactory is Timelocked {
      *      standing invitation for the two to disagree.
      */
     function _fundBorrowerSide(address vaultAddress, address asset, uint256 deposit) internal {
-        require(
-            IERC20(asset).transferFrom(msg.sender, vaultAddress, deposit),
-            "Deposit transfer failed"
-        );
+        SafeTransfer.safeTransferFrom(asset, msg.sender, vaultAddress, deposit);
         Vault(vaultAddress).creditDeposit();
 
         uint256 premium = Vault(vaultAddress).insurancePremium();
         if (premium > 0) {
-            require(
-                IERC20(asset).transferFrom(msg.sender, address(this), premium),
-                "Premium transfer failed"
-            );
-            require(
-                IERC20(asset).approve(address(insurancePool), premium),
-                "Premium approval failed"
-            );
+            SafeTransfer.safeTransferFrom(asset, msg.sender, address(this), premium);
+            SafeTransfer.safeApprove(asset, address(insurancePool), premium);
             insurancePool.fund(asset, premium);
         }
     }

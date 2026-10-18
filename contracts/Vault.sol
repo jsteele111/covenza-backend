@@ -5,6 +5,7 @@ import "./AssetRegistry.sol";
 import "./InsurancePool.sol";
 import "./interfaces/IERC20.sol";
 import "./libraries/UniswapTwap.sol";
+import "./libraries/SafeTransfer.sol";
 
 /**
  * @title Vault
@@ -438,10 +439,7 @@ contract Vault {
         // never count toward the segregation invariant or the payout maths.
         deposit = _requiredDeposit;
 
-        bool ok = IERC20(asset).transferFrom(
-            borrower, address(this), _requiredDeposit + insurancePremium
-        );
-        require(ok, "Deposit transfer failed");
+        SafeTransfer.safeTransferFrom(asset, borrower, address(this), _requiredDeposit + insurancePremium);
 
         emit DepositReceived(borrower, _requiredDeposit);
 
@@ -450,10 +448,7 @@ contract Vault {
         // claim events with premium failures, which is the one property an
         // insurance fund cannot have.
         if (insurancePremium > 0) {
-            require(
-                IERC20(asset).approve(address(insurancePool), insurancePremium),
-                "Premium approval failed"
-            );
+            SafeTransfer.safeApprove(asset, address(insurancePool), insurancePremium);
             insurancePool.fund(asset, insurancePremium);
             emit InsurancePremiumPaid(borrower, insurancePremium);
         }
@@ -512,7 +507,7 @@ contract Vault {
         settledLenderPayout  = balance;
 
         if (balance > 0) {
-            require(IERC20(asset).transfer(lender, balance), "Refund to lender failed");
+            SafeTransfer.safeTransfer(asset, lender, balance);
         }
 
         emit Cancelled(lender, balance, block.timestamp);
@@ -571,7 +566,7 @@ contract Vault {
 
         _enforceDepositInvariant(amount);
 
-        require(IERC20(asset).approve(yieldVenue, amount), "Yield approval failed");
+        SafeTransfer.safeApprove(asset, yieldVenue, amount);
         if (yieldVenueKind == 1) {
             IAavePool(yieldVenue).supply(asset, amount, address(this), 0);
             emit AaveSupplied(amount, block.timestamp);
@@ -862,7 +857,7 @@ contract Vault {
         uint24  poolFee
     ) internal returns (uint256 amountOut) {
         address router = registry.swapRouter();
-        require(IERC20(tokenIn).approve(router, amountIn), "Swap approval failed");
+        SafeTransfer.safeApprove(tokenIn, router, amountIn);
 
         // Item 17: the vault measures what it received rather than taking
         // the router's word for it, and enforces the minimum itself. The
@@ -1039,18 +1034,18 @@ contract Vault {
         settledFee            = fee;
         settledBounty         = bounty;
 
-        require(IERC20(asset).transfer(lender, lenderPayout), "Failed to pay lender");
+        SafeTransfer.safeTransfer(asset, lender, lenderPayout);
         if (bounty > 0) {
-            require(IERC20(asset).transfer(msg.sender, bounty), "Failed to pay bounty");
+            SafeTransfer.safeTransfer(asset, msg.sender, bounty);
         }
         if (settledProtocolFee > 0) {
-            require(IERC20(asset).transfer(treasury, settledProtocolFee), "Failed to pay treasury");
+            SafeTransfer.safeTransfer(asset, treasury, settledProtocolFee);
         }
         if (settledReferrerFee > 0) {
-            require(IERC20(asset).transfer(referrer, settledReferrerFee), "Failed to pay referrer");
+            SafeTransfer.safeTransfer(asset, referrer, settledReferrerFee);
         }
         if (settledBorrowerPayout > 0) {
-            require(IERC20(asset).transfer(borrower, settledBorrowerPayout), "Failed to pay borrower");
+            SafeTransfer.safeTransfer(asset, borrower, settledBorrowerPayout);
         }
 
         emit Settled(msg.sender, early, settledTotalReturned, settledInsuranceDraw,

@@ -362,7 +362,7 @@ first review did not walk.
 | 12 | Other live-loan parameters change instantly | MEDIUM | Open |
 | 13 | A mandate can be filled repeatedly | MEDIUM | Open — design |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | Open — design |
-| 15 | ERC20 assumptions, and timelock entries that never expire | LOW | Open |
+| 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
 | 16 | Sequencer downtime can consume the grace window | MEDIUM | Open |
 | 17 | Swaps trust the router's minimum-output check | LOW | **FIXED** |
 | 18 | `swapBack` had no price floor: borrower could drain principal (KRAIT-001) | CRITICAL | **FIXED** |
@@ -492,7 +492,23 @@ receives the asset" rather than "nobody receives anything".
 
 ---
 
-## 15. Minor — LOW — open
+## 15. Minor — LOW — **FIXED** (18 October 2026, except the bounty note)
+
+> - **Return values:** every token call in Vault, VaultFactory and
+>   InsurancePool now goes through `libraries/SafeTransfer.sol`, which accepts
+>   `true` or no data and still fails on `false`, a revert, or an address with
+>   no code. Approvals reset to zero and retry if a token refuses a direct
+>   change. A full loan now runs end to end in a USDT-style token.
+> - **Fee-on-transfer and rebasing tokens** are excluded by a listing rule,
+>   stated in `AssetRegistry`'s header and the README, rather than handled.
+> - **Expiry:** `Timelocked` adds a 14-day `EXECUTION_WINDOW`. A matured action
+>   must execute within it ("Timelock approval expired" otherwise) and may then
+>   be queued afresh, waiting the full delay again. `executionDeadline(id)`
+>   publishes the cut-off.
+>
+> Nine tests in `TokenSafety.test.js`; the USDT-style loan and the expiry cases
+> fail against `3a7a784`.
+
 
 - **ERC20 return values.** Transfers and approvals assume `bool` returns
   (`require(IERC20(..).transfer(..))`); no `SafeERC20`. Tokens that return
@@ -687,11 +703,10 @@ full post-swap balance in the exit direction, not just the increment.
 
 **Done (1 October 2026):** items 10, 11, 18 and 19. 256 tests passing.
 
-**Done (18 October 2026):** items 17 and 20. 267 tests passing.
+**Done (18 October 2026):** items 15, 17 and 20. 276 tests passing.
 
 **Before freeze:** item 12 (per-setter timelock or snapshot, plus the comment),
-item 13 (decide mandate semantics), item 15 (SafeERC20 or listing rule;
-timelock expiry), item 16 (sequencer-aware grace), the Krait
+item 13 (decide mandate semantics), item 16 (sequencer-aware grace), the Krait
 observations, and update `redeploy-factory-v21.js`.
 
 **Design first:** item 14 (settlement fallback for frozen or unswappable

@@ -19,18 +19,19 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 587 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
-| `contracts/VaultFactory.sol` | 535 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel), pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
+| `contracts/Vault.sol` | 582 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall |
+| `contracts/VaultFactory.sol` | 521 | Clones vaults from one implementation. KYC and whitelist gating, mandates (publish, fill atomically, cancel), pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 356 | Operator-curated whitelist, risk tiers with tier history, on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config |
 | `contracts/KYCRegistry.sol` | 146 | Records wallets admitted by recognised third-party attesters. Stores address, timestamp and attester only, no identity data. Timelocked attester additions |
-| `contracts/InsurancePool.sol` | 104 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
-| `contracts/Timelocked.sol` | 38 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs |
+| `contracts/InsurancePool.sol` | 102 | Per-asset reserves, draws capped as a % of principal, vault-only draws, timelocked withdrawals and factory changes |
+| `contracts/Timelocked.sol` | 47 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
+| `contracts/libraries/SafeTransfer.sol` | 31 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **1,948** | 1,859 written for Covenza + 89 vendored |
+| **Total** | **1,967** | 1,878 written for Covenza + 89 vendored |
 
-Out of scope: `contracts/mocks/` (6 test-only contracts, never deployed to production), `scripts/`, `test/`.
+Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
 Compiler: Solidity 0.8.24, optimizer on (200 runs). Hardhat 2.22.
 
@@ -93,7 +94,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**267 tests** across 14 suites.
+**276 tests** across 15 suites.
 
 ```bash
 npm install
@@ -162,6 +163,7 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **Insurance has no aggregate limit.** The draw cap limits each settlement, but nothing limits total draws, so correlated losses would drain a reserve first-come-first-served. A reserve-ratio floor is the intended fix and needs actuarial modelling first. `scripts/model-insurance-solvency.js` holds the current model.
 - **Governance Safes are 1-of-1.** Co-signers must be added before mainnet.
 - **The ERC-4626 venue on testnet is a mock.** No real venue exists on Robinhood Chain yet; mainnet ships with none.
+- **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
 - **No commercial identity provider is integrated yet.** Attester curation is the whole control on who can borrow.
 - **Some live-loan parameters still change instantly** (settlement tolerance, exposure caps, grace, draw cap). Bounded, but a lender priced the loan against the values in force when it was written. Item 12 in the self-review.
 - **A mandate can be filled more than once**, up to the lender's allowance; `maxPrincipal` limits each fill, not the total. Item 13.
@@ -177,7 +179,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 267 tests, 14 suites
+test/                 276 tests, 15 suites
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)
