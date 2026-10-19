@@ -939,7 +939,7 @@ concept before it was fixed, and each fix has a regression test.
 | E-5 | `scripts/legacy/` | Efficiency | **Deleted** | — |
 | E-6 | `package.json` listed hardhat's own dependencies at top level | Efficiency | **Trimmed** | fresh install, all tests passing |
 
-In-scope size after this pass: **2,106 nSLOC** (2,017 written for Covenza plus
+In-scope size after this pass: **2,107 nSLOC** (2,018 written for Covenza plus
 89 vendored), down from 2,311.
 
 ## 21. M-1 — one refused payout blocked the whole settlement — MEDIUM — **FIXED**
