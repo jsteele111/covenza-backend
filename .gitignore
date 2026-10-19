@@ -22,3 +22,7 @@ badge-artwork-check.svg
 
 # Timelocked admin calls announced but not yet executed (per network)
 pending-timelock.json
+
+# Foundry build output (forge test)
+out-foundry/
+cache-foundry/

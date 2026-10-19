@@ -1,0 +1,33 @@
+# Foundry runs alongside Hardhat. Hardhat owns contracts/ and the JavaScript
+# suites in test/; Foundry adds the invariant suites in test-foundry/ and
+# writes to its own output folders, so neither tool touches the other's.
+#
+#   forge test                      run everything
+#   forge test --match-contract X   one suite
+#
+# OpenZeppelin is read from node_modules (installed by npm), forge-std from
+# lib/ (a git submodule: forge install foundry-rs/forge-std).
+
+[profile.default]
+src = "contracts"
+test = "test-foundry"
+out = "out-foundry"
+cache_path = "cache-foundry"
+libs = ["node_modules", "lib"]
+remappings = [
+    "@openzeppelin/=node_modules/@openzeppelin/",
+    "forge-std/=lib/forge-std/src/",
+]
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 200
+evm_version = "paris"
+
+[invariant]
+runs = 128           # independent random sequences
+depth = 300          # calls per sequence
+fail_on_revert = false
+call_override = false
+
+[fuzz]
+runs = 256

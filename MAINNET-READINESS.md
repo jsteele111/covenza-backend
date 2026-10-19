@@ -526,8 +526,18 @@ the excess. Either way, make the UI and the getter say which it is.
 ## 14. Settlement has no fallback when swap-back is impossible — MEDIUM — **FIXED** (18 October 2026)
 
 > `Vault.settleInKind()` is a last-resort settlement, open to anyone from
-> `inKindFrom()`: `IN_KIND_DELAY` (7 days) after keepers could first settle,
-> including any outage extension, so it never cuts a normal path short.
+> `inKindFrom()`: `IN_KIND_DELAY` (7 days) after the grace period ends,
+> including any outage extension, and never during an outage's recovery
+> period, so it never cuts a normal path short.
+>
+> *Corrected the same day, after the invariant fuzzer could not reach this
+> path:* the seven days were first counted from the keeper start, which moves
+> with the latest recorded outage. Without the heartbeat bot, a quiet chain
+> records every silence over 30 minutes as an outage, so each attempt pushed
+> the window back a week and it never opened. Counting from the grace end
+> (bounded by the 72-hour extension cap) fixes it; the recovery hour can be
+> cleared by anyone calling `heartbeat()`. Regression test in
+> `InKindSettlement.test.js`, failing against `a114f28`.
 > `settle()` stays available throughout.
 >
 > 1. Each held asset is sold at the TWAP floor if it can be, each attempt
@@ -635,7 +645,8 @@ receives the asset" rather than "nobody receives anything".
 > the three that matter fail against `a9b954b`.
 >
 > **Operational dependency:** an off-chain bot must call `heartbeat()` every
-> 5 minutes. If it stops, quiet periods read as outages: the parties gain time
+> 5 minutes. Without it, any 30 minutes with no transaction reads as an
+> outage, even when the sequencer was fine. If it stops, quiet periods read as outages: the parties gain time
 > and keepers wait (bounded by the cap). A keeper held off by the recovery
 > period must call `heartbeat()` itself and wait, because a reverted
 > `settle()` also reverts the outage record. No sequencer uptime feed is
@@ -841,8 +852,12 @@ pair, announce-then-execute for timelocked calls via `scripts/lib/timelock.js`
 and `execute-timelocked.js`, `VaultLens` in the factory redeploy) and the
 heartbeat bot (item 16).
 
-**Before freeze:** the per-asset grace decision (item 12), Foundry invariant
-tests, and retiring outdated scripts. All four Krait observations are closed.
+**Done (18 October 2026, evening):** outdated scripts retired to
+`scripts/legacy/`; Foundry invariant suite (`test-foundry/`, nine invariants,
+checked against deliberately broken contracts), which found and fixed the
+in-kind window bug above. 354 Hardhat tests passing.
+
+**Before freeze:** the per-asset grace decision (item 12). All four Krait observations are closed.
 Item 8's premium calibration remains modelling work.
 
 The KYC adapter work is

@@ -269,7 +269,7 @@ contract Vault {
 
     // --- In-kind settlement (item 14) ---
 
-    /// @notice How long after keepers could first settle before the last-resort
+    /// @notice How long after the grace period ends before the last-resort
     ///         in-kind settlement opens. Longer than the 72-hour outage cap and
     ///         any weekend grace, so it can never cut a normal path short.
     uint256 public constant IN_KIND_DELAY = 7 days;
@@ -981,19 +981,28 @@ contract Vault {
 
     /**
      * @notice When the last-resort in-kind settlement opens: IN_KIND_DELAY
-     *         after keepers could first settle, including any outage
-     *         extension and recovery period.
+     *         after the grace period ends (including any outage extension),
+     *         and never while the chain is still recovering from an outage.
+     *
+     * @dev    The seven days are counted from the grace end, not from the
+     *         keeper start. The keeper start moves with the LATEST outage, and
+     *         without a heartbeat bot a quiet chain records every silence over
+     *         30 minutes as one, so counting from it pushed the window back a
+     *         week every time anyone tried. Found by the invariant fuzzer.
      */
     function inKindFrom() public view returns (uint256) {
-        (, uint256 keeperFrom) = registry.settlementWindow(deadline, deadline + _effectiveGracePeriod());
-        return keeperFrom + IN_KIND_DELAY;
+        (uint256 graceEnd, uint256 keeperFrom) =
+            registry.settlementWindow(deadline, deadline + _effectiveGracePeriod());
+        uint256 opens = graceEnd + IN_KIND_DELAY;
+        return opens > keeperFrom ? opens : keeperFrom;
     }
 
     /**
      * @notice Last-resort settlement for a vault whose forced exit cannot
      *         complete — a held asset frozen by its issuer, or a pool too thin
      *         or too far from its TWAP to sell into. Callable by anyone, once
-     *         inKindFrom() has passed. settle() remains available throughout;
+     *         inKindFrom() has passed (7 days after grace, and not during an
+     *         outage's recovery period). settle() remains available throughout;
      *         whichever succeeds first closes the loan.
      *
      * @dev    Item 14. Without it settle() reverts in full for as long as any

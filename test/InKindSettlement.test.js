@@ -257,6 +257,28 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
   });
 
+  it("Opens after an outage once the chain has recovered, not seven days later (found by the invariant fuzzer)", async function () {
+    const { lender, usdx, registry, vault, breakTheSale } = await loadFixture(stack);
+    // Outage detection on, and no heartbeat bot: the chain is simply quiet.
+    await registry.setOutageConfig(1800, 3600, 72 * 3600);
+    await breakTheSale();
+    // A silence spanning the grace period also counts as an outage that ate
+    // it, so grace is extended by the 72-hour cap first.
+    await time.increaseTo((await vault.deadline()) + (await registry.swapBackGracePeriod())
+      + 72n * 3600n + 7n * 86400n + 1n);
+
+    // The first heartbeat in days records the silence as an outage, so the
+    // recovery hour applies. The lender (or anyone) keeps the chain alive
+    // through it, as the bot would.
+    await registry.heartbeat();
+    for (let i = 0; i < 3; i++) { await time.increase(20 * 60); await registry.heartbeat(); }
+
+    // Previously the seven days were counted from the END of that recovery,
+    // so a quiet chain pushed the in-kind window back by a week every time.
+    await expect(vault.connect(lender).settleInKind()).to.not.be.reverted;
+    expect(await usdx.balanceOf(lender.address)).to.be.greaterThan(0n);
+  });
+
   it("Is refused while nothing is held, and the sale helper cannot be called from outside", async function () {
     const { lender, borrower, usdx, vault, toInKindWindow } = await loadFixture(stack);
     await expect(vault.connect(lender).exitHeld(await usdx.getAddress())).to.be.revertedWith("Only the vault itself");

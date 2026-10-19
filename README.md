@@ -19,7 +19,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 674 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall, last-resort in-kind settlement (unsellable assets handed over at TWAP value; frozen tokens claimable later) |
+| `contracts/Vault.sol` | 676 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall, last-resort in-kind settlement (unsellable assets handed over at TWAP value; frozen tokens claimable later) |
 | `contracts/VaultFactory.sol` | 566 | Clones vaults from one implementation. identity gating through `IIdentityAdapter` (borrowers need all three claims, lenders sanctions screening; loosening is timelocked), whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 431 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 190 | Identity adapter backed by third-party attesters. EIP-712 attestations bound to chain and contract, carrying claim flags (KYC, sanctions, jurisdiction) and an expiry of at most 365 days, checked at every origination. Timelocked attester additions and rotations. Manual grants: timelocked, 30 days, once per wallet per year, case reference on chain, marked manual, at most 5 per 30 days. No identity data stored |
@@ -31,7 +31,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | `contracts/interfaces/IIdentityAdapter.sol` | 10 | The one identity question the protocol asks (`isEligible(wallet, claims)`), and the claim flags. Lets a ZK adapter replace KYCRegistry without changing the lending contracts |
 | `contracts/libraries/SafeTransfer.sol` | 34 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code. A non-reverting variant for in-kind hand-over of frozen tokens |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,290** | 2,201 written for Covenza + 89 vendored |
+| **Total** | **2,292** | 2,203 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -96,11 +96,14 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**353 tests** across 20 suites.
+**354 Hardhat tests** across 20 suites, plus **9 Foundry invariants** and one
+handler-path test.
 
 ```bash
 npm install
 npx hardhat test
+forge install foundry-rs/forge-std   # once, after cloning (git submodule)
+forge test                           # invariants: about a minute
 ```
 
 | Suite | Tests | Covers |
@@ -122,13 +125,40 @@ npx hardhat test
 | `KraitFindings.test.js` | 16 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool; settlement cannot be stalled (approved pool, held-amount record, full-exit check); measured swap output |
 | `TokenSafety.test.js` | 9 | USDT-style tokens through a whole loan; `false`-returning and code-less tokens still fail; timelock approvals lapse after 14 days |
 | `OutageGrace.test.js` | 11 | Sequencer outages: grace extended by lost time, keeper's own settle records the outage first, recovery hold for keepers only, bounty from recovery, 72-hour cap, config bounds |
-| `InKindSettlement.test.js` | 11 | Item 14: opens 7 days after keepers could settle; cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender with no insurance draw; insurance only on the shortfall after in-kind value |
+| `InKindSettlement.test.js` | 12 | Item 14: opens 7 days after grace, and only once the chain has recovered from any outage; cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender with no insurance draw; insurance only on the shortfall after in-kind value |
 | `DrawShare.test.js` | 7 | Item 8: each insurance draw limited to 5% of the remaining reserve; a 40-claim crash pays everyone something; timelocked both ways |
 | `ParameterTimelocks.test.js` | 16 | Live-loan parameters wait on a real 48-hour timelock by direction; exposure cap uses the worst tier since origination |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
 
-Not yet present: fuzz and invariant suites.
+### Invariants (Foundry)
+
+`test-foundry/` drives the real stack (factory, clones, registry, pool, linked
+TWAP library) through random sequences of up to 300 actions, 128 sequences per
+run: originate directly or through a mandate, pay or skip the deposit, swap in
+and out (including attempts to spend the deposit or sell more than was bought),
+move the price, manipulate spot away from the TWAP, freeze the bought token,
+donate tokens to a vault, let time pass with or without the heartbeat bot,
+settle, settle in kind, cancel, and claim. After every action it checks:
+
+| Invariant | Property |
+|---|---|
+| `openVaultHoldsDeposit` | An open, funded vault always holds at least the deposit in the loan asset |
+| `heldRecordIsBacked` | The record of what a vault bought never exceeds what it holds, and clears at settlement |
+| `settlementConserves` | Every settlement pays out exactly the vault's funds plus the insurance draw, and leaves no loan asset behind |
+| `lenderPayoutBounded` | The lender never receives more than principal plus accrued interest; an early close always pays in full |
+| `inKindClaimsAreBacked` | Tokens owed in kind are still in the vault |
+| `reserveAccounting` | The pool's reserve equals funding plus premiums minus draws, and never exceeds its balance |
+| `drawsWithinBothCaps` | No draw exceeds 10% of the loan's principal or 5% of the remaining reserve |
+| `wethConserved` | Every token minted is accounted for: none created, none lost |
+| `mandateCapacity` | No mandate lends beyond its total capacity |
+
+Checked against deliberately broken contracts: removing the reserve-share
+cap, or letting a swap spend the deposit, each fails within seconds.
+
+The fuzzer found one real problem, now fixed: the in-kind window was counted
+from the keeper start, which moves with the latest outage, so on a quiet
+chain without the bot it never opened (item 14).
 
 ---
 
@@ -207,7 +237,9 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 353 tests, 20 suites
+test/                 354 Hardhat tests, 20 suites
+test-foundry/         Foundry invariant suite and handler
+lib/forge-std/        Foundry test library (git submodule)
 scripts/              Deployment, proofs, operator and diagnostic scripts
   lib/                Production deploy guards
 tools/                compute_volatility.py (historical volatility model)
