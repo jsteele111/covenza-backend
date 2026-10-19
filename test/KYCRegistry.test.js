@@ -50,7 +50,7 @@ describe("KYCRegistry", function () {
       expect(await registry.operator()).to.equal(operator.address);
     });
     it("Should recognise the constructor key as the first attester", async function () {
-      expect(await registry.isRecognisedAttester(verifierKey.address)).to.equal(true);
+      expect((await registry.attesters(verifierKey.address)).recognised).to.equal(true);
       expect(await registry.allAttesters()).to.deep.equal([verifierKey.address]);
     });
     it("Should start with no addresses verified or eligible", async function () {
@@ -261,12 +261,9 @@ describe("KYCRegistry", function () {
       await registry.revoke(wallet1.address);
       expect(await registry.isVerified(wallet1.address)).to.equal(false);
     });
-    it("Should record revocation timestamp", async function () {
-      await registry.revoke(wallet1.address);
-      expect(await registry.revokedAt(wallet1.address)).to.equal(BigInt(await time.latest()));
-    });
-    it("Should emit AddressRevoked event", async function () {
-      await expect(registry.revoke(wallet1.address)).to.emit(registry, "AddressRevoked");
+    it("Should emit AddressRevoked with the revocation time", async function () {
+      await expect(registry.revoke(wallet1.address)).to.emit(registry, "AddressRevoked")
+        .withArgs(wallet1.address, (await time.latest()) + 1);
     });
     it("Should revert if non-operator tries to revoke", async function () {
       await expect(registry.connect(otherAccount).revoke(wallet1.address)).to.be.revertedWith("Caller is not the operator");
@@ -340,22 +337,15 @@ describe("KYCRegistry", function () {
     });
   });
 
-  // --- statusOf ---
-  describe("statusOf", function () {
-    it("Should return correct status for unverified address", async function () {
-      const [v, ts, rts] = await registry.statusOf(wallet1.address);
-      expect(v).to.equal(false); expect(ts).to.equal(0); expect(rts).to.equal(0);
-    });
-    it("Should return correct status for verified address", async function () {
+  // --- Status (statusOf, verifiedAt and revokedAt were removed as unused;
+  //     isVerified, verificationOf and the events carry the same facts) ---
+  describe("Status", function () {
+    it("Tracks admission and revocation through isVerified", async function () {
+      expect(await registry.isVerified(wallet1.address)).to.equal(false);
       await registry.verify(wallet1.address, ALL, REF);
-      const [v, ts] = await registry.statusOf(wallet1.address);
-      expect(v).to.equal(true); expect(ts).to.be.gt(0);
-    });
-    it("Should return correct status after revocation", async function () {
-      await registry.verify(wallet1.address, ALL, REF);
+      expect(await registry.isVerified(wallet1.address)).to.equal(true);
       await registry.revoke(wallet1.address);
-      const [v, , rts] = await registry.statusOf(wallet1.address);
-      expect(v).to.equal(false); expect(rts).to.be.gt(0);
+      expect(await registry.isVerified(wallet1.address)).to.equal(false);
     });
   });
 
@@ -390,7 +380,7 @@ describe("KYCRegistry", function () {
     it("Should rotate a key, after announcement, and carry the provider name across", async function () {
       await registry.queueRotateAttester(verifierKey.address, otherAccount.address);
       await registry.rotateAttester(verifierKey.address, otherAccount.address);
-      expect(await registry.isRecognisedAttester(verifierKey.address)).to.equal(false);
+      expect((await registry.attesters(verifierKey.address)).recognised).to.equal(false);
       expect((await registry.attesters(otherAccount.address)).name).to.equal("Initial attester");
     });
     it("Should refuse a rotation that was not announced (Krait: timelock bypass)", async function () {

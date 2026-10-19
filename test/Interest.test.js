@@ -48,9 +48,6 @@ describe("Annualised interest", function () {
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
     const usdxAddr = await usdx.getAddress();
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(usdxAddr);
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
@@ -60,10 +57,10 @@ describe("Annualised interest", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), usdxAddr, 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
+    await registry.addAsset(usdxAddr, 0);
     await registry.setSettlementConfig(1800, 200, 3600, 2, 100);
 
     // Tier limits disabled for this suite. These tests predate the risk tiers

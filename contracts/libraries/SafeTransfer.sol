@@ -45,10 +45,17 @@ library SafeTransfer {
     }
 
     /// @dev As safeTransfer, but reports failure instead of reverting. Used
-    ///      only where a refusing token must not block everything else: the
-    ///      in-kind settlement of an asset whose issuer has frozen it.
-    function trySafeTransfer(address token, address to, uint256 amount) internal returns (bool) {
-        return _succeeded(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    ///      where one refusing token or recipient must not block everyone
+    ///      else (Vault._pay).
+    ///
+    ///      A failure caused by running OUT OF GAS still reverts. Otherwise a
+    ///      caller could send just enough gas for the transfer to fail, by the
+    ///      63/64 rule, while the rest of the transaction completes, and so
+    ///      turn any payout it liked into a deferred one.
+    function trySafeTransfer(address token, address to, uint256 amount) internal returns (bool ok) {
+        uint256 gasBefore = gasleft();
+        ok = _succeeded(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        if (!ok && gasleft() <= gasBefore / 63) { revert("Out of gas"); }
     }
 
     function safeTransferFrom(address token, address from, address to, uint256 amount) internal {

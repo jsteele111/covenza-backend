@@ -157,7 +157,7 @@ async function main() {
       const regProbes = [
         ["tier config      (phase 3)", "function tierConfig(uint8) view returns (uint256,uint256,uint256,uint256,uint256)", [0]],
         ["deposit floor    (phase 3)", "function minimumDepositBpsForTier(uint8,uint256) view returns (uint256)", [0, 86400]],
-        ["yield venue      (phase 1)", "function venueOf(address) view returns (uint8,address)", [uni.tokens.tUSDG]],
+        ["outage record    (item 16)", "function outageGapThreshold() view returns (uint256)", []],
         ["tier history     (review)",  "function tierHistoryLength(address) view returns (uint256)", [uni.tokens.tUSDG]],
       ];
       for (const [label, sig, args] of regProbes) {

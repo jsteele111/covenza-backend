@@ -364,6 +364,11 @@ contract VaultFactory is Timelocked {
     function _deployVault(OriginationParams memory p) internal returns (address) {
 
         // --- Gates ---
+        // A wallet lending to itself has no legitimate purpose, and it is the
+        // first step of every self-dealing route against the shared insurance
+        // pool. Separate wallets can still collude; this removes the trivial
+        // case (audit L-1).
+        require(p.lender != p.borrower, "Lender and borrower must differ");
         require(kycRegistry.isEligible(p.borrower, requiredBorrowerClaims), "Borrower is not KYC verified");
         require(
             requiredLenderClaims == 0 || kycRegistry.isEligible(p.lender, requiredLenderClaims),
@@ -831,13 +836,20 @@ contract VaultFactory is Timelocked {
      *      the principal. Here the borrower acts, so a non-atomic fill would
      *      let anyone lock a lender's capital until the deadline for the price
      *      of gas, across every mandate on the book.
+     *
+     *      `maxAprBps` is the borrower's limit (audit L-6). The APR comes from
+     *      the mandate's formula, but the binding deposit it credits against
+     *      reads the registry's tier settings, which can change between the
+     *      borrower's quote and this transaction. The fill reverts rather than
+     *      charge more than the borrower agreed to.
      */
     function fillMandate(
         uint256 id,
         uint256 principal,
         uint256 duration,
         bool    useSeconds,
-        uint256 deposit
+        uint256 deposit,
+        uint256 maxAprBps
     ) external returns (address vaultAddress) {
         require(isMandateLive(id), "Mandate is not live");
 
@@ -873,6 +885,7 @@ contract VaultFactory is Timelocked {
             require(depositBps >= m.minDepositBps, "Deposit below the mandate's minimum");
 
             apr = quoteMandateApr(id, termSeconds, depositBps);
+            require(apr <= maxAprBps, "APR above the borrower's limit");
         }
 
         vaultAddress = _deployVault(OriginationParams({

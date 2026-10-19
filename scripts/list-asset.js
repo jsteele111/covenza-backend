@@ -67,9 +67,6 @@ async function main() {
     // sends at once when nothing changes, and announces otherwise.
     const result = await sendOrQueue(registry, "addAssetWithTier", [
       asset,
-      ethers.ZeroAddress,   // no Aave on this chain
-      0,                    // YieldVenue.None
-      ethers.ZeroAddress,
       GRACE_HOURS * 3600,
       TIER,
     ], { network: hre.network.name, label: `list ${SYMBOL || asset}` });

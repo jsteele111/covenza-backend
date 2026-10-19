@@ -2,14 +2,13 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const {
   guardProductionConfig,
-  guardNoYieldVenues,
   MIN_TWAP_WINDOW,
   MIN_TIMELOCK,
 } = require("../scripts/lib/production-guards");
 
 /**
  * The guards exist because every value they reject is LEGAL. The contracts
- * accept a 60-second TWAP window, a zero timelock and a mock yield venue —
+ * accept a 60-second TWAP window and a zero timelock —
  * testing requires them to. So no revert fires, no test fails, and a testnet
  * configuration reaches production silently.
  *
@@ -97,59 +96,5 @@ describe("Production deployment guards", function () {
     expect(() =>
       guardProductionConfig("robinhoodMainnet", { timelockDelay: 0, twapWindow: 60 })
     ).to.not.throw();
-  });
-
-  // --- Yield venues ---
-
-  it("Refuses production when any asset has a yield venue set", async function () {
-    const [operator] = await ethers.getSigners();
-
-    const Mock = await ethers.getContractFactory("MockERC20");
-    const usdx = await Mock.deploy("USDX", "USDX", 18);
-    const aave = await (await ethers.getContractFactory("MockAavePool")).deploy();
-    const router = await (await ethers.getContractFactory("MockSwapRouter")).deploy();
-    const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory")).deploy();
-
-    const registry = await (await ethers.getContractFactory("AssetRegistry")).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress(), 0
-    );
-
-    const vault4626 = await (await ethers.getContractFactory("MockERC4626"))
-      .deploy(await usdx.getAddress());
-
-    await registry.addAssetWithVenue(
-      await usdx.getAddress(), ethers.ZeroAddress, 2, await vault4626.getAddress(), 0
-    );
-
-    await expect(
-      guardNoYieldVenues("robinhoodMainnet", registry, [await usdx.getAddress()])
-    ).to.be.rejectedWith(/yield venue set/);
-
-    // The same registry is fine on testnet, which is the whole point — the
-    // configuration is not wrong, it is wrong THERE.
-    await expect(
-      guardNoYieldVenues("robinhoodTestnet", registry, [await usdx.getAddress()])
-    ).to.not.be.rejected;
-  });
-
-  it("Accepts production when every venue is None", async function () {
-    const [operator] = await ethers.getSigners();
-
-    const Mock = await ethers.getContractFactory("MockERC20");
-    const usdx = await Mock.deploy("USDX", "USDX", 18);
-    const aave = await (await ethers.getContractFactory("MockAavePool")).deploy();
-    const router = await (await ethers.getContractFactory("MockSwapRouter")).deploy();
-    const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory")).deploy();
-
-    const registry = await (await ethers.getContractFactory("AssetRegistry")).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress(), 0
-    );
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
-
-    await expect(
-      guardNoYieldVenues("robinhoodMainnet", registry, [await usdx.getAddress()])
-    ).to.not.be.rejected;
   });
 });

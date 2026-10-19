@@ -7,9 +7,8 @@ import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence c
 
 /**
  * @title AssetRegistry
- * @notice Protocol-level, operator-controlled asset whitelist for the
- *         Covenza lending protocol — replaces the single hardcoded Aave
- *         constant that previously lived inside Vault.sol.
+ * @notice Protocol-level, operator-controlled asset whitelist and
+ *         settlement configuration for the Covenza lending protocol.
  *
  *         This closes the NFR-6 gap ("whitelist configurable without
  *         redeploying in-flight vaults"): vaults read this registry LIVE
@@ -19,14 +18,13 @@ import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence c
  *
  *         Per asset, the registry stores:
  *           - whether it is currently whitelisted (loans may be originated
- *             in it; borrowers may swap INTO it), and
- *           - its Aave V3 aToken address (needed by vaults to check their
- *             own Aave position balance at settlement).
+ *             in it; borrowers may swap INTO it),
+ *           - its risk tier (with history), and
+ *           - any extension to the swap-back grace period.
  *
- *         It also stores the protocol-wide external contract addresses
- *         (Aave V3 Pool, Uniswap V3 SwapRouter, Uniswap V3 Factory, WETH),
- *         giving every vault one place to read integration config from.
- *         These are immutable: fixed at deployment, never repointable.
+ *         It also stores the Uniswap V3 SwapRouter and Factory, giving every
+ *         vault one place to read integration config from. These are
+ *         immutable: fixed at deployment, never repointable.
  *
  *         IMPORTANT SAFETY RULE (enforced in Vault, documented here):
  *         removing an asset from the whitelist blocks NEW exposure to it
@@ -65,10 +63,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     // to it through VaultFactory's timelocked setRegistries. Vaults hold their
     // own registry reference, so live loans keep the integrations they were
     // originated against and can never be repointed underneath.
-    address public immutable aavePool;       // Aave V3 Pool (uniform entry for all assets)
-    address public immutable swapRouter;     // Uniswap V3 SwapRouter
+    address public immutable swapRouter;     // Uniswap V3 SwapRouter02
     address public immutable uniswapFactory; // Uniswap V3 Factory (for TWAP pool lookups)
-    address public immutable weth;           // canonical WETH for this network
 
     // --- Settlement configuration (protocol-wide, operator-configurable) ---
     // Launch values below are placeholders pending empirical calibration
@@ -188,25 +184,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     uint256 private constant YEAR = 365 days;
 
-    /**
-     * @notice Where idle loan-asset funds may be parked to earn yield.
-     *
-     * @dev    Deliberately an interface standard rather than a named protocol.
-     *         Aave is not deployed on every chain Covenza targets, and binding
-     *         to one lending market would mean re-integrating for each new
-     *         venue. ERC4626 covers MetaMorpho, Yearn, and anything else that
-     *         implements the standard, on any chain, with one code path.
-     *
-     *         None is a first-class option, not a failure state: an asset with
-     *         no yield venue is still perfectly usable for lending and swaps.
-     */
-    enum YieldVenue { None, Aave, ERC4626 }
-
     struct AssetConfig {
         bool       whitelisted;
-        address    aToken;       // Aave V3 aToken for this asset (address(0) = no Aave support)
-        YieldVenue venue;
-        address    venueAddress; // ERC-4626 vault address; unused for Aave (which uses aavePool)
         RiskTier   tier;
         // Per-asset EXTENSION to the global swap-back grace, in seconds.
         // Only ever lengthens it — see gracePeriodOf(). Exists for assets that
@@ -273,15 +252,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     /// @notice Enumerable list of every asset ever added (whitelisted or
     ///         since removed) — removal flips the flag but keeps the entry,
-    ///         so historical vaults can still look up aToken addresses.
+    ///         so its tier history and grace stay readable for open loans.
     address[] public allAssets;
     mapping(address => bool) private _everAdded;
 
     // --- Events ---
 
-    event AssetAdded(address indexed asset, address indexed aToken);
+    event AssetAdded(address indexed asset);
     event AssetRemoved(address indexed asset);
-    event VenueUpdated(address indexed asset, YieldVenue venue, address venueAddress);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
     event PoolFeeTierUpdated(address indexed tokenA, address indexed tokenB, uint24 fee);
     event OutageRecorded(uint256 start, uint256 end);
@@ -290,13 +268,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
         uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
     event DepositCoeffUpdated(uint256 previousBps, uint256 newBps);
-    event IntegrationAddressesUpdated(
-        address aavePool,
-        address swapRouter,
-        address uniswapFactory,
-        address weth
-    );
-
+    event MaxEntryImpactUpdated(uint256 previousBps, uint256 newBps);
     event SettlementConfigUpdated(
         uint32  twapWindow,
         uint256 twapToleranceBps,
@@ -309,23 +281,15 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     constructor(
         address _operator,
-        address _aavePool,
         address _swapRouter,
         address _uniswapFactory,
-        address _weth,
         uint256 _timelockDelay
     ) OperatorControlled(_operator) Timelocked(_timelockDelay) {
-        require(_aavePool != address(0),       "Invalid Aave pool address");
         require(_swapRouter != address(0),     "Invalid swap router address");
         require(_uniswapFactory != address(0), "Invalid Uniswap factory address");
-        require(_weth != address(0),           "Invalid WETH address");
 
-        aavePool       = _aavePool;
         swapRouter     = _swapRouter;
         uniswapFactory = _uniswapFactory;
-        weth           = _weth;
-
-        emit IntegrationAddressesUpdated(_aavePool, _swapRouter, _uniswapFactory, _weth);
 
         lastHeartbeat = block.timestamp;
 
@@ -341,43 +305,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     /**
      * @notice Whitelists an asset for loan origination and swap-into use.
-     * @param _asset  The ERC20 asset to whitelist.
-     * @param _aToken The asset's Aave V3 aToken, or address(0) if this
-     *                asset should not support Aave supply (swap-only).
-     */
-    function addAsset(address _asset, address _aToken) external onlyOperator {
-        // An aToken implies the Aave venue; its absence implies no venue.
-        // Preserved as the shorthand for the common case — addAssetWithVenue
-        // is the general form.
-        _addAsset(
-            _asset,
-            _aToken,
-            _aToken == address(0) ? YieldVenue.None : YieldVenue.Aave,
-            address(0),
-            0
-        );
-        _recordTier(_asset, assetConfig[_asset].tier);
-    }
-
-    /**
-     * @notice Whitelists an asset, specifying its yield venue and any grace
-     *         period extension explicitly.
+     *         A never-seen asset starts at Speculative; a re-listed one keeps
+     *         the tier it had.
      * @param _asset        The ERC20 asset to whitelist.
-     * @param _aToken       Aave aToken, or address(0). Required when the venue
-     *                      is Aave — the vault reads its position through it.
-     * @param _venue        None, Aave, or ERC4626.
-     * @param _venueAddress The ERC-4626 vault. Must be address(0) for other venues.
      * @param _gracePeriod  Seconds to extend the global swap-back grace by, for
      *                      this asset. Zero for continuously tradeable assets.
      */
-    function addAssetWithVenue(
-        address    _asset,
-        address    _aToken,
-        YieldVenue _venue,
-        address    _venueAddress,
-        uint256    _gracePeriod
-    ) external onlyOperator {
-        _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
+    function addAsset(address _asset, uint256 _gracePeriod) external onlyOperator {
+        _addAsset(_asset, _gracePeriod);
         _recordTier(_asset, assetConfig[_asset].tier);
     }
 
@@ -387,23 +322,11 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      * @dev    Listing then tagging in two transactions leaves the asset
      *         carrying the default tier in between. Observed on testnet:
      *         listing an equity produced two tier-history entries, the first
-     *         of them a tier nobody intended. Nothing was harmed because no
-     *         loans existed, but the window is real and it is trivially
-     *         avoidable.
-     *
-     *         This is the path an operator should use. addAsset and
-     *         addAssetWithVenue remain for the case where the tier is genuinely
-     *         being left at its default.
+     *         of them a tier nobody intended. This is the path an operator
+     *         should use; addAsset remains for leaving the tier at its default.
      */
-    function addAssetWithTier(
-        address    _asset,
-        address    _aToken,
-        YieldVenue _venue,
-        address    _venueAddress,
-        uint256    _gracePeriod,
-        RiskTier   _tier
-    ) external onlyOperator {
-        _addAsset(_asset, _aToken, _venue, _venueAddress, _gracePeriod);
+    function addAssetWithTier(address _asset, uint256 _gracePeriod, RiskTier _tier) external onlyOperator {
+        _addAsset(_asset, _gracePeriod);
         assetConfig[_asset].tier = _tier;
 
         // Recorded once, here, rather than inside _addAsset. Recording the
@@ -415,24 +338,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         emit TierUpdated(_asset, _tier);
     }
 
-    function _addAsset(
-        address    _asset,
-        address    _aToken,
-        YieldVenue _venue,
-        address    _venueAddress,
-        uint256    _gracePeriod
-    ) internal {
+    function _addAsset(address _asset, uint256 _gracePeriod) internal {
         require(_asset != address(0), "Invalid asset address");
         require(!assetConfig[_asset].whitelisted, "Asset already whitelisted");
         require(_gracePeriod <= MAX_GRACE_EXTENSION, "Grace extension too long");
-        _validateVenue(_venue, _aToken, _venueAddress);
 
         // Re-listing a removed asset is not a fresh start: vaults may still
-        // hold it (swap-back is always allowed), so its grace extension and
-        // venue reach live loans. Without this, remove-then-re-add changed
-        // either instantly, around the timelocks on setGracePeriod and
-        // setVenue. Re-listing on the same terms stays instant.
-        if (_relistChangesLiveTerms(_asset, _aToken, _venue, _venueAddress, _gracePeriod)) {
+        // hold it (swap-back is always allowed), so its grace extension
+        // reaches live loans. Without this, remove-then-re-add changed it
+        // instantly, around the timelock on setGracePeriod. Re-listing on the
+        // same terms stays instant.
+        if (_everAdded[_asset] && _gracePeriod != assetConfig[_asset].gracePeriod) {
             _consumeIfDelayed(keccak256(msg.data));
         }
 
@@ -452,9 +368,6 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
         assetConfig[_asset] = AssetConfig({
             whitelisted:  true,
-            aToken:       _aToken,
-            venue:        _venue,
-            venueAddress: _venueAddress,
             tier:         existingTier,
             gracePeriod:  _gracePeriod
         });
@@ -469,65 +382,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         // into this function must record — a listing with no history falls
         // through to the empty-history case, which trusts the current tier and
         // would let a re-tag widen a live loan.
-        emit AssetAdded(_asset, _aToken);
-        emit VenueUpdated(_asset, _venue, _venueAddress);
+        emit AssetAdded(_asset);
         if (_gracePeriod > 0) { emit GracePeriodUpdated(_asset, _gracePeriod); }
-    }
-
-    /// @dev True when re-listing a previously added asset would change its
-    ///      grace extension, or point it at a different (non-None) venue.
-    ///      Removing the venue on re-listing stays instant, as in setVenue.
-    function _relistChangesLiveTerms(
-        address    _asset,
-        address    _aToken,
-        YieldVenue _venue,
-        address    _venueAddress,
-        uint256    _gracePeriod
-    ) internal view returns (bool) {
-        if (!_everAdded[_asset]) { return false; }
-        AssetConfig storage old = assetConfig[_asset];
-        if (_gracePeriod != old.gracePeriod) { return true; }
-        if (_venue == YieldVenue.None) { return false; }
-        return _venue != old.venue || _venueAddress != old.venueAddress || _aToken != old.aToken;
-    }
-
-    function _validateVenue(YieldVenue _venue, address _aToken, address _venueAddress) internal pure {
-        if (_venue == YieldVenue.Aave) {
-            require(_aToken != address(0),       "Aave venue requires an aToken");
-            require(_venueAddress == address(0), "Aave venue takes no venue address");
-        } else if (_venue == YieldVenue.ERC4626) {
-            require(_venueAddress != address(0), "ERC4626 venue requires a vault address");
-        } else {
-            require(_venueAddress == address(0), "No venue takes no venue address");
-        }
-    }
-
-    /**
-     * @notice Repoints an asset's yield venue.
-     *
-     * @dev    SAFETY: vaults snapshot their venue at first supply and settle
-     *         against that snapshot, so changing this cannot strand an
-     *         in-flight position. It takes effect for vaults that have not yet
-     *         supplied. Same reasoning as the fee terms being snapshotted at
-     *         origination — live loans are never repriced underneath.
-     */
-    function setVenue(
-        address    _asset,
-        YieldVenue _venue,
-        address    _venueAddress
-    ) external onlyOperator {
-        require(_everAdded[_asset], "Unknown asset");
-        _validateVenue(_venue, assetConfig[_asset].aToken, _venueAddress);
-
-        // Pointing an asset at a venue is where borrowers' principal will be
-        // sent on their next supply, so it waits. Removing the venue (None)
-        // only stops new supply and stays instant.
-        if (_venue != YieldVenue.None) { _consumeIfDelayed(keccak256(msg.data)); }
-
-        assetConfig[_asset].venue        = _venue;
-        assetConfig[_asset].venueAddress = _venueAddress;
-
-        emit VenueUpdated(_asset, _venue, _venueAddress);
     }
 
     /**
@@ -656,6 +512,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         if (_newBps == 0 || (maxEntryImpactBps != 0 && _newBps > maxEntryImpactBps)) {
             _consumeIfDelayed(keccak256(msg.data));
         }
+        emit MaxEntryImpactUpdated(maxEntryImpactBps, _newBps);
         maxEntryImpactBps = _newBps;
     }
 
@@ -717,8 +574,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      * @notice Removes an asset from the whitelist. Blocks new loans in it
      *         and new swaps into it. Does NOT affect existing holdings —
      *         swap-back from a removed asset is always permitted (enforced
-     *         vault-side), and its stored aToken address remains readable
-     *         so in-flight vaults can still settle correctly.
+     *         vault-side), and its tier history and grace extension stay
+     *         readable so in-flight vaults still settle correctly.
      */
     function removeAsset(address _asset) external onlyOperator {
         require(assetConfig[_asset].whitelisted, "Asset is not whitelisted");
@@ -753,6 +610,18 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         require(_twapWindow >= 60,                    "TWAP window too short");
         require(_twapToleranceBps > 0 && _twapToleranceBps <= 1000, "Tolerance must be 1-1000 bps");
         require(_bountyCapBps <= 1000,                "Bounty cap must be <= 1000 bps");
+        // Upper limits (audit L-2). An unbounded window longer than any pool's
+        // history makes every quote revert, which freezes every swap and every
+        // forced exit at once; an unbounded grace postpones keepers for ever.
+        require(_twapWindow <= 1 days,                "TWAP window too long");
+        require(_swapBackGracePeriod <= 7 days,       "Grace period too long");
+        require(_bountyRatePerHourBps <= 10000,       "Bounty rate too high");
+        // The rule setOutageConfig enforces, checked from this side too: after
+        // an outage the TWAP is stale for a full window, so keepers must be
+        // held off at least that long. Without this, widening the window here
+        // quietly broke it.
+        require(outageGapThreshold == 0 || _twapWindow <= recoveryPeriod,
+            "TWAP window longer than the outage recovery period");
 
         // Every one of these is read by open vaults at settlement, and every
         // direction hurts someone: a wider tolerance or longer grace costs
@@ -776,21 +645,6 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         return assetConfig[_asset].whitelisted;
     }
 
-    /// @notice The Aave aToken for an asset (address(0) if none configured).
-    ///         Readable even after whitelist removal, so in-flight vaults
-    ///         holding a removed asset can still settle.
-    function aTokenOf(address _asset) external view returns (address) {
-        return assetConfig[_asset].aToken;
-    }
-
-    /// @notice The asset's yield venue and, for ERC-4626, its vault address.
-    ///         Readable after whitelist removal, like aTokenOf, so in-flight
-    ///         vaults can still settle.
-    function venueOf(address _asset) external view returns (YieldVenue, address) {
-        AssetConfig storage c = assetConfig[_asset];
-        return (c.venue, c.venueAddress);
-    }
-
     /**
      * @notice The effective swap-back grace for a vault HOLDING this asset.
      *
@@ -809,8 +663,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         return swapBackGracePeriod + assetConfig[_asset].gracePeriod;
     }
 
-    /// @notice The asset's risk tier. Readable after whitelist removal, like
-    ///         aTokenOf, so in-flight vaults can still settle.
+    /// @notice The asset's risk tier. Readable after whitelist removal, so
+    ///         in-flight vaults can still settle.
     function tierOf(address _asset) external view returns (RiskTier) {
         return assetConfig[_asset].tier;
     }
@@ -848,38 +702,9 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         return volFloor > cfg.minDepositBps ? volFloor : cfg.minDepositBps;
     }
 
-    /**
-     * @notice The same figure for a specific asset, for display.
-     *
-     * @dev    NOT what governs origination. At origination the borrower has not
-     *         chosen what to hold — only the ceiling they are permitted — so
-     *         the binding floor comes from the vault's maxTier, not from the
-     *         loan's denomination. A USDG loan that permits Speculative
-     *         exposure carries Speculative risk.
-     *
-     *         This overload answers "what would holding THIS asset require",
-     *         which is a useful thing to show a borrower and the wrong thing to
-     *         enforce.
-     */
-    function minimumDepositBps(address _asset, uint256 _termSeconds)
-        external view returns (uint256)
-    {
-        return minimumDepositBpsForTier(assetConfig[_asset].tier, _termSeconds);
-    }
-
     /// @notice Longest loan permitted for a given risk ceiling.
     function maxTermForTier(RiskTier _tier) external view returns (uint256) {
         return tierConfig[_tier].maxTermSeconds;
-    }
-
-    /// @notice Longest loan permitted against this asset.
-    function maxTermFor(address _asset) external view returns (uint256) {
-        return tierConfig[assetConfig[_asset].tier].maxTermSeconds;
-    }
-
-    /// @notice Most of a loan's principal that may sit in this one asset.
-    function maxExposureBpsFor(address _asset) external view returns (uint256) {
-        return tierConfig[assetConfig[_asset].tier].maxExposureBps;
     }
 
     /// @notice The exposure cap a loan written at `_since` must apply to
@@ -917,12 +742,13 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      *                    recovery period, whichever is later. The keeper bounty
      *                    accrues from here.
      *
-     * @dev    Outages are recorded in time order and do not overlap, so the walk
-     *         runs backwards and stops at the first that ended before the
-     *         deadline. An outage that begins after the (extended) grace end can
-     *         be counted here, but it can never reopen a window that has
-     *         closed: such an outage ends at least its own length after the old
-     *         grace end, so the new end is already in the past when it is read.
+     * @dev    Only outages that end after the deadline and start before
+     *         `_graceEnd + maxGraceExtension` (the horizon) can extend the
+     *         window. Outages are recorded in time order and never overlap, so
+     *         these form one contiguous run: a binary search finds where the run
+     *         ends, and the walk goes backwards from there, stopping at the first
+     *         outage that ended on or before the deadline. Cost is logarithmic in
+     *         the outages recorded after the horizon (audit L-4).
      */
     function settlementWindow(uint256 _deadline, uint256 _graceEnd)
         external view returns (uint256 graceEnd, uint256 keeperFrom)
@@ -930,10 +756,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         uint256 ext;
         uint256 n = _outages.length;
         uint256 horizon = _graceEnd + maxGraceExtension;
-        for (uint256 i = n; i > 0; i--) {
+
+        // First outage starting at or after the horizon (or n if none).
+        uint256 lo = 0;
+        uint256 hi = n;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (_outages[mid].start < horizon) { lo = mid + 1; } else { hi = mid; }
+        }
+        for (uint256 i = lo; i > 0; i--) {
             Outage storage o = _outages[i - 1];
             if (o.end <= _deadline) { break; }
-            if (o.start >= horizon) { continue; }
             ext += o.end - (o.start > _deadline ? o.start : _deadline);
         }
         if (ext > maxGraceExtension) { ext = maxGraceExtension; }
@@ -991,12 +824,6 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     /// @notice Abandons an announced change. Instant: it reduces risk.
     function cancelAction(bytes32 _id) external onlyOperator { _cancel(_id); }
-
-    /// @notice Annualised insurance premium for holding this asset, in bps of
-    ///         principal. Charged to the borrower, priced on the full term.
-    function insurancePremiumBpsFor(address _asset) external view returns (uint256) {
-        return tierConfig[assetConfig[_asset].tier].insurancePremiumBps;
-    }
 
     /// @notice The same figure keyed to a risk ceiling. This is what a vault
     ///         charges, since the premium insures what the borrower MAY hold

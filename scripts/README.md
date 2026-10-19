@@ -3,7 +3,8 @@
 Operational scripts for the Robinhood Chain deployment. None of them is in the
 audit scope. Every script in this folder works against the current contracts;
 scripts written for earlier versions (Arbitrum Sepolia, the single-key KYC
-registry) are in [`legacy/`](legacy/) and are not maintained.
+registry, yield venues) were deleted before the audit freeze and remain in git
+history.
 
 Most read and write `deployed-addresses.json` (what is deployed where) and
 `uniswap-testnet.json` (the test Uniswap V3, its tokens and pools). Run them
@@ -19,11 +20,11 @@ environment variables.
 | `deploy-robinhood-testnet.js` | Full protocol deploy against that Uniswap: KYCRegistry, InsurancePool, AssetRegistry, TWAP library, Vault implementation, VaultLens, VaultFactory. Lists assets (and any stock tokens already in `uniswap-testnet.json`), names the approved pool for every pair, seeds the insurance pool. Timelocked calls go through `lib/timelock.js`. |
 | `deploy-stock-token-testnet.js` | Adds a test tokenised equity: deploys it, opens and seeds a tUSDG pool, warms the oracle, lists it as Standard tier with a 72-hour grace, names its approved pool. |
 | `redeploy-factory-v21.js` | Replaces only the factory, Vault implementation, TWAP library and VaultLens, reusing the registries and pool. Refuses if any reused contract is an older version. |
-| `list-asset.js` | Lists an already-deployed token on the current registry and names its approved pool. For use after a registry redeploy. |
+| `list-asset.js` | Lists an already-deployed token on the current registry with its risk tier and grace extension in one call, and names its approved pool. For use after a registry redeploy. |
 | `set-tier-config.js` | Changes one tier's parameters, keeping the others. Raising an exposure cap waits on the timelock. |
 | `execute-timelocked.js` | Executes admin calls announced earlier, once their delay has passed. `LIST_ONLY=1` to just report. |
 | `lib/timelock.js` | Shared helper: sends a timelocked call if it can take effect now, otherwise announces it and records it in `pending-timelock.json`; prints Safe transactions when control is with a Safe. |
-| `lib/production-guards.js` | Refuses a mainnet deploy carrying testnet values (zero timelock, 60 s TWAP, outage detection off, deployer as attester, any yield venue). |
+| `lib/production-guards.js` | Refuses a mainnet deploy carrying testnet values (zero timelock, 60 s TWAP, outage detection off, deployer as operator or attester). |
 | `check-sizes.js` | Bytecode size of every contract against the 24,576-byte limit (`npx hardhat run scripts/check-sizes.js`). |
 
 ## Heartbeat bot (item 16)

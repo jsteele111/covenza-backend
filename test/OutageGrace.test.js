@@ -23,7 +23,6 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const weth = await Mock.deploy("WETH", "WETH", 18);
     const usdx = await Mock.deploy("USDX", "USDX", 18);
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -37,9 +36,9 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);
-    await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
-    await registry.addAssetWithTier(await usdx.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
+      operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+    await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
@@ -147,6 +146,17 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     expect(await vault.isSettled()).to.equal(true);
   });
 
+  it("Costs the same to settle however many outages are recorded after the window (audit L-4)", async function () {
+    const { registry, deadline, graceEnd } = await loadFixture(stack);
+    await time.increaseTo(graceEnd + BigInt(80 * HOUR));
+    for (let i = 0; i < 40; i++) { await time.increase(31 * MIN); await registry.heartbeat(); }
+    const g40 = await registry.settlementWindow.estimateGas(deadline, graceEnd);
+    for (let i = 0; i < 160; i++) { await time.increase(31 * MIN); await registry.heartbeat(); }
+    const g200 = await registry.settlementWindow.estimateGas(deadline, graceEnd);
+    // Binary search: a handful of extra reads, not 160 (about 2,700 gas each).
+    expect(g200 - g40).to.be.lessThan(10000n);
+  });
+
   it("Caps the extension at 72 hours, however long the silence", async function () {
     const { registry, vault, graceEnd } = await loadFixture(stack);
     await botRunsUntil(registry, graceEnd - BigInt(HOUR));
@@ -186,7 +196,7 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     it("Waits on the timelock when the registry has a delay", async function () {
       const [operator] = await ethers.getSigners();
       const reg = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-        operator.address, operator.address, operator.address, operator.address, operator.address, 48 * HOUR);
+        operator.address, operator.address, operator.address, 48 * HOUR);
       await expect(reg.setOutageConfig(30 * MIN, 2 * HOUR, 72 * HOUR)).to.be.revertedWith("Action was not queued");
     });
   });

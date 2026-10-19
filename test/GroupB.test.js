@@ -4,7 +4,7 @@ const { ethers } = require("hardhat");
 
 /**
  * Group B/D integration tests — the full Vault v2 lifecycle against mock
- * Aave, mock Uniswap router, and a mock TWAP source. Covers swap mechanics,
+ * mock Uniswap router and a mock TWAP source. Covers swap mechanics,
  * the deposit invariant, forced swap-back (aligned and diverged TWAP),
  * insurance draws, the three-tier access model, and the keeper bounty.
  *
@@ -61,9 +61,6 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
 
     // --- Mock integrations ---
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(await weth.getAddress());
-    const aTokenWeth = await aave.aTokenOf(await weth.getAddress());
 
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
@@ -84,11 +81,11 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await weth.getAddress(), 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(await weth.getAddress(), aTokenWeth);
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
+    await registry.addAsset(await weth.getAddress(), 0);
+    await registry.addAsset(await usdx.getAddress(), 0);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100); // 2% tol, 1h grace, 2bps/hr, 1% cap
 
     // Tier limits disabled for this suite. These tests predate the risk tiers
@@ -156,7 +153,7 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
     await weth.connect(borrower).approve(await vault.getAddress(), DEPOSIT);
     await vault.connect(borrower).payDeposit();
 
-    return { operator, lender, borrower, keeper, weth, usdx, aave, aTokenWeth,
+    return { operator, lender, borrower, keeper, weth, usdx,
              router, uniPool, kyc, registry, pool, factory, vault };
   }
 
@@ -172,17 +169,6 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
   });
 
   // --- Deposit invariant ---
-
-  it("Invariant: Aave supply of full principal succeeds; one wei more is blocked", async function () {
-    const { vault, borrower, aTokenWeth } = await loadFixture(deployStackFixture);
-
-    await expect(vault.connect(borrower).supplyToAave(PRINCIPAL + 1n))
-      .to.be.revertedWith("Action would touch the deposit - deposit is not investable");
-
-    await vault.connect(borrower).supplyToAave(PRINCIPAL);
-    const aToken = await ethers.getContractAt("MockAToken", aTokenWeth);
-    expect(await aToken.balanceOf(await vault.getAddress())).to.equal(PRINCIPAL);
-  });
 
   it("Invariant: swapping out the full principal succeeds; one wei more is blocked", async function () {
     const { vault, borrower, usdx } = await loadFixture(deployStackFixture);
@@ -235,13 +221,10 @@ describe("Group B — Vault v2 lifecycle (integration)", function () {
   // --- Early close ---
 
   it("Early close: profit path pays lender target and borrower the residual", async function () {
-    const { vault, borrower, lender, weth, aave } = await loadFixture(deployStackFixture);
-    const wethAddr = await weth.getAddress();
+    const { vault, borrower, lender, weth } = await loadFixture(deployStackFixture);
 
-    await vault.connect(borrower).supplyToAave(PRINCIPAL);
-    // Simulate 0.5 WETH yield: extra aTokens to vault + underlying to Aave.
-    await aave.simulateYield(wethAddr, await vault.getAddress(), E("0.5"));
-    await weth.mint(await aave.getAddress(), E("0.5"));
+    // 0.5 WETH of trading profit (arrives as loan asset in the vault).
+    await weth.mint(await vault.getAddress(), E("0.5"));
 
     await atDeadline(vault);
     await vault.connect(borrower).settle();

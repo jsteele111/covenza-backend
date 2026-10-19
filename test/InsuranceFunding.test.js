@@ -42,9 +42,6 @@ describe("Insurance funding and cancellation", function () {
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
     const usdxAddr = await usdx.getAddress();
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(usdxAddr);
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
@@ -54,10 +51,10 @@ describe("Insurance funding and cancellation", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), usdxAddr, 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
+    await registry.addAsset(usdxAddr, 0);
     // Explicit: a never-seen asset defaults to Speculative, not BlueChip. This
     // suite asserts that the vault's CEILING prices the premium rather than
     // the loan asset's own tier, which needs the loan asset to be tagged

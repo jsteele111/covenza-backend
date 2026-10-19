@@ -175,27 +175,23 @@ describe("Admin timelocks — AssetRegistry integration addresses", function () 
   // Normalised to checksum form, since that is how ethers returns addresses
   // read from a contract.
   const addrs = {
-    aavePool:       ethers.getAddress("0x0000000000000000000000000000000000000a01"),
     swapRouter:     ethers.getAddress("0x0000000000000000000000000000000000000a02"),
     uniswapFactory: ethers.getAddress("0x0000000000000000000000000000000000000a03"),
-    weth:           ethers.getAddress("0x0000000000000000000000000000000000000a04"),
   };
 
   async function deployFixture() {
     const [operator, attacker] = await ethers.getSigners();
     const Registry = await ethers.getContractFactory("AssetRegistry", operator);
     const registry = await Registry.deploy(
-      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth, 0
+      operator.address, addrs.swapRouter, addrs.uniswapFactory, 0
     );
     return { registry, operator, attacker };
   }
 
   it("Records the integration addresses given at deployment", async function () {
     const { registry } = await loadFixture(deployFixture);
-    expect(await registry.aavePool()).to.equal(addrs.aavePool);
     expect(await registry.swapRouter()).to.equal(addrs.swapRouter);
     expect(await registry.uniswapFactory()).to.equal(addrs.uniswapFactory);
-    expect(await registry.weth()).to.equal(addrs.weth);
   });
 
   it("Exposes no function that can change them", async function () {

@@ -72,10 +72,6 @@ describe("Group H — protocol fee", function () {
     const weth = await Mock.deploy("Mock WETH", "WETH", 18);
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(await weth.getAddress());
-    const aTokenWeth = await aave.aTokenOf(await weth.getAddress());
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -92,11 +88,11 @@ describe("Group H — protocol fee", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await weth.getAddress(), 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(await weth.getAddress(), aTokenWeth);
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
+    await registry.addAsset(await weth.getAddress(), 0);
+    await registry.addAsset(await usdx.getAddress(), 0);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
 
     // Tier limits disabled for this suite. These tests predate the risk tiers
@@ -162,7 +158,7 @@ describe("Group H — protocol fee", function () {
     }
 
     return { operator, lender, borrower, keeper, treasury, referrer,
-             weth, usdx, aave, aTokenWeth, router, uniPool, kyc, registry, pool,
+             weth, usdx, router, uniPool, kyc, registry, pool,
              factory, originate };
   }
 

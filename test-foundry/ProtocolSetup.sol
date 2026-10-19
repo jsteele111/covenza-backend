@@ -67,10 +67,9 @@ abstract contract ProtocolSetup is Test {
 
         MockIdentityAdapter id = new MockIdentityAdapter();
 
-        registry = new AssetRegistry(address(this), makeAddr("aave"), address(router),
-                                     address(uniFactory), address(weth), 0);
-        registry.addAssetWithTier(address(weth), address(0), AssetRegistry.YieldVenue.None, address(0), 0, AssetRegistry.RiskTier.BlueChip);
-        registry.addAssetWithTier(address(usdx), address(0), AssetRegistry.YieldVenue.None, address(0), 0, AssetRegistry.RiskTier.BlueChip);
+        registry = new AssetRegistry(address(this), address(router), address(uniFactory), 0);
+        registry.addAssetWithTier(address(weth), 0, AssetRegistry.RiskTier.BlueChip);
+        registry.addAssetWithTier(address(usdx), 0, AssetRegistry.RiskTier.BlueChip);
         registry.setPoolFeeTier(address(weth), address(usdx), 3000);
         registry.setSettlementConfig(1800, 200, 1 days, 100, 200);
         // Permissive tier: only the vault's own rules bind, not the floors.

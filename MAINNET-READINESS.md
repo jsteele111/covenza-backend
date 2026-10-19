@@ -243,7 +243,12 @@ Adding an identity provider is not an emergency.
 
 ---
 
-## 7. The ERC-4626 yield venue is a mock — HIGH (blocked)
+## 7. The ERC-4626 yield venue is a mock — HIGH (blocked) — **RESOLVED BY REMOVAL (19 October 2026)**
+
+> **Update, 19 October 2026:** yield venues (Aave V3 and ERC-4626) were removed
+> from the contracts before the audit freeze (audit E-1). With no real venue on
+> this chain they were unused code in scope. They can return as a separate,
+> separately audited change once a venue exists. Original text below.
 
 `MockERC4626` is registered as the venue for tUSDG on testnet. Real funds must
 never touch it.
@@ -886,6 +891,13 @@ in-kind window bug above. 354 Hardhat tests passing.
 
 **Done (19 October 2026):** per-asset grace timelocked both ways, and the re-listing bypass closed (item 12). 360 Hardhat tests passing.
 
+**Done (19 October 2026, pre-freeze audit pass):** M-1, M-2, L-1, L-2, L-4,
+L-5, L-6, L-7 and the missing event fixed; yield venues and unused views
+removed; `scripts/legacy/` deleted; `package.json` trimmed. I-3 fixed. M-3, L-3
+and the three remaining informational items accepted and documented. See
+*Pre-freeze audit pass* below. 355 Hardhat tests (21 suites) and 10 Foundry
+tests passing.
+
 **Before freeze:** nothing outstanding in the code. All four Krait observations are closed.
 Item 8's premium calibration remains modelling work.
 
@@ -893,3 +905,135 @@ The KYC adapter work is
 **done (18 October 2026)**: `IIdentityAdapter`, expiring claim-bearing EIP-712
 attestations checked at origination, lender screening, and the manual-grant
 safeguards. See `KYCRegistry.sol` and `IdentityAdapter.test.js`.
+
+---
+
+# Pre-freeze audit pass — 19 October 2026
+
+A final self-audit before freezing the commit: every contract re-read against
+the Cyfrin/Solodit checklist (370 items), Zealynx's Uniswap integration
+checklist, and the classes of bug that automated LLM auditors have found in
+production contracts. Each finding was confirmed with a failing proof of
+concept before it was fixed, and each fix has a regression test.
+
+| ID | Finding | Severity | Status | Tests |
+|---|---|---|---|---|
+| M-1 | One recipient the token refuses blocks the whole settlement | Medium | **Fixed** | `Payouts.test.js`, invariant `settlementConserves` |
+| M-2 | In-kind split and insurance draw follow a TWAP the caller can move | Medium | **Fixed** | `InKindSettlement.test.js` |
+| M-3 | Forced swap-back can be sandwiched within the TWAP tolerance | Medium | **Accepted, documented** | — |
+| L-1 | A wallet can lend to itself | Low | **Fixed** | `KraitFindings.test.js` |
+| L-2 | Settlement config had no upper limits and could break the window/recovery rule | Low | **Fixed** | `ParameterTimelocks.test.js` |
+| L-3 | `settleInKind` charges no protocol fee, so a borrower holding dust could choose it | Low | **Accepted, mitigated by M-2's fix** | `InKindSettlement.test.js` (lender-only period) |
+| L-4 | `settlementWindow` cost grows with every outage recorded | Low | **Fixed** | `OutageGrace.test.js` |
+| L-5 | Zero-value payouts were still sent; tokens that reject them would block total-loss settlements | Low | **Fixed** | `Payouts.test.js` |
+| L-6 | A mandate fill had no borrower-side APR limit | Low | **Fixed** | `Mandates.test.js` |
+| L-7 | TWAP quote truncates amounts above `uint128` | Low | **Fixed** | `TwapGuard.test.js` |
+| I-1 | `setMaxEntryImpactBps` emitted no event | Info | **Fixed** | `ParameterTimelocks.test.js` |
+| I-2 | Interest stops at the deadline though capital stays locked through grace and the in-kind window | Info | **Documented** | — |
+| I-3 | `lossSeverity` misreports in-kind closes | Info | **Fixed** | `InKindSettlement.test.js` |
+| I-4 | Tokens sent to a vault outside its holdings cannot be recovered | Info | **Documented** | — |
+| I-5 | No pause function | Info | **Documented** | — |
+| — | Out-of-gas failures inside `try` could be read as a refused payout or an unsellable asset | Hardening | **Fixed** | — |
+| E-1 | Yield venues unused on this chain | Efficiency | **Removed** | `AssetGrace.test.js` replaces `YieldVenue.test.js` |
+| E-3 | Views nothing reads (KYC status helpers, venue getters) | Efficiency | **Removed** | — |
+| E-5 | `scripts/legacy/` | Efficiency | **Deleted** | — |
+| E-6 | `package.json` listed hardhat's own dependencies at top level | Efficiency | **Trimmed** | fresh install, all tests passing |
+
+In-scope size after this pass: **2,106 nSLOC** (2,017 written for Covenza plus
+89 vendored), down from 2,311.
+
+## 21. M-1 — one refused payout blocked the whole settlement — MEDIUM — **FIXED**
+
+Settlement pushed every payout (lender, keeper, treasury, referrer, borrower)
+in one transaction. Regulated stablecoins can blacklist addresses. If any
+recipient was blacklisted, every `settle()` reverted for ever: a borrower on a
+sanctions list locked the lender's principal in the vault permanently, and a
+blacklisted treasury blocked every settlement that paid a protocol fee.
+
+**Fix:** every payout goes through `Vault._pay`. It transfers if it can; if the
+token refuses, it records the amount in `owed(token, recipient)` and emits
+`PaymentDeferred`. Everyone else is paid as normal. The recipient calls
+`claim(token)` once the token lets them receive. `cancel()` uses the same path.
+The invariant `settlementConserves` now allows a vault to hold exactly the
+amounts owed to recipients and nothing more.
+
+## 22. M-2 — the in-kind split followed a movable TWAP — MEDIUM — **FIXED**
+
+`settleInKind()` values unsold assets at the TWAP and, before this fix, could
+draw insurance on the shortfall. It is only reachable when the pool cannot
+absorb the sale, which is exactly when its TWAP is cheapest to move. In the
+proof of concept (8 units held, 6.02 owed to the lender) the split was 6.02 /
+1.98 at a fair price, 4.02 / 3.98 with the TWAP pushed up, and 8 / 0 plus a
+1.0 insurance draw with it pushed down.
+
+**Fix:** `settleInKind()` never draws insurance, and for the first
+`IN_KIND_LENDER_PERIOD` (7 days) only the lender may call it. The lender is
+the party owed and already receives the cash first; anyone may call it after
+that, so a lender who walks away cannot strand the borrower's share.
+
+## 23. M-3 — sandwiching within the tolerance — MEDIUM — **ACCEPTED**
+
+A forced swap-back must land within the settlement tolerance of the TWAP. A
+searcher can sandwich it and take up to that tolerance from the sale. The loss
+falls on the borrower's residual first, and reaches the lender only in a loss.
+This is the price of having no oracle, and it is bounded: the tolerance is a
+timelocked parameter and should be kept tight on mainnet. Recorded under known
+limitations.
+
+## 24. L-1 to L-7 and the missing event — **FIXED or ACCEPTED**
+
+- **L-1:** `lender == borrower` is now refused at origination. A wallet
+  lending to itself has no legitimate purpose and is the first step of every
+  self-dealing route against the shared insurance pool. Separate wallets can
+  still collude; this removes the trivial case.
+- **L-2:** `setSettlementConfig` now has upper limits (TWAP window at most
+  1 day, grace at most 7 days, bounty rate at most 100% per hour) and enforces
+  from its side the rule `setOutageConfig` already enforced: the TWAP window
+  may not exceed the outage recovery period. Before, widening the window here
+  quietly broke that rule, and an unbounded window longer than any pool's
+  history would make every quote revert.
+- **L-3 (accepted):** `settleInKind()` charges no protocol fee, so a patient
+  borrower holding 1 wei of a dust asset could choose it to avoid the fee.
+  M-2's fix closes most of that route: the borrower cannot call it until
+  7 days after grace plus the 7-day lender-only period, and the lender can
+  settle normally (fee included) throughout. The fee forgone is small next to
+  two weeks of waiting, so charging a fee on surplus cash was not added.
+- **L-4:** outages are searched with a binary search instead of walked one by
+  one, so settling a vault costs the same however many outages were recorded
+  after its window (previously about 0.93M gas at 300 outages and 1.73M at
+  600).
+- **L-5:** `_pay` skips zero amounts, so a token that reverts on a
+  zero-value transfer cannot block a total-loss settlement (lender payout 0),
+  or any settlement with no referrer or no keeper bounty.
+- **L-6:** `fillMandate` takes a `maxAprBps` from the borrower and refuses a
+  fill priced above it, so a fill can never cost more than the borrower
+  accepted when they sent it.
+- **L-7:** `UniswapTwap.quote` refuses amounts above `type(uint128).max`
+  instead of truncating them.
+- **Event (I-1):** `setMaxEntryImpactBps` emits `MaxEntryImpactUpdated`.
+- **Additional hardening:** a `try` that fails because it ran out of gas now
+  reverts the whole transaction (`gasleft() <= gasBefore / 63`), in both the
+  in-kind sale loop and `trySafeTransfer`. M-1's fix made payouts
+  non-reverting, and without this a caller could send just enough gas for a
+  payout or sale to fail on purpose and have it treated as refused or
+  unsellable.
+
+## 25. Informational items I-2 to I-5 — **I-3 FIXED; the rest DOCUMENTED**
+
+- **I-2: interest stops at the deadline.** A lender's capital can stay in the
+  vault through grace and, in the worst case, the in-kind window, without
+  earning.
+- **I-3: `lossSeverity` misreported in-kind closes — FIXED.** It compared
+  the cash the lender received with what they were owed, so an in-kind close
+  where the lender was made whole in assets read as a lender loss (2). It now
+  returns 3 for any in-kind close: the outcome depends on assets the vault
+  could not sell, so it cannot be measured in the loan asset. What each side
+  received is in the `InKindAllocated` events.
+- **I-4: stray tokens are stuck.** Tokens sent to a vault that are not part
+  of its holdings record cannot be recovered. There is deliberately no sweep
+  function: any path to an arbitrary address is a path out of the vault.
+- **I-5: no pause.** The brakes are `removeAsset` (no new loans in that
+  asset), the identity requirements (no new borrowers) and the timelocks. Live
+  loans cannot be frozen by anyone, which is intended: a pause would be one
+  key holding every borrower's exit.
+

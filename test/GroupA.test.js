@@ -15,24 +15,20 @@ describe("Group A — AssetRegistry", function () {
     // Placeholder integration addresses — plain EOAs are fine for
     // registry-only tests; nothing here calls into them.
     const addrs = {
-      aavePool:       "0x0000000000000000000000000000000000000A01",
       swapRouter:     "0x0000000000000000000000000000000000000A02",
       uniswapFactory: "0x0000000000000000000000000000000000000A03",
-      weth:           "0x0000000000000000000000000000000000000A04",
     };
 
     const Registry = await ethers.getContractFactory("AssetRegistry", operator);
     const registry = await Registry.deploy(
-      operator.address, addrs.aavePool, addrs.swapRouter, addrs.uniswapFactory, addrs.weth, 0
+      operator.address, addrs.swapRouter, addrs.uniswapFactory, 0
     );
 
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const usdc = await Mock.deploy("Mock USDC", "USDC", 6);
     const wbtc = await Mock.deploy("Mock WBTC", "WBTC", 8);
 
-    const aTokenUsdc = "0x0000000000000000000000000000000000000B01";
-
-    return { registry, operator, other, usdc, wbtc, aTokenUsdc, addrs };
+    return { registry, operator, other, usdc, wbtc, addrs };
   }
 
   it("Should reject deployment with any zero address", async function () {
@@ -40,60 +36,63 @@ describe("Group A — AssetRegistry", function () {
     const Registry = await ethers.getContractFactory("AssetRegistry");
     const good = "0x0000000000000000000000000000000000000A01";
     await expect(
-      Registry.deploy(ethers.ZeroAddress, good, good, good, good, 0)
+      Registry.deploy(ethers.ZeroAddress, good, good, 0)
     ).to.be.revertedWith("Invalid operator address");
     await expect(
-      Registry.deploy(operator.address, ethers.ZeroAddress, good, good, good, 0)
-    ).to.be.revertedWith("Invalid Aave pool address");
+      Registry.deploy(operator.address, ethers.ZeroAddress, good, 0)
+    ).to.be.revertedWith("Invalid swap router address");
+    await expect(
+      Registry.deploy(operator.address, good, ethers.ZeroAddress, 0)
+    ).to.be.revertedWith("Invalid Uniswap factory address");
   });
 
-  it("Should allow the operator to whitelist an asset with its aToken", async function () {
-    const { registry, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+  it("Should allow the operator to whitelist an asset", async function () {
+    const { registry, usdc } = await loadFixture(deployRegistryFixture);
 
-    await expect(registry.addAsset(await usdc.getAddress(), aTokenUsdc))
+    await expect(registry.addAsset(await usdc.getAddress(), 0))
       .to.emit(registry, "AssetAdded")
-      .withArgs(await usdc.getAddress(), aTokenUsdc);
+      .withArgs(await usdc.getAddress());
 
     expect(await registry.isWhitelisted(await usdc.getAddress())).to.equal(true);
-    expect(await registry.aTokenOf(await usdc.getAddress())).to.equal(aTokenUsdc);
   });
 
   it("Should reject whitelist changes from non-operators", async function () {
-    const { registry, other, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+    const { registry, other, usdc } = await loadFixture(deployRegistryFixture);
 
     await expect(
-      registry.connect(other).addAsset(await usdc.getAddress(), aTokenUsdc)
+      registry.connect(other).addAsset(await usdc.getAddress(), 0)
     ).to.be.revertedWith("Caller is not the operator");
   });
 
   it("Should reject double-whitelisting", async function () {
-    const { registry, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
-    await registry.addAsset(await usdc.getAddress(), aTokenUsdc);
+    const { registry, usdc } = await loadFixture(deployRegistryFixture);
+    await registry.addAsset(await usdc.getAddress(), 0);
     await expect(
-      registry.addAsset(await usdc.getAddress(), aTokenUsdc)
+      registry.addAsset(await usdc.getAddress(), 0)
     ).to.be.revertedWith("Asset already whitelisted");
   });
 
-  it("Should remove an asset but keep its aToken readable (in-flight vault safety)", async function () {
-    const { registry, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+  it("Should remove an asset but keep its tier and grace readable (in-flight vault safety)", async function () {
+    const { registry, usdc } = await loadFixture(deployRegistryFixture);
     const usdcAddr = await usdc.getAddress();
 
-    await registry.addAsset(usdcAddr, aTokenUsdc);
+    await registry.addAssetWithTier(usdcAddr, 3600, 1);
     await expect(registry.removeAsset(usdcAddr))
       .to.emit(registry, "AssetRemoved").withArgs(usdcAddr);
 
     expect(await registry.isWhitelisted(usdcAddr)).to.equal(false);
-    // The critical safety property: aToken stays readable after removal.
-    expect(await registry.aTokenOf(usdcAddr)).to.equal(aTokenUsdc);
+    // The critical safety property: open loans still read these at settlement.
+    expect(await registry.tierOf(usdcAddr)).to.equal(1);
+    expect(await registry.gracePeriodOf(usdcAddr)).to.equal((await registry.swapBackGracePeriod()) + 3600n);
   });
 
   it("Should return only currently-whitelisted assets from getWhitelistedAssets", async function () {
-    const { registry, usdc, wbtc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+    const { registry, usdc, wbtc } = await loadFixture(deployRegistryFixture);
     const usdcAddr = await usdc.getAddress();
     const wbtcAddr = await wbtc.getAddress();
 
-    await registry.addAsset(usdcAddr, aTokenUsdc);
-    await registry.addAsset(wbtcAddr, ethers.ZeroAddress);
+    await registry.addAsset(usdcAddr, 0);
+    await registry.addAsset(wbtcAddr, 0);
     await registry.removeAsset(usdcAddr);
 
     const listed = await registry.getWhitelistedAssets();
@@ -102,12 +101,12 @@ describe("Group A — AssetRegistry", function () {
   });
 
   it("Should allow re-whitelisting a previously removed asset without duplicating history", async function () {
-    const { registry, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+    const { registry, usdc } = await loadFixture(deployRegistryFixture);
     const usdcAddr = await usdc.getAddress();
 
-    await registry.addAsset(usdcAddr, aTokenUsdc);
+    await registry.addAsset(usdcAddr, 0);
     await registry.removeAsset(usdcAddr);
-    await registry.addAsset(usdcAddr, aTokenUsdc);
+    await registry.addAsset(usdcAddr, 0);
 
     expect(await registry.isWhitelisted(usdcAddr)).to.equal(true);
     expect(await registry.totalAssets()).to.equal(1);
@@ -137,7 +136,7 @@ describe("Group A — AssetRegistry", function () {
   });
 
   it("Should transfer the operator role and reject the old operator afterwards", async function () {
-    const { registry, operator, other, usdc, aTokenUsdc } = await loadFixture(deployRegistryFixture);
+    const { registry, operator, other, usdc } = await loadFixture(deployRegistryFixture);
 
     await registry.transferOperator(other.address);
 
@@ -145,16 +144,16 @@ describe("Group A — AssetRegistry", function () {
     // the nominee has no powers until they accept.
     expect(await registry.operator()).to.equal(operator.address);
     await expect(
-      registry.connect(other).addAsset(await usdc.getAddress(), aTokenUsdc)
+      registry.connect(other).addAsset(await usdc.getAddress(), 0)
     ).to.be.revertedWith("Caller is not the operator");
 
     await registry.connect(other).acceptOperator();
 
     await expect(
-      registry.connect(operator).addAsset(await usdc.getAddress(), aTokenUsdc)
+      registry.connect(operator).addAsset(await usdc.getAddress(), 0)
     ).to.be.revertedWith("Caller is not the operator");
 
-    await expect(registry.connect(other).addAsset(await usdc.getAddress(), aTokenUsdc))
+    await expect(registry.connect(other).addAsset(await usdc.getAddress(), 0))
       .to.emit(registry, "AssetAdded");
   });
 });

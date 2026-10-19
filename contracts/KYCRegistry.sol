@@ -96,8 +96,6 @@ contract KYCRegistry is Timelocked, OperatorControlled, EIP712, IIdentityAdapter
     mapping(address => Verification) internal _verification;
 
     mapping(address => bool)    public isVerified;  // admitted and not revoked; NOT expiry-aware — use isEligible
-    mapping(address => uint256) public verifiedAt;
-    mapping(address => uint256) public revokedAt;
     mapping(address => uint256) public nonces;      // bumped on every use and on revoke
 
     /// @notice Which attester admitted each wallet, address(0) if manual.
@@ -232,7 +230,6 @@ contract KYCRegistry is Timelocked, OperatorControlled, EIP712, IIdentityAdapter
     function revoke(address _wallet) external onlyOperator {
         require(isVerified[_wallet], "Address is not verified");
         isVerified[_wallet] = false;
-        revokedAt[_wallet]  = block.timestamp;
         nonces[_wallet]    += 1;
         emit AddressRevoked(_wallet, block.timestamp);
     }
@@ -337,8 +334,6 @@ contract KYCRegistry is Timelocked, OperatorControlled, EIP712, IIdentityAdapter
         });
         attestedBy[_wallet] = _attester;
         isVerified[_wallet] = true;
-        verifiedAt[_wallet] = block.timestamp;
-        revokedAt[_wallet]  = 0;
         emit AddressVerified(_wallet, block.timestamp, !_manual);
     }
 
@@ -354,18 +349,4 @@ contract KYCRegistry is Timelocked, OperatorControlled, EIP712, IIdentityAdapter
         return _attesterList;
     }
 
-    function isRecognisedAttester(address _key) external view returns (bool) {
-        return attesters[_key].recognised;
-    }
-
-    /// @notice Summary status, kept for existing callers. `verified` ignores
-    ///         expiry; isEligible is the answer that counts.
-    function statusOf(address _wallet) external view returns (bool verified, uint256 verifiedTs, uint256 revokedTs) {
-        return (isVerified[_wallet], verifiedAt[_wallet], revokedAt[_wallet]);
-    }
-
-    /// @notice The EIP-712 domain separator signers must use.
-    function domainSeparator() external view returns (bytes32) {
-        return _domainSeparatorV4();
-    }
 }

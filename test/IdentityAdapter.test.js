@@ -15,10 +15,9 @@ describe("Identity adapter — eligibility checked at origination", function () 
   async function stack(adapterKind = "kyc", factoryDelay = 0) {
     const [operator, lender, borrower, attester] = await ethers.getSigners();
     const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("WETH", "WETH", 18);
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), operator.address, operator.address, await weth.getAddress(), 0);
-    await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
+      operator.address, operator.address, operator.address, 0);
+    await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();

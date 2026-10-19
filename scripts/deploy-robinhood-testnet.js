@@ -9,10 +9,9 @@
  *      whole point: the mock could not express observation cardinality, which
  *      is how a fund-freeze bug survived 91 passing tests.
  *
- *   2. No Aave. It is not deployed on Robinhood Chain. AssetRegistry's
- *      constructor still requires a non-zero pool address, so a placeholder
- *      goes in and no asset is configured with the Aave venue. The interface
- *      stays in the contracts, dormant, so Aave chains remain available.
+ *   2. No yield venue. Aave is not on Robinhood Chain and no ERC-4626 vault
+ *      exists here, so the yield-venue code was removed from the contracts
+ *      before audit. Idle principal stays in the vault.
  *
  *   3. twapWindow is 60, not 1800. A freshly warmed pool has only a couple of
  *      minutes of observation history, and on a real chain you cannot fast-
@@ -34,7 +33,7 @@ const hre = require("hardhat");
 const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
-const { guardProductionConfig, guardNoYieldVenues } = require("./lib/production-guards");
+const { guardProductionConfig } = require("./lib/production-guards");
 const { sendOrQueue } = require("./lib/timelock");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
@@ -44,8 +43,6 @@ const BOUNTY_RATE_PER_HOUR_BPS = 3000; // demo-tuned so a bounty is visible fast
 const BOUNTY_CAP_BPS           = 200;  // 2%
 const INSURANCE_DRAW_CAP_BPS   = 1000; // 10% of principal
 
-const VENUE_NONE = 0;
-const VENUE_4626 = 2;
 
 const TIER_STANDARD = 1;
 const STOCK_GRACE_SECONDS = 72 * 3600;   // covers a weekend; see deploy-stock-token-testnet.js
@@ -163,18 +160,6 @@ async function main() {
   await sendOrQueue(kyc, "verify", [deployer.address, 7, ethers.id("testnet-demo-lender")],
     { network, label: `manual grant: lender ${deployer.address} (lenders need sanctions screening)` });
 
-  // --- 2. ERC-4626 yield venue over tUSDG ------------------------------
-  //
-  // Stands in for a MetaMorpho vault until one is confirmed on this chain.
-  // Deploying it now means the 4626 path is exercised on-chain rather than
-  // only in the local suite — and it is the path that will actually be used
-  // in production, since Aave is not here.
-
-  const venue = await (await ethers.getContractFactory("MockERC4626", deployer)).deploy(usdg);
-  await venue.waitForDeployment();
-  const venueAddress = await venue.getAddress();
-  console.log(`\nERC-4626 venue  ${venueAddress} (over tUSDG)`);
-
   // --- 3. InsurancePool -------------------------------------------------
 
   const pool = await (await ethers.getContractFactory("InsurancePool", deployer))
@@ -183,16 +168,9 @@ async function main() {
   console.log(`InsurancePool   ${await pool.getAddress()}`);
 
   // --- 4. AssetRegistry, pointed at REAL Uniswap -----------------------
-  //
-  // The Aave pool argument is a placeholder: the constructor rejects zero,
-  // but nothing reads it unless an asset is given the Aave venue, and none is.
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", deployer)).deploy(
-    deployer.address,
-    deployer.address,      // aavePool placeholder — Aave is not on this chain
-    uni.swapRouter,
-    uni.uniswapFactory,
-    weth, TIMELOCK_DELAY
+    deployer.address, uni.swapRouter, uni.uniswapFactory, TIMELOCK_DELAY
   );
   await registry.waitForDeployment();
   console.log(`AssetRegistry   ${await registry.getAddress()}`);
@@ -201,16 +179,11 @@ async function main() {
   // Production must keep it on, with the heartbeat bot running.
   guardProductionConfig(network, { outageGapThreshold: await registry.outageGapThreshold() });
 
-  // tUSDG earns yield through the 4626 venue; tWETH is swap-only. Neither
-  // carries a grace extension — both are continuously tradeable. Stock
-  // tokens are where extensions apply.
-  await (await registry.addAssetWithVenue(
-    usdg, ethers.ZeroAddress, VENUE_4626, venueAddress, 0
-  )).wait();
-  await (await registry.addAssetWithVenue(
-    weth, ethers.ZeroAddress, VENUE_NONE, ethers.ZeroAddress, 0
-  )).wait();
-  console.log("  whitelisted tUSDG (ERC-4626 venue) and tWETH (swap-only)");
+  // Neither carries a grace extension — both are continuously tradeable.
+  // Stock tokens are where extensions apply.
+  await (await registry.addAsset(usdg, 0)).wait();
+  await (await registry.addAsset(weth, 0)).wait();
+  console.log("  whitelisted tUSDG and tWETH");
 
   // Always timelocked (item 12): every direction hurts someone on a live loan.
   await sendOrQueue(registry, "setSettlementConfig", [
@@ -259,7 +232,7 @@ async function main() {
 
   // Tokenised equities added earlier by deploy-stock-token-testnet.js are
   // re-listed, so a full redeploy keeps them: Standard tier, 72-hour grace,
-  // no yield venue. Skipped if the testnet reset took them.
+  // Skipped if the testnet reset took them.
   const stocks = [];
   for (const [symbol, addr] of Object.entries(uni.tokens)) {
     if (addr === usdg || addr === weth) continue;
@@ -267,8 +240,7 @@ async function main() {
       console.log(`  ${symbol} ${addr} has no code — skipped`);
       continue;
     }
-    await (await registry.addAssetWithVenue(addr, ethers.ZeroAddress, VENUE_NONE, ethers.ZeroAddress, STOCK_GRACE_SECONDS)).wait();
-    await (await registry.setTier(addr, TIER_STANDARD)).wait();
+    await (await registry.addAssetWithTier(addr, STOCK_GRACE_SECONDS, TIER_STANDARD)).wait();
     stocks.push(symbol);
     console.log(`  whitelisted ${symbol} (Standard, ${STOCK_GRACE_SECONDS / 3600}h grace)`);
   }
@@ -291,8 +263,6 @@ async function main() {
     });
   }
 
-  // Production ships with every venue None (item 7). Testnet keeps the mock.
-  await guardNoYieldVenues(network, registry, [usdg, weth, ...stocks.map((s) => uni.tokens[s])]);
 
   // --- 5. VaultFactory ---------------------------------------------------
 
@@ -404,7 +374,6 @@ async function main() {
     vaultLens: await lens.getAddress(),
     uniswapTwapLibrary:  await twapLib.getAddress(),
     treasury,
-    yieldVenue4626: venueAddress,
     verifiedBorrower: borrower.address,
     keeper: keeper ? keeper.address : null,
     tokens: { tUSDG: usdg, tWETH: weth, ...Object.fromEntries(stocks.map((s) => [s, uni.tokens[s]])) },

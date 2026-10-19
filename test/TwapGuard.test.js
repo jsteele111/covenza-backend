@@ -49,10 +49,6 @@ describe("TWAP availability guard", function () {
     const weth = await Mock.deploy("Mock WETH", "WETH", 18);
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(await weth.getAddress());
-    const aTokenWeth = await aave.aTokenOf(await weth.getAddress());
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
@@ -75,11 +71,11 @@ describe("TWAP availability guard", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await weth.getAddress(), 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(await weth.getAddress(), aTokenWeth);
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
+    await registry.addAsset(await weth.getAddress(), 0);
+    await registry.addAsset(await usdx.getAddress(), 0);
     await registry.setSettlementConfig(TWAP_WINDOW, 200, GRACE, 2, 100);
 
     // Tier limits disabled for this suite. These tests predate the risk tiers
@@ -294,6 +290,12 @@ describe("TWAP availability guard", function () {
     const [quotable, twapOut] = await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), 0n, POOL_FEE);
     expect(quotable).to.equal(false);
     expect(twapOut).to.equal(0n);
+  });
+
+  it("Refuses to quote an amount the TWAP maths would truncate (audit L-7)", async function () {
+    const { vault, lens, usdx } = await loadFixture(fixture);
+    await expect(lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), 2n ** 128n, POOL_FEE))
+      .to.be.revertedWith("Amount too large to quote");
   });
 
   it("A guarded swap still force-settles cleanly", async function () {

@@ -205,14 +205,8 @@ async function main() {
 
   // --- 5. List it ------------------------------------------------------
 
-  await (await registry.addAssetWithVenue(
-    stockAddr,
-    ethers.ZeroAddress, // no Aave on this chain
-    0,                  // YieldVenue.None — an equity has no lending venue here
-    ethers.ZeroAddress,
-    GRACE_SECONDS
-  )).wait();
-  await (await registry.setTier(stockAddr, TIER_STANDARD)).wait();
+  // One transaction, so the tier history records Standard and nothing else.
+  await (await registry.addAssetWithTier(stockAddr, GRACE_SECONDS, TIER_STANDARD)).wait();
 
   // Vaults trade only through the pool the registry names for each pair
   // (KRAIT-003 / item 20). Naming the first pool for a pair is instant.

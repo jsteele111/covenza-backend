@@ -2,11 +2,11 @@
  * Refuses a production deployment carrying a testnet configuration.
  *
  * WHY THIS EXISTS: every value below is VALID. The contracts accept a 60-second
- * TWAP window, a zero timelock delay, and a mock yield venue — they have to,
+ * TWAP window and a zero timelock delay — they have to,
  * because testing needs them. That is precisely the danger: nothing reverts, no
  * test fails, and the mistake is invisible until it is exploited.
  *
- * Three specific near-misses this guards against:
+ * Specific near-misses this guards against:
  *
  *   - A 60s TWAP is the contract minimum and the testnet value. We moved a
  *     pool's price 80% in eight transactions during testing; a 60-second
@@ -16,10 +16,6 @@
  *     Shipped to mainnet that yields timelocks which queue and execute in the
  *     same block — the ceremony of a delay with none of the protection. This
  *     default was introduced in the same change that added the timelocks.
- *
- *   - The ERC-4626 venue is a mock. There is no real vault on Robinhood Chain
- *     to replace it with, so mainnet must ship with every venue set to None
- *     rather than trusting whoever runs the script to remember.
  *
  * Override with ALLOW_UNSAFE_PRODUCTION=1 — deliberately ugly, and it prints
  * what is being waived so it appears in the terminal history.
@@ -112,38 +108,8 @@ function guardProductionConfig(networkName, cfg = {}) {
   throw new Error(message + "\n\nSet ALLOW_UNSAFE_PRODUCTION=1 to override.");
 }
 
-/**
- * Asserts no whitelisted asset points at a yield venue.
- *
- * Separate from the config check because it runs AFTER assets are listed, and
- * because it needs the registry rather than a plain object.
- */
-async function guardNoYieldVenues(networkName, registry, assets) {
-  if (!isProduction(networkName)) { return; }
-
-  const withVenue = [];
-  for (const asset of assets) {
-    const [venue] = await registry.venueOf(asset);
-    if (Number(venue) !== 0) { withVenue.push({ asset, venue: Number(venue) }); }
-  }
-  if (withVenue.length === 0) { return; }
-
-  const message =
-    `Refusing production deployment: ${withVenue.length} asset(s) have a yield venue set.\n` +
-    withVenue.map((w) => `  - ${w.asset} (venue ${w.venue})`).join("\n") +
-    `\nThe only ERC-4626 implementation in this repo is a mock, and no real ` +
-    `vault exists on this chain. Ship with venues set to None.`;
-
-  if (process.env.ALLOW_UNSAFE_PRODUCTION === "1") {
-    console.warn("\n" + message + "\nPROCEEDING because ALLOW_UNSAFE_PRODUCTION=1.\n");
-    return;
-  }
-  throw new Error(message + "\n\nSet ALLOW_UNSAFE_PRODUCTION=1 to override.");
-}
-
 module.exports = {
   guardProductionConfig,
-  guardNoYieldVenues,
   isProduction,
   MIN_TWAP_WINDOW,
   MIN_TIMELOCK,

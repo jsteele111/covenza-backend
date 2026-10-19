@@ -40,9 +40,6 @@ describe("Risk tiers", function () {
     const aapl = await Mock.deploy("Mock AAPL", "AAPL", 18);   // standard
     const meme = await Mock.deploy("Mock MEME", "MEME", 18);   // speculative
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(await usdx.getAddress());
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
@@ -67,11 +64,11 @@ describe("Risk tiers", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await usdx.getAddress(), 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
     for (const t of [usdx, weth, aapl, meme]) {
-      await registry.addAsset(await t.getAddress(), ethers.ZeroAddress);
+      await registry.addAsset(await t.getAddress(), 0);
     }
     await registry.setSettlementConfig(1800, 300, 3600, 2, 100);
 
@@ -262,17 +259,7 @@ describe("Risk tiers", function () {
       .deploy("Fresh", "FRSH", 18);
     const addr = await freshToken.getAddress();
 
-    await registry.addAsset(addr, ethers.ZeroAddress);
-    expect(await registry.tierHistoryLength(addr)).to.equal(1);
-  });
-
-  it("Seeds tier history on the addAssetWithVenue path", async function () {
-    const { registry, operator } = await loadFixture(fixture);
-    const freshToken = await (await ethers.getContractFactory("MockERC20", operator))
-      .deploy("Fresh", "FRSH", 18);
-    const addr = await freshToken.getAddress();
-
-    await registry.addAssetWithVenue(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0);
+    await registry.addAsset(addr, 0);
     expect(await registry.tierHistoryLength(addr)).to.equal(1);
   });
 
@@ -282,7 +269,7 @@ describe("Risk tiers", function () {
       .deploy("Fresh", "FRSH", 18);
     const addr = await freshToken.getAddress();
 
-    await registry.addAssetWithTier(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, STANDARD);
+    await registry.addAssetWithTier(addr, 0, STANDARD);
 
     expect(await registry.tierHistoryLength(addr)).to.equal(1);
     expect(await registry.tierOf(addr)).to.equal(STANDARD);
@@ -294,7 +281,7 @@ describe("Risk tiers", function () {
       .deploy("Fresh", "FRSH", 18);
     const addr = await freshToken.getAddress();
 
-    await registry.addAssetWithTier(addr, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, STANDARD);
+    await registry.addAssetWithTier(addr, 0, STANDARD);
 
     // The sole entry must read Standard. A phantom Speculative entry sharing
     // this block would make highestTierSince report a tier the asset never
@@ -309,7 +296,7 @@ describe("Risk tiers", function () {
       .deploy("Fresh", "FRSH", 18);
     const addr = await freshToken.getAddress();
 
-    await registry.addAsset(addr, ethers.ZeroAddress);
+    await registry.addAsset(addr, 0);
 
     expect(await registry.tierOf(addr)).to.equal(SPECULATIVE);
     const listedAt = (await ethers.provider.getBlock("latest")).timestamp;

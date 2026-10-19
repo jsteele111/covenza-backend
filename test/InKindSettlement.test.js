@@ -11,8 +11,10 @@ const { ethers } = require("hardhat");
  * tokenised equity, or a pool too thin or too far from its TWAP, locked the
  * whole vault: the lender received nothing, not even the cash already in it.
  *
- * settleInKind() opens IN_KIND_DELAY (7 days) after keepers could first
- * settle. It sells what it can, pays the cash to the lender first, and hands
+ * settleInKind() opens IN_KIND_DELAY (7 days) after the grace period ends
+ * (never during an outage's recovery hold), to the lender alone for the first
+ * IN_KIND_LENDER_PERIOD (7 days) and to anyone after that. It draws no
+ * insurance. It sells what it can, pays the cash to the lender first, and hands
  * each unsold asset over in kind: to the lender up to what they are still
  * owed (valued at the TWAP), the rest to the borrower. An asset that cannot
  * be priced goes wholly to the lender if anything is still owed.
@@ -38,8 +40,6 @@ async function stack() {
   const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock WETH", "WETH", 18);
   // The held asset: a token its issuer can freeze, like a tokenised equity.
   const usdx = await (await ethers.getContractFactory("MockFreezableToken", operator)).deploy("Mock USDX", "USDX", 18);
-
-  const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
   const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
   const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
   const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -55,9 +55,9 @@ async function stack() {
   await kyc.verify(lender.address, 7, ethers.id("test-fixture"));
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-    operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);
-  await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
-  await registry.addAssetWithTier(await usdx.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
+    operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+  await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+  await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
   await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
   // Outage detection off: these tests jump the clock by days, which would
   // otherwise be recorded as a sequencer outage and move every window.
@@ -111,12 +111,12 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     await expect(vault.connect(lender).settle()).to.be.revertedWith("Too little received");
   });
 
-  it("Opens 7 days after keepers could first settle, and not a second before", async function () {
+  it("Opens 7 days after grace ends, and not a second before", async function () {
     const { lender, vault, registry, breakTheSale } = await loadFixture(stack);
     await breakTheSale();
 
-    const keeperFrom = (await vault.deadline()) + (await registry.swapBackGracePeriod());
-    expect(await vault.inKindFrom()).to.equal(keeperFrom + 7n * 86400n);
+    const graceEnd = (await vault.deadline()) + (await registry.swapBackGracePeriod());
+    expect(await vault.inKindFrom()).to.equal(graceEnd + 7n * 86400n);
     expect(await vault.IN_KIND_DELAY()).to.equal(7n * 86400n);
 
     await time.setNextBlockTimestamp((await vault.inKindFrom()) - 1n);
@@ -149,11 +149,30 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await vault.heldAssetCount()).to.equal(0);
   });
 
-  it("Is open to anyone, and pays the caller nothing", async function () {
-    const { stranger, weth, usdx, vault, breakTheSale, toInKindWindow } = await loadFixture(stack);
+  it("Reports an in-kind close as severity 3, not as a lender loss (audit I-3)", async function () {
+    // Here the lender is made whole: 3.5 WETH of cash plus USDX worth the
+    // rest at the TWAP. Comparing cash alone would have reported 2.
+    const { lender, usdx, vault, breakTheSale, toInKindWindow } = await loadFixture(stack);
+    await breakTheSale();
+    await toInKindWindow();
+    expect(await vault.lossSeverity()).to.equal(0);   // unsettled
+    await vault.connect(lender).settleInKind();
+
+    expect(await vault.settledLenderPayout()).to.be.lessThan(P + (await vault.settledFee()));
+    expect(await usdx.balanceOf(lender.address)).to.be.greaterThan(0n);
+    expect(await vault.lossSeverity()).to.equal(3);
+  });
+
+  it("Opens to the lender first, and to anyone a week later; pays the caller nothing (audit M-2)", async function () {
+    const { stranger, borrower, weth, usdx, vault, breakTheSale, toInKindWindow } = await loadFixture(stack);
     await breakTheSale();
     await toInKindWindow();
 
+    // The lender bears the TWAP valuation, so the lender chooses the moment.
+    await expect(vault.connect(stranger).settleInKind()).to.be.revertedWith("Lender-only period");
+    await expect(vault.connect(borrower).settleInKind()).to.be.revertedWith("Lender-only period");
+
+    await time.increaseTo((await vault.inKindFrom()) + (await vault.IN_KIND_LENDER_PERIOD()));
     await vault.connect(stranger).settleInKind();
     expect(await weth.balanceOf(stranger.address)).to.equal(0);
     expect(await usdx.balanceOf(stranger.address)).to.equal(0);
@@ -192,19 +211,19 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await weth.balanceOf(lender.address) - lenderWeth).to.equal(CASH);
 
     const stillOwed = P + (await vault.settledFee()) - CASH;
-    expect(await vault.inKindOwed(await usdx.getAddress(), lender.address)).to.equal(stillOwed);
-    expect(await vault.inKindOwed(await usdx.getAddress(), borrower.address)).to.equal(BOUGHT - stillOwed);
+    expect(await vault.owed(await usdx.getAddress(), lender.address)).to.equal(stillOwed);
+    expect(await vault.owed(await usdx.getAddress(), borrower.address)).to.equal(BOUGHT - stillOwed);
 
-    await expect(vault.connect(lender).claimInKind(await usdx.getAddress())).to.be.revertedWith("Token transfer failed");
+    await expect(vault.connect(lender).claim(await usdx.getAddress())).to.be.revertedWith("Token transfer failed");
 
     await usdx.setFrozen(false);
-    await expect(vault.connect(lender).claimInKind(await usdx.getAddress()))
-      .to.emit(vault, "InKindClaimed").withArgs(await usdx.getAddress(), lender.address, stillOwed);
-    await vault.connect(borrower).claimInKind(await usdx.getAddress());
+    await expect(vault.connect(lender).claim(await usdx.getAddress()))
+      .to.emit(vault, "Claimed").withArgs(await usdx.getAddress(), lender.address, stillOwed);
+    await vault.connect(borrower).claim(await usdx.getAddress());
     expect(await usdx.balanceOf(lender.address)).to.equal(stillOwed);
     expect(await usdx.balanceOf(borrower.address)).to.equal(BOUGHT - stillOwed);
 
-    await expect(vault.connect(lender).claimInKind(await usdx.getAddress())).to.be.revertedWith("Nothing owed in kind");
+    await expect(vault.connect(lender).claim(await usdx.getAddress())).to.be.revertedWith("Nothing owed");
   });
 
   it("An asset with no price goes wholly to the lender, and draws no insurance", async function () {
@@ -239,20 +258,21 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await usdx.balanceOf(borrower.address)).to.equal(E("1"));
   });
 
-  it("Draws insurance only on the shortfall left after counting the asset at its TWAP value", async function () {
+  it("Draws no insurance, however large the shortfall (audit M-2)", async function () {
     const { lender, weth, usdx, uniPool, vault, breakTheSale, toInKindWindow } = await loadFixture(stack);
     await breakTheSale();
     // The TWAP falls to about 0.25 WETH per USDX: 8 USDX is worth ~2 WETH, so
-    // cash 3.5 + 2 leaves ~4.5 of principal uncovered. The 10% draw cap
-    // (1 WETH) binds.
+    // cash 3.5 + 2 leaves ~4.5 of principal uncovered. Drawing on that
+    // shortfall let whoever depressed a thin pool's TWAP take the asset AND a
+    // payout; the lender now takes the asset instead of a claim.
     await uniPool.setAvgTick(tickFor(await usdx.getAddress(), await weth.getAddress(), -13863));
     await toInKindWindow();
 
     const lenderWeth = await weth.balanceOf(lender.address);
     await vault.connect(lender).settleInKind();
 
-    expect(await vault.settledInsuranceDraw()).to.equal(E("1"));
-    expect(await weth.balanceOf(lender.address) - lenderWeth).to.equal(CASH + E("1"));
+    expect(await vault.settledInsuranceDraw()).to.equal(0);
+    expect(await weth.balanceOf(lender.address) - lenderWeth).to.equal(CASH);
     // Still owed more than the asset is worth, so the lender takes all of it.
     expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
   });

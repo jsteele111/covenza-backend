@@ -47,9 +47,6 @@ describe("Mandates", function () {
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
     const usdxAddr = await usdx.getAddress();
-
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(usdxAddr);
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
 
@@ -60,10 +57,10 @@ describe("Mandates", function () {
     await kyc.verify(outsider.address, 7, ethers.id("test-fixture"));   // verified, but not the permitted borrower
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), usdxAddr, 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(usdxAddr, await aave.aTokenOf(usdxAddr));
+    await registry.addAsset(usdxAddr, 0);
     await registry.setSettlementConfig(1800, 200, 3600, 2, 100);
 
     // Permissive tiers so only the MANDATE's own bounds bind. Tier enforcement
@@ -365,7 +362,7 @@ describe("Mandates", function () {
     const { publish, factory, borrower, lender } = await loadFixture(fixture);
     const id = await publish();
 
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
 
     const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
     expect(await vault.lender()).to.equal(lender.address);
@@ -380,7 +377,7 @@ describe("Mandates", function () {
     const { publish, factory, borrower, usdx } = await loadFixture(fixture);
     const id = await publish();
 
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
     const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
 
     expect(await vault.depositPaid()).to.equal(true);
@@ -393,7 +390,7 @@ describe("Mandates", function () {
     const id = await publish();
 
     const before = await pool.reserveOf(usdxAddr);
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
 
     const expected = (PRINCIPAL * PREMIUM_BPS * BigInt(30 * DAY)) / (10000n * BigInt(YEAR));
     expect(await pool.reserveOf(usdxAddr) - before).to.equal(expected);
@@ -404,18 +401,28 @@ describe("Mandates", function () {
     const id = await publish();
 
     const lenderBefore = await usdx.balanceOf(lender.address);
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
 
     expect(lenderBefore - await usdx.balanceOf(lender.address)).to.equal(PRINCIPAL);
   });
 
   // --- Bounds ---
 
+  it("Refuses a fill priced above the borrower's limit (audit L-6)", async function () {
+    const { publish, factory, borrower } = await loadFixture(fixture);
+    const id = await publish();
+    const apr = await factory.quoteMandateApr(id, 30 * DAY, (DEPOSIT * 10000n) / PRINCIPAL);
+
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, apr - 1n))
+      .to.be.revertedWith("APR above the borrower's limit");
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, apr);
+  });
+
   it("Refuses a principal outside the mandate", async function () {
     const { publish, factory, borrower } = await loadFixture(fixture);
     const id = await publish();
 
-    await expect(factory.connect(borrower).fillMandate(id, E("500"), 30 * DAY, true, E("100")))
+    await expect(factory.connect(borrower).fillMandate(id, E("500"), 30 * DAY, true, E("100"), ethers.MaxUint256))
       .to.be.revertedWith("Principal outside the mandate's bounds");
   });
 
@@ -423,7 +430,7 @@ describe("Mandates", function () {
     const { publish, factory, borrower } = await loadFixture(fixture);
     const id = await publish();
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 60 * DAY, true, DEPOSIT))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 60 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.be.revertedWith("Term outside the mandate's bounds");
   });
 
@@ -431,7 +438,7 @@ describe("Mandates", function () {
     const { publish, factory, borrower } = await loadFixture(fixture);
     const id = await publish();
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, E("10")))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, E("10"), ethers.MaxUint256))
       .to.be.revertedWith("Deposit below the mandate's minimum");
   });
 
@@ -439,10 +446,10 @@ describe("Mandates", function () {
     const { publish, factory, borrower, outsider } = await loadFixture(fixture);
     const id = await publish({ permittedBorrower: borrower.address });
 
-    await expect(factory.connect(outsider).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT))
+    await expect(factory.connect(outsider).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.be.revertedWith("Not the permitted borrower for this mandate");
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.not.be.reverted;
   });
 
@@ -451,7 +458,7 @@ describe("Mandates", function () {
     const id = await publish();
     await factory.connect(lender).cancelMandate(id);
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.be.revertedWith("Mandate is not live");
   });
 
@@ -467,7 +474,7 @@ describe("Mandates", function () {
 
     const borrowerBefore = await usdx.balanceOf(borrower.address);
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.be.reverted;
 
     // No vault, no moved funds, and the mandate is still there to be filled if
@@ -484,7 +491,7 @@ describe("Mandates", function () {
     await usdx.connect(borrower).approve(factoryAddr, 0);
     const lenderBefore = await usdx.balanceOf(lender.address);
 
-    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT))
+    await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
       .to.be.reverted;
 
     // The lender's principal must not have moved. Without atomicity this is
@@ -506,18 +513,18 @@ describe("Mandates", function () {
     const { publish, factory, borrower } = await loadFixture(fixture);
     const id = await publish({ maxPrincipal: E("100"), totalCapacity: E("250") });
 
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
-    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+    await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
     expect(await factory.mandateRemaining(id)).to.equal(E("50"));
     expect(await factory.quoteMandateFillable(id)).to.equal(E("50"));
 
     // A third full-size loan no longer fits...
     await expect(
-      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT)
+      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256)
     ).to.be.revertedWith("Exceeds the mandate's remaining capacity");
 
     // ...but the remainder can still be taken.
-    await factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"));
+    await factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"), ethers.MaxUint256);
     expect(await factory.mandateRemaining(id)).to.equal(0);
     expect(await factory.quoteMandateFillable(id)).to.equal(0);
   });
@@ -528,7 +535,7 @@ describe("Mandates", function () {
     await usdx.connect(lender).approve(factoryAddr, 0);
 
     await expect(
-      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT)
+      factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256)
     ).to.be.reverted;
     expect(await factory.mandateRemaining(id)).to.equal(E("250"));
   });

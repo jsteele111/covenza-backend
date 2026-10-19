@@ -15,10 +15,10 @@ contract HandlerPaths is ProtocolSetup {
         h.toggleFreeze(0);                                   // issuer freezes the bought token
         h.warpToInKindWindow(0); h.botHour();                // silence extends grace once (72h cap)
         h.warpToInKindWindow(0); h.botHour();                // then the window opens after recovery
-        h.settleInKind(0, 0);
+        h.settleInKind(0, 1);                                // the lender, in the lender-only period
         assertEq(h.calls("settleInKind.ok"), 1, "in-kind settlement not reached");
         h.toggleFreeze(1);                                   // freeze lifts
-        h.claimInKind(0, true);
-        assertEq(h.calls("claimInKind.ok"), 1, "in-kind claim not reached");
+        h.claim(0, true);
+        assertEq(h.calls("claim.ok"), 1, "in-kind claim not reached");
     }
 }

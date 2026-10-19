@@ -112,7 +112,7 @@ app.listen(PORT, async () => {
   // attester. Saying so at startup turns a silent, confusing rejection at
   // submission time into a line the operator can act on before testing.
   try {
-    const recognised = await registry.isRecognisedAttester(verifierWallet.address);
+    const recognised = (await registry.attesters(verifierWallet.address)).recognised;
     if (recognised) {
       console.log("Status:   signing key IS a recognised attester.");
     } else {
@@ -122,6 +122,6 @@ app.listen(PORT, async () => {
       console.log(`              npx hardhat run scripts/manage-attesters.js --network ${NETWORK}`);
     }
   } catch {
-    console.log("Status:   registry predates recognised attesters (no isRecognisedAttester).");
+    console.log("Status:   registry predates recognised attesters (no attesters()).");
   }
-});
+});

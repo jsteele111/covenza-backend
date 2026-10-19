@@ -21,7 +21,7 @@ import "./libraries/SafeTransfer.sol";
  *         DEPOSIT SEGREGATION INVARIANT (replaces v1's investedAmount cap):
  *         the vault's loan-asset balance may never drop below `deposit`
  *         as a result of any borrower action. Every borrower-triggered
- *         outflow of the loan asset (Aave supply, swap out) checks that
+ *         outflow of the loan asset (a swap out) checks that
  *         the post-action balance remains >= deposit. One rule, enforced
  *         uniformly across all action types.
  *
@@ -54,29 +54,6 @@ import "./libraries/SafeTransfer.sol";
  *         If no foreign assets are held, post-deadline settlement is
  *         open to anyone immediately (unchanged from v1).
  */
-
-interface IAavePool {
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-}
-
-/**
- * @dev The second yield venue is the ERC-4626 STANDARD rather than a named
- *      protocol. Aave is not deployed on every chain Covenza targets; binding
- *      to a specific lending market would mean re-integrating per chain. Any
- *      compliant vault — MetaMorpho, Yearn, others — works through this one
- *      interface.
- *
- *      Unlike Aave's aToken, which rebases 1:1 with the underlying, 4626
- *      shares appreciate against it. Hence convertToAssets() wherever a
- *      position's VALUE is needed rather than its share count.
- */
-interface IERC4626 {
-    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
-    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
-    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
-    function convertToAssets(uint256 shares) external view returns (uint256);
-}
 
 /**
  * @dev This is **SwapRouter02**, not the original SwapRouter.
@@ -233,17 +210,6 @@ contract Vault {
     uint256 public referrerShareBps;
     uint256 public minimumFeeBps;
 
-    // --- Yield venue (snapshotted at first supply, never re-read) ---
-    //
-    // Same reasoning as the fee terms above. An operator repointing an
-    // asset's venue mid-loan must not be able to strand a position: the
-    // vault settles against the venue it actually supplied to, not whatever
-    // the registry says today. Zero kind means the vault has never supplied.
-
-    uint8   public yieldVenueKind;      // 0 None, 1 Aave, 2 ERC4626 — mirrors AssetRegistry.YieldVenue
-    address public yieldVenue;          // Aave pool, or the ERC-4626 vault
-    address public yieldPositionToken;  // aToken, or the ERC-4626 vault (its own share token)
-
     // --- Foreign asset tracking (assets swapped into, not yet swapped back) ---
 
     address[] public heldAssets;
@@ -277,10 +243,20 @@ contract Vault {
     /// @notice True when the loan was closed by settleInKind().
     bool public settledInKind;
 
-    /// @notice Held tokens allocated in kind that could not be transferred at
-    ///         settlement (a frozen token), by token and recipient. Claimable
-    ///         with claimInKind() once the token moves again.
-    mapping(address => mapping(address => uint256)) public inKindOwed;
+    /// @notice Lender-only period at the start of the in-kind window (M-2).
+    ///         The split values unsold assets at the TWAP, and an asset that
+    ///         cannot be sold usually sits in a thin pool whose TWAP is cheap to
+    ///         move. Letting anyone trigger it let the borrower choose a pumped
+    ///         moment. The lender, who bears the valuation, chooses first;
+    ///         after this period anyone may, so an absent lender cannot hold
+    ///         the borrower's share hostage.
+    uint256 public constant IN_KIND_LENDER_PERIOD = 7 days;
+
+    /// @notice Payouts that could not be delivered, by token and recipient:
+    ///         a token that refused the transfer (a frozen equity, or a
+    ///         blacklisted recipient of a regulated stablecoin). Claimable
+    ///         with claim() once the token moves again. See _pay().
+    mapping(address => mapping(address => uint256)) public owed;
 
     // --- Events ---
 
@@ -288,12 +264,8 @@ contract Vault {
         uint256 principal, uint256 requiredDeposit, uint256 aprBps, uint256 deadline);
     event DepositReceived(address indexed borrower, uint256 amount);
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, bool isSwapBack);
-    event AaveSupplied(uint256 amount, uint256 timestamp);
-    event AaveWithdrawn(uint256 amount, uint256 timestamp);
     event InsurancePremiumPaid(address indexed borrower, uint256 amount);
     event Cancelled(address indexed lender, uint256 principalReturned, uint256 timestamp);
-    event YieldSupplied(uint8 indexed venue, uint256 amount, uint256 timestamp);
-    event YieldWithdrawn(uint8 indexed venue, uint256 amount, uint256 timestamp);
     event ForcedSwapBack(address indexed heldAsset, uint256 amountIn, uint256 amountOut);
     event Settled(address indexed triggeredBy, bool early, uint256 totalReturned, uint256 insuranceDraw,
         uint256 lenderPayout, uint256 borrowerPayout, uint256 fee, uint256 bounty, uint256 timestamp);
@@ -301,7 +273,8 @@ contract Vault {
         uint256 treasuryAmount, uint256 referrerAmount);
     event InKindAllocated(address indexed token, uint256 toLender, uint256 toBorrower,
         uint256 twapValue, bool priced);
-    event InKindClaimed(address indexed token, address indexed to, uint256 amount);
+    event Claimed(address indexed token, address indexed to, uint256 amount);
+    event PaymentDeferred(address indexed token, address indexed to, uint256 amount);
 
     // --- Constructor ---
 
@@ -524,9 +497,7 @@ contract Vault {
         settledTotalReturned = balance;
         settledLenderPayout  = balance;
 
-        if (balance > 0) {
-            SafeTransfer.safeTransfer(asset, lender, balance);
-        }
+        _pay(asset, lender, balance);
 
         emit Cancelled(lender, balance, block.timestamp);
     }
@@ -550,74 +521,12 @@ contract Vault {
         _;
     }
 
-    // --- Whitelisted action 1: yield venue supply/withdraw (loan asset only) ---
-
-    /**
-     * @notice Supplies loan-asset funds to this asset's configured yield
-     *         venue — Aave V3 or any ERC-4626 vault.
-     *
-     * @dev    The venue is snapshotted on the first supply and locked for the
-     *         life of the vault. A borrower who wants to move venues must
-     *         fully withdraw and settle; the alternative is a vault holding
-     *         positions in two places with only one recorded, which is how
-     *         funds get stranded.
-     */
-    function supplyToYield(uint256 amount) public onlyActiveBorrower {
-        require(amount > 0, "Amount must be greater than zero");
-
-        (AssetRegistry.YieldVenue venue, address venueAddr) = registry.venueOf(asset);
-        require(venue != AssetRegistry.YieldVenue.None, "Asset has no yield venue");
-
-        if (yieldVenueKind == 0) {
-            yieldVenueKind = uint8(venue);
-            if (venue == AssetRegistry.YieldVenue.Aave) {
-                yieldVenue         = registry.aavePool();
-                yieldPositionToken = registry.aTokenOf(asset);
-                require(yieldPositionToken != address(0), "Asset has no Aave support");
-            } else {
-                yieldVenue         = venueAddr;
-                yieldPositionToken = venueAddr;   // a 4626 vault IS its own share token
-            }
-        } else {
-            require(yieldVenueKind == uint8(venue), "Yield venue changed mid-loan");
-        }
-
-        _enforceDepositInvariant(amount);
-
-        SafeTransfer.safeApprove(asset, yieldVenue, amount);
-        if (yieldVenueKind == 1) {
-            IAavePool(yieldVenue).supply(asset, amount, address(this), 0);
-            emit AaveSupplied(amount, block.timestamp);
-        } else {
-            IERC4626(yieldVenue).deposit(amount, address(this));
-        }
-
-        emit YieldSupplied(yieldVenueKind, amount, block.timestamp);
-    }
-
-    /// @notice Withdraws a borrower-chosen amount of the UNDERLYING asset
-    ///         back from the yield venue mid-term.
-    function withdrawFromYield(uint256 amount) public onlyActiveBorrower {
-        require(amount > 0,        "Amount must be greater than zero");
-        require(yieldVenueKind > 0, "No yield position");
-
-        if (yieldVenueKind == 1) {
-            IAavePool(yieldVenue).withdraw(asset, amount, address(this));
-            emit AaveWithdrawn(amount, block.timestamp);
-        } else {
-            IERC4626(yieldVenue).withdraw(amount, address(this), address(this));
-        }
-
-        emit YieldWithdrawn(yieldVenueKind, amount, block.timestamp);
-    }
-
-    /// @notice Deprecated aliases, kept so existing integrations and the
-    ///         published ABI keep working. Aave is now one venue among
-    ///         several rather than the only one.
-    function supplyToAave(uint256 amount) external { supplyToYield(amount); }
-    function withdrawFromAave(uint256 amount) external { withdrawFromYield(amount); }
-
-    // --- Whitelisted action 2: Uniswap V3 directional swaps ---
+    // --- The borrower's one action: Uniswap V3 directional swaps ---
+    //
+    // Yield venues (Aave, ERC-4626) were removed before audit: no venue
+    // exists on Robinhood Chain and production refused to configure one, so
+    // the code could only add attack surface. Idle principal sits in the
+    // vault. A venue can be reintroduced, with its own review, when one exists.
 
     /**
      * @notice Swaps the loan asset into a whitelisted foreign asset
@@ -975,7 +884,6 @@ contract Vault {
         isSettled = true; // before external calls — reentrancy guard
 
         _forcedSwapBackAll();
-        _withdrawAllFromYield();
         _distribute(early, bounty);
     }
 
@@ -1000,10 +908,11 @@ contract Vault {
     /**
      * @notice Last-resort settlement for a vault whose forced exit cannot
      *         complete — a held asset frozen by its issuer, or a pool too thin
-     *         or too far from its TWAP to sell into. Callable by anyone, once
-     *         inKindFrom() has passed (7 days after grace, and not during an
-     *         outage's recovery period). settle() remains available throughout;
-     *         whichever succeeds first closes the loan.
+     *         or too far from its TWAP to sell into. Opens at inKindFrom()
+     *         (7 days after grace, and not during an outage's recovery period)
+     *         for the lender alone, and to anyone IN_KIND_LENDER_PERIOD later.
+     *         settle() remains available throughout; whichever succeeds first
+     *         closes the loan.
      *
      * @dev    Item 14. Without it settle() reverts in full for as long as any
      *         one asset cannot be sold, and nothing bounds that: the lender
@@ -1022,30 +931,27 @@ contract Vault {
      *            valued, so the lender receives all of it if anything is still
      *            owed, and the borrower receives it otherwise.
      *
-     *         INSURANCE is drawn only on the shortfall that remains after the
-     *         in-kind assets are counted at their TWAP value, and only when
-     *         every asset could be priced. An unpriceable asset might be worth
-     *         anything, and paying a claim on top of handing it over would let
-     *         a borrower who drained their own pool collect twice.
+     *         NO INSURANCE on this path (M-2). The lender receives the asset
+     *         instead of a claim. Drawing on a shortfall measured at the TWAP of
+     *         a thin pool let whoever depressed that TWAP take the asset AND a
+     *         payout, then watch the price recover.
      *
      *         No keeper bounty and no protocol fee: this is a rescue, and the
      *         lender has every reason to call it themselves.
      *
-     *         A frozen token may refuse even the in-kind transfer. Its share
-     *         is then recorded in inKindOwed and the recipient claims it with
-     *         claimInKind() when the freeze lifts. The cash goes out regardless.
-     *
-     *         OUT OF SCOPE: a yield venue that cannot redeem still reverts this
-     *         path. Mainnet ships with every venue set to None (enforced by
-     *         the production deployment guard), so no vault can be in that
-     *         state; a real venue reopens the question.
+     *         Anything that cannot be delivered (a frozen held token, or a
+     *         blacklisted recipient) is recorded in owed() and claimed later
+     *         with claim(). Everything else goes out regardless.
      */
     function settleInKind() external {
         require(!isSettled, "Loan already settled");
         registry.heartbeat();
         require(depositPaid(), "Deposit was never paid - use cancel()");
         require(heldAssets.length > 0, "Nothing held - use settle()");
-        require(block.timestamp >= inKindFrom(), "In-kind settlement not yet open");
+        uint256 opens = inKindFrom();
+        require(block.timestamp >= opens, "In-kind settlement not yet open");
+        require(msg.sender == lender || block.timestamp >= opens + IN_KIND_LENDER_PERIOD,
+            "Lender-only period");
 
         isSettled = true; // before external calls — reentrancy guard
         settledInKind = true;
@@ -1053,45 +959,39 @@ contract Vault {
         // 1. Sell what can be sold. What cannot stays in heldAssets.
         for (uint256 i = heldAssets.length; i > 0; i--) {
             address held = heldAssets[i - 1];
+            uint256 gasBefore = gasleft();
             try this.exitHeld(held) {
                 heldAssets[i - 1] = heldAssets[heldAssets.length - 1];
                 _dropLastHeld(held);
-            } catch {}
-        }
-
-        _withdrawAllFromYield();
-
-        uint256 cash = IERC20(asset).balanceOf(address(this));
-        uint256 fee = accruedFee();
-        uint256 owed = principal + fee;
-
-        // 2. Insurance, on the shortfall after counting what is handed over.
-        uint256 insuranceDraw;
-        {
-            (uint256 pricedValue, bool allPriced) = _inKindValue();
-            if (allPriced && cash + pricedValue < principal) {
-                insuranceDraw = insurancePool.draw(asset, principal - cash - pricedValue, principal);
+            } catch {
+                // A sale that failed for lack of gas must not be read as an
+                // asset that cannot be sold (63/64 rule; Solodit SOL-Heuristics-5).
+                if (gasleft() <= gasBefore / 63) { revert("Out of gas"); }
             }
         }
 
-        uint256 available = cash + insuranceDraw;
-        uint256 lenderCash = available < owed ? available : owed;
-        owed -= lenderCash;
+
+        uint256 cash = IERC20(asset).balanceOf(address(this));
+        uint256 fee = accruedFee();
+        uint256 stillOwed = principal + fee;
+
+        // 2. Cash to the lender first, surplus cash to the borrower.
+        uint256 lenderCash = cash < stillOwed ? cash : stillOwed;
+        stillOwed -= lenderCash;
 
         settledTotalReturned  = cash;
-        settledInsuranceDraw  = insuranceDraw;
         settledLenderPayout   = lenderCash;
-        settledBorrowerPayout = available - lenderCash;
+        settledBorrowerPayout = cash - lenderCash;
         settledFee            = fee;
 
-        if (lenderCash > 0) { SafeTransfer.safeTransfer(asset, lender, lenderCash); }
-        if (settledBorrowerPayout > 0) { SafeTransfer.safeTransfer(asset, borrower, settledBorrowerPayout); }
+        _pay(asset, lender, lenderCash);
+        _pay(asset, borrower, settledBorrowerPayout);
 
         // 3 and 4. Priced assets first, then unpriceable ones.
-        owed = _allocateInKind(owed, true);
-        _allocateInKind(owed, false);
+        stillOwed = _allocateInKind(stillOwed, true);
+        _allocateInKind(stillOwed, false);
 
-        emit Settled(msg.sender, false, cash, insuranceDraw,
+        emit Settled(msg.sender, false, cash, 0,
             lenderCash, settledBorrowerPayout, fee, 0, block.timestamp);
     }
 
@@ -1116,18 +1016,10 @@ contract Vault {
         return (true, UniswapTwap.quote(uniFactory, held, asset, feeTier, amount, window));
     }
 
-    function _inKindValue() internal view returns (uint256 total, bool allPriced) {
-        allPriced = true;
-        for (uint256 i = 0; i < heldAssets.length; i++) {
-            (bool priced, uint256 value) = _priceHeld(heldAssets[i]);
-            if (priced) { total += value; } else { allPriced = false; }
-        }
-    }
-
     /// @dev Hands over every remaining held asset that is (or, with
     ///      `pricedPass` false, is not) priceable, and forgets it. Returns what
     ///      the lender is still owed.
-    function _allocateInKind(uint256 owed, bool pricedPass) internal returns (uint256) {
+    function _allocateInKind(uint256 stillOwed, bool pricedPass) internal returns (uint256) {
         for (uint256 i = heldAssets.length; i > 0; i--) {
             address held = heldAssets[i - 1];
             (bool priced, uint256 value) = _priceHeld(held);
@@ -1135,42 +1027,54 @@ contract Vault {
 
             uint256 amount = _sellableAmount(held);
             uint256 toLender;
-            if (owed > 0) {
-                if (!priced || value <= owed) {
+            if (stillOwed > 0) {
+                if (!priced || value <= stillOwed) {
                     toLender = amount;
-                    owed = priced ? owed - value : 0;
+                    stillOwed = priced ? stillOwed - value : 0;
                 } else {
-                    toLender = (amount * owed) / value;
-                    owed = 0;
+                    toLender = (amount * stillOwed) / value;
+                    stillOwed = 0;
                 }
             }
 
-            _handOver(held, lender, toLender);
-            _handOver(held, borrower, amount - toLender);
+            _pay(held, lender, toLender);
+            _pay(held, borrower, amount - toLender);
             emit InKindAllocated(held, toLender, amount - toLender, value, priced);
 
             heldAssets[i - 1] = heldAssets[heldAssets.length - 1];
             _dropLastHeld(held);
         }
-        return owed;
+        return stillOwed;
     }
 
-    /// @dev Transfers, or records the entitlement if the token refuses.
-    function _handOver(address token, address to, uint256 amount) internal {
+    /**
+     * @dev Every payout from this vault goes through here. Pays `amount`, or,
+     *      if the token refuses (a frozen equity, or a recipient blacklisted
+     *      by a regulated stablecoin), records it in owed() for the recipient
+     *      to claim later. Zero amounts are skipped, so tokens that reject
+     *      zero-value transfers cannot block settlement either.
+     *
+     *      M-1: settlement used to push every payout in one transaction, so
+     *      ONE recipient the token would not pay reverted the whole settlement
+     *      for everyone, permanently. A blacklisted borrower locked the
+     *      lender's principal in the vault for good.
+     */
+    function _pay(address token, address to, uint256 amount) internal {
         if (amount == 0) { return; }
         if (!SafeTransfer.trySafeTransfer(token, to, amount)) {
-            inKindOwed[token][to] += amount;
+            owed[token][to] += amount;
+            emit PaymentDeferred(token, to, amount);
         }
     }
 
-    /// @notice Claims a held token allocated in kind that could not be
-    ///         transferred at settlement. Reverts while the token still refuses.
-    function claimInKind(address token) external {
-        uint256 amount = inKindOwed[token][msg.sender];
-        require(amount > 0, "Nothing owed in kind");
-        inKindOwed[token][msg.sender] = 0;
+    /// @notice Collects a payout that could not be delivered at settlement.
+    ///         Reverts while the token still refuses this recipient.
+    function claim(address token) external {
+        uint256 amount = owed[token][msg.sender];
+        require(amount > 0, "Nothing owed");
+        owed[token][msg.sender] = 0;
         SafeTransfer.safeTransfer(token, msg.sender, amount);
-        emit InKindClaimed(token, msg.sender, amount);
+        emit Claimed(token, msg.sender, amount);
     }
 
     /// @dev Settlement phase 2: computes the waterfall, stores the outcome,
@@ -1253,19 +1157,11 @@ contract Vault {
         settledFee            = fee;
         settledBounty         = bounty;
 
-        SafeTransfer.safeTransfer(asset, lender, lenderPayout);
-        if (bounty > 0) {
-            SafeTransfer.safeTransfer(asset, msg.sender, bounty);
-        }
-        if (settledProtocolFee > 0) {
-            SafeTransfer.safeTransfer(asset, treasury, settledProtocolFee);
-        }
-        if (settledReferrerFee > 0) {
-            SafeTransfer.safeTransfer(asset, referrer, settledReferrerFee);
-        }
-        if (settledBorrowerPayout > 0) {
-            SafeTransfer.safeTransfer(asset, borrower, settledBorrowerPayout);
-        }
+        _pay(asset, lender, lenderPayout);
+        _pay(asset, msg.sender, bounty);
+        _pay(asset, treasury, settledProtocolFee);
+        _pay(asset, referrer, settledReferrerFee);
+        _pay(asset, borrower, settledBorrowerPayout);
 
         emit Settled(msg.sender, early, settledTotalReturned, settledInsuranceDraw,
             settledLenderPayout, settledBorrowerPayout, settledFee, settledBounty, block.timestamp);
@@ -1326,35 +1222,6 @@ contract Vault {
         return (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
     }
 
-    /// @dev Withdraws the vault's full yield position, if any, from whichever
-    ///      venue it actually supplied to. Reads the SNAPSHOT rather than the
-    ///      registry, so a venue repointed mid-loan cannot strand funds.
-    ///      Hardened: balance must genuinely decrease (the v1 stuck-funds fix,
-    ///      kept, and it applies to both venues).
-    function _withdrawAllFromYield() internal {
-        if (yieldVenueKind == 0) { return; }
-        if (yieldPositionToken == address(0) || yieldPositionToken.code.length == 0) { return; }
-
-        uint256 before = IERC20(yieldPositionToken).balanceOf(address(this));
-        if (before == 0) { return; }
-
-        if (yieldVenueKind == 1) {
-            // aToken rebases 1:1, so `before` is both the share count and the value.
-            IAavePool(yieldVenue).withdraw(asset, type(uint256).max, address(this));
-            emit AaveWithdrawn(before, block.timestamp);
-        } else {
-            // `before` is a SHARE count here; redeem burns all of them and
-            // returns however much underlying they are now worth.
-            IERC4626(yieldVenue).redeem(before, address(this), address(this));
-        }
-
-        require(
-            IERC20(yieldPositionToken).balanceOf(address(this)) < before,
-            "Yield withdrawal did not reduce balance"
-        );
-        emit YieldWithdrawn(yieldVenueKind, before, block.timestamp);
-    }
-
     /**
      * @dev The swap-back grace this vault is actually entitled to.
      *
@@ -1402,19 +1269,6 @@ contract Vault {
         return block.timestamp > deadline && !isSettled;
     }
 
-    /// @notice The vault's yield position valued in the UNDERLYING loan asset.
-    ///         Aave's aToken rebases 1:1 so its balance is already the value;
-    ///         ERC-4626 shares must be converted, since their whole point is
-    ///         to appreciate against the underlying.
-    function yieldPositionValue() external view returns (uint256) {
-        if (yieldVenueKind == 0 || yieldPositionToken == address(0)) { return 0; }
-
-        uint256 bal = IERC20(yieldPositionToken).balanceOf(address(this));
-        if (bal == 0) { return 0; }
-
-        return yieldVenueKind == 1 ? bal : IERC4626(yieldVenue).convertToAssets(bal);
-    }
-
     /// @notice The grace period this vault would get if it settled now, in
     ///         seconds — surfaced so the UI can show a borrower holding a
     ///         24/5 asset why their window is longer.
@@ -1422,12 +1276,18 @@ contract Vault {
         return _effectiveGracePeriod();
     }
 
-    /// 0 = no loss (or unsettled); 1 = borrower-only; 2 = lender-impacted.
+    /// 0 = no loss (or unsettled); 1 = borrower-only; 2 = lender-impacted;
+    /// 3 = settled in kind.
     /// Severity reflects the vault's OWN performance (pre-insurance-draw):
     /// a pool draw that makes the lender whole still records severity 1+,
     /// because the loss genuinely occurred — the pool absorbed it.
+    /// An in-kind close hands over assets the vault could not sell, so its
+    /// outcome cannot be measured in the loan asset: comparing cash alone
+    /// would report a lender loss even when the assets made the lender whole
+    /// (audit I-3). See the InKindAllocated events for what each side got.
     function lossSeverity() external view returns (uint8) {
         if (!isSettled) return 0;
+        if (settledInKind) return 3;
         if (settledLenderPayout < principal + settledFee) return 2;
         if (settledTotalReturned < principal + deposit) return 1;
         return 0;

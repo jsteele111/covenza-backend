@@ -27,8 +27,6 @@ async function stack() {
   const Mock = await ethers.getContractFactory("MockERC20", operator);
   const weth = await Mock.deploy("Mock WETH", "WETH", 18);
   const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
-
-  const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
   const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
   const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
   const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -45,9 +43,9 @@ async function stack() {
   await kyc.verify(attacker.address, 7, ethers.id("test-fixture"));
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-    operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);
-  await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
-  await registry.addAssetWithTier(await usdx.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
+    operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+  await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+  await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
 
   const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
   // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
@@ -148,23 +146,32 @@ describe("Krait findings — regression (KRAIT-001, KRAIT-002, KRAIT-003)", func
   describe("KRAIT-002: the insurance pool covers principal only", function () {
 
     it("Self-dealing at an absurd APR draws nothing from the pool", async function () {
+      // One wallet can no longer lend to itself (audit L-1), so the attack
+      // now needs two colluding wallets: attacker lends, accomplice borrows.
       const f = await loadFixture(stack);
-      const { attacker, weth, pool } = f;
+      const { attacker, borrower: accomplice, weth, pool } = f;
       const reserve0 = await pool.reserveOf(await weth.getAddress());
-      const start = await weth.balanceOf(attacker.address);
+      const start = (await weth.balanceOf(attacker.address)) + (await weth.balanceOf(accomplice.address));
 
       for (let i = 0; i < 3; i++) {
-        const vault = await originate(f, E("10"), E("1"), 2_000_000_000n, 60, true, attacker, attacker);
+        const vault = await originate(f, E("10"), E("1"), 2_000_000_000n, 60, true, attacker, accomplice);
         await time.increase(61);
         await vault.connect(attacker).settle();
         expect(await vault.settledInsuranceDraw()).to.equal(0);
       }
 
-      // The reserve only GROWS (by the premiums the attacker paid in).
+      // The reserve only GROWS (by the premiums the pair paid in).
       expect(await pool.reserveOf(await weth.getAddress())).to.be.gte(reserve0);
-      // The attacker ends with no more than they started with (minted funds aside).
+      // Together they end with no more than they started with (minted funds aside).
       const minted = 3n * (E("10") + E("1"));
-      expect((await weth.balanceOf(attacker.address)) - start).to.be.lte(minted);
+      const end = (await weth.balanceOf(attacker.address)) + (await weth.balanceOf(accomplice.address));
+      expect(end - start).to.be.lte(minted);
+    });
+
+    it("Refuses a wallet lending to itself (audit L-1)", async function () {
+      const f = await loadFixture(stack);
+      await expect(originate(f, E("10"), E("1"), 1200, 60, true, f.attacker, f.attacker))
+        .to.be.revertedWith("Lender and borrower must differ");
     });
 
     it("A genuine loss of principal is still covered, up to the cap", async function () {

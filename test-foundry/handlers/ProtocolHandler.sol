@@ -145,7 +145,7 @@ contract ProtocolHandler is Test {
         vm.prank(borrower);
         weth.approve(address(factory), type(uint256).max);
         vm.prank(borrower);
-        try factory.fillMandate(id, principal, term, true, dep) returns (address v) {
+        try factory.fillMandate(id, principal, term, true, dep, type(uint256).max) returns (address v) {
             vaults.push(Vault(v));
             ghostReserve += Vault(v).insurancePremium();
         } catch {}
@@ -308,7 +308,7 @@ contract ProtocolHandler is Test {
         try v.cancel() { calls["cancel.ok"]++; } catch {}
     }
 
-    function claimInKind(uint256 vSeed, bool asLender) external {
+    function claim(uint256 vSeed, bool asLender) external {
         Vault v;
         uint256 n = vaults.length;
         for (uint256 k = 0; k < n; k++) {
@@ -316,9 +316,9 @@ contract ProtocolHandler is Test {
             if (c.settledInKind()) { v = c; break; }
         }
         if (address(v) == address(0)) return;
-        calls["claimInKind"]++;
+        calls["claim"]++;
         vm.prank(asLender ? v.lender() : v.borrower());
-        try v.claimInKind(address(usdx)) { calls["claimInKind.ok"]++; } catch {}
+        try v.claim(address(usdx)) { calls["claim.ok"]++; } catch {}
     }
 
     // ------------------------------------------------------------------

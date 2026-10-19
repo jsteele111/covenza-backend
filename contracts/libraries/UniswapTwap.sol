@@ -58,6 +58,10 @@ library UniswapTwap {
         uint32  window
     ) public view returns (uint256 amountOut) {
         require(window > 0, "TWAP window must be nonzero");
+        // The vendored maths takes a uint128 amount. Casting silently would
+        // quote a truncated amount, and so set a floor far below the real
+        // value (audit L-7). Refuse instead.
+        require(amountIn <= type(uint128).max, "Amount too large to quote");
 
         address pool = IUniswapV3Factory(factory).getPool(tokenIn, tokenOut, fee);
         require(pool != address(0), "No pool for pair/fee");

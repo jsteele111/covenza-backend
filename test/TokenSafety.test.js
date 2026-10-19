@@ -16,8 +16,6 @@ describe("Item 15 — token safety and timelock expiry", function () {
   async function noReturnStack() {
     const [operator, lender, borrower, treasury] = await ethers.getSigners();
     const nr = await (await ethers.getContractFactory("MockNoReturnToken", operator)).deploy();
-
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
@@ -25,8 +23,8 @@ describe("Item 15 — token safety and timelock expiry", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await nr.getAddress(), 0);
-    await registry.addAssetWithTier(await nr.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
+      operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    await registry.addAssetWithTier(await nr.getAddress(), 0, 0);
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();

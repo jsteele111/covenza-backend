@@ -49,10 +49,6 @@ describe("Group D — guard rails and edge cases", function () {
     const weth = await Mock.deploy("Mock WETH", "WETH", 18);
     const usdx = await Mock.deploy("Mock USDX", "USDX", 18);
 
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
-    await aave.configureAsset(await weth.getAddress());
-    const aTokenWeth = await aave.aTokenOf(await weth.getAddress());
-
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -69,11 +65,11 @@ describe("Group D — guard rails and edge cases", function () {
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(),
-      await uniFactory.getAddress(), await weth.getAddress(), 0
+      operator.address, await router.getAddress(),
+      await uniFactory.getAddress(), 0
     );
-    await registry.addAsset(await weth.getAddress(), aTokenWeth);
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
+    await registry.addAsset(await weth.getAddress(), 0);
+    await registry.addAsset(await usdx.getAddress(), 0);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
 
     // Tier limits disabled for this suite. These tests predate the risk tiers
@@ -131,7 +127,7 @@ describe("Group D — guard rails and edge cases", function () {
     );
     const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
 
-    return { operator, lender, borrower, keeper, unverified, weth, usdx, aave, aTokenWeth,
+    return { operator, lender, borrower, keeper, unverified, weth, usdx,
              router, uniPool, kyc, registry, pool, factory, vault };
   }
 
@@ -201,10 +197,10 @@ describe("Group D — guard rails and edge cases", function () {
   });
 
   it("KYC revocation mid-loan: existing vault still functions (KYC gates origination only)", async function () {
-    const { kyc, vault, borrower, weth } = await loadFixture(fundedVaultFixture);
+    const { kyc, vault, borrower, usdx } = await loadFixture(fundedVaultFixture);
     await kyc.revoke(borrower.address);
     // Borrower can still operate and close their existing loan.
-    await vault.connect(borrower).supplyToAave(E("1"));
+    await vault.connect(borrower).swap(await usdx.getAddress(), E("1"), 1n, POOL_FEE);
     await atDeadline(vault);
     await vault.connect(borrower).settle();
     expect(await vault.isSettled()).to.equal(true);
@@ -240,7 +236,8 @@ describe("Group D — guard rails and edge cases", function () {
 
   it("Actions before deposit is paid are rejected (onlyActiveBorrower)", async function () {
     const { vault, borrower } = await loadFixture(deployStackFixture);
-    await expect(vault.connect(borrower).supplyToAave(E("1")))
+    const { usdx } = await loadFixture(deployStackFixture);
+    await expect(vault.connect(borrower).swap(await usdx.getAddress(), E("1"), 1n, POOL_FEE))
       .to.be.revertedWith("Deposit not yet paid");
     await atDeadline(vault);
     await expect(vault.connect(borrower).settle())
@@ -248,27 +245,6 @@ describe("Group D — guard rails and edge cases", function () {
   });
 
   // --- Invariant under combined actions ---
-
-  it("Invariant holds across combined Aave + swap activity", async function () {
-    const { vault, borrower, usdx } = await loadFixture(fundedVaultFixture);
-    const usdxAddr = await usdx.getAddress();
-
-    await vault.connect(borrower).supplyToAave(E("6"));
-    await vault.connect(borrower).swap(usdxAddr, E("4"), E("4"), POOL_FEE);
-    // Loan-asset balance is now exactly the deposit — one more wei out must fail.
-    await expect(vault.connect(borrower).swap(usdxAddr, 1n, 1n, POOL_FEE))
-      .to.be.revertedWith("Action would touch the deposit - deposit is not investable");
-    await expect(vault.connect(borrower).supplyToAave(1n))
-      .to.be.revertedWith("Action would touch the deposit - deposit is not investable");
-  });
-
-  it("withdrawFromAave mid-term restores investable balance", async function () {
-    const { vault, borrower, weth } = await loadFixture(fundedVaultFixture);
-    await vault.connect(borrower).supplyToAave(PRINCIPAL);
-    await vault.connect(borrower).withdrawFromAave(E("3"));
-    expect(await weth.balanceOf(await vault.getAddress())).to.equal(E("3") + DEPOSIT);
-    await vault.connect(borrower).supplyToAave(E("3")); // re-invest is fine
-  });
 
   it("swapBack: rejects assets that are not actually held", async function () {
     const { vault, borrower, usdx } = await loadFixture(fundedVaultFixture);

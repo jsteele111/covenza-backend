@@ -55,7 +55,11 @@ contract ProtocolInvariants is ProtocolSetup {
             uint256 out = v.settledLenderPayout() + v.settledBorrowerPayout() + v.settledBounty()
                         + v.settledProtocolFee() + v.settledReferrerFee();
             assertEq(out, v.settledTotalReturned() + v.settledInsuranceDraw(), "payouts != funds");
-            assertEq(weth.balanceOf(address(v)), 0, "loan asset left in a settled vault");
+            // Nothing left behind except payouts that could not be delivered
+            // and are waiting to be claimed (audit M-1).
+            uint256 deferred = v.owed(address(weth), v.lender()) + v.owed(address(weth), v.borrower())
+                             + v.owed(address(weth), keeper) + v.owed(address(weth), treasury);
+            assertEq(weth.balanceOf(address(v)), deferred, "loan asset left in a settled vault");
         }
     }
 
@@ -76,7 +80,7 @@ contract ProtocolInvariants is ProtocolSetup {
         for (uint256 i = 0; i < h.vaultCount(); i++) {
             Vault v = h.vaults(i);
             if (!v.settledInKind()) continue;
-            uint256 owed = v.inKindOwed(address(usdx), v.lender()) + v.inKindOwed(address(usdx), v.borrower());
+            uint256 owed = v.owed(address(usdx), v.lender()) + v.owed(address(usdx), v.borrower());
             assertGe(usdx.balanceOf(address(v)), owed, "in-kind claims exceed tokens held");
         }
     }
@@ -133,7 +137,7 @@ contract ProtocolInvariants is ProtocolSetup {
     function afterInvariant() external view {
         string[14] memory names = ["originate", "fillMandate", "swap.ok", "swapBack.ok",
             "movePrice", "manipulateSpot", "toggleFreeze", "donate", "warpToInKindWindow", "botHour",
-            "settle.ok", "settleInKind.ok", "claimInKind.ok", "cancel.ok"];
+            "settle.ok", "settleInKind.ok", "claim.ok", "cancel.ok"];
         for (uint256 i = 0; i < names.length; i++) {
             console.log(names[i], h.calls(names[i]));
         }

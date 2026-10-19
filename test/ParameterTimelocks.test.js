@@ -30,9 +30,9 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
       await uniFactory.setPool(await weth.getAddress(), await usdx.getAddress(), fee, await p.getAddress());
     }
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, operator.address, operator.address, await uniFactory.getAddress(), await weth.getAddress(), DELAY);
-    await registry.addAsset(await weth.getAddress(), ethers.ZeroAddress);
-    await registry.addAsset(await usdx.getAddress(), ethers.ZeroAddress);
+      operator.address, operator.address, await uniFactory.getAddress(), DELAY);
+    await registry.addAsset(await weth.getAddress(), 0);
+    await registry.addAsset(await usdx.getAddress(), 0);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, DELAY);
     return { operator, stranger, weth, usdx, registry, pool };
   }
@@ -79,9 +79,10 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
   });
 
   describe("Entry-impact limit", function () {
-    it("Tightens instantly", async function () {
+    it("Tightens instantly, and says so in an event", async function () {
       const { registry } = await loadFixture(registryStack);
-      await registry.setMaxEntryImpactBps(50); // 100 -> 50
+      await expect(registry.setMaxEntryImpactBps(50))   // 100 -> 50
+        .to.emit(registry, "MaxEntryImpactUpdated").withArgs(100, 50);
       expect(await registry.maxEntryImpactBps()).to.equal(50);
     });
 
@@ -123,7 +124,7 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
     });
   });
 
-  describe("Approved pool and yield venue", function () {
+  describe("Approved pool", function () {
     it("Names the FIRST pool for a pair instantly, but waits to change it", async function () {
       const { registry, weth, usdx } = await loadFixture(registryStack);
       const a = await weth.getAddress(), b = await usdx.getAddress();
@@ -135,15 +136,6 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
       expect(await registry.poolFeeTier(b, a)).to.equal(ALT_FEE);
     });
 
-    it("Waits to point an asset at a yield venue, but removes one instantly", async function () {
-      const { registry, usdx, stranger } = await loadFixture(registryStack);
-      const asset = await usdx.getAddress();
-      await expect(registry.setVenue(asset, 2, stranger.address)).to.be.revertedWith("Action was not queued");
-      await announce(registry, "setVenue", [asset, 2, stranger.address]);
-      await time.increase(DELAY);
-      await registry.setVenue(asset, 2, stranger.address);
-      await registry.setVenue(asset, 0, ethers.ZeroAddress); // back to None, instantly
-    });
   });
 
   describe("Per-asset grace extension", function () {
@@ -177,11 +169,11 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
       const { registry, usdx } = await loadFixture(registryStack);
       const asset = await usdx.getAddress();
       await registry.removeAsset(asset);   // instant: it only stops new positions
-      await expect(registry.addAssetWithVenue(asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72))
+      await expect(registry.addAsset(asset, H72))
         .to.be.revertedWith("Action was not queued");
-      await announce(registry, "addAssetWithVenue", [asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72]);
+      await announce(registry, "addAsset", [asset, H72]);
       await time.increase(DELAY);
-      await registry.addAssetWithVenue(asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72);
+      await registry.addAsset(asset, H72);
       expect(await registry.gracePeriodOf(asset)).to.equal((await registry.swapBackGracePeriod()) + BigInt(H72));
     });
 
@@ -189,28 +181,52 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
       const { registry, usdx, operator } = await loadFixture(registryStack);
       const asset = await usdx.getAddress();
       await registry.removeAsset(asset);
-      await registry.addAsset(asset, ethers.ZeroAddress);   // same grace (0), no venue
+      await registry.addAsset(asset, 0);   // same grace (0)
       expect(await registry.isWhitelisted(asset)).to.equal(true);
 
       const fresh = await (await ethers.getContractFactory("MockERC20", operator)).deploy("NEW", "NEW", 18);
-      await registry.addAssetWithVenue(await fresh.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, H72);
-    });
-
-    it("Cannot point a re-listed asset at a yield venue without the delay either", async function () {
-      const { registry, usdx, stranger } = await loadFixture(registryStack);
-      const asset = await usdx.getAddress();
-      await registry.removeAsset(asset);
-      await expect(registry.addAssetWithVenue(asset, ethers.ZeroAddress, 2, stranger.address, 0))
-        .to.be.revertedWith("Action was not queued");
+      await registry.addAsset(await fresh.getAddress(), H72);
     });
 
     it("Caps the extension at 14 days, at listing as well as on change", async function () {
       const { registry, usdx, operator } = await loadFixture(registryStack);
       const fresh = await (await ethers.getContractFactory("MockERC20", operator)).deploy("NEW", "NEW", 18);
-      await expect(registry.addAssetWithVenue(await fresh.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 15 * 86400))
+      await expect(registry.addAsset(await fresh.getAddress(), 15 * 86400))
         .to.be.revertedWith("Grace extension too long");
       await expect(registry.setGracePeriod(await usdx.getAddress(), 15 * 86400))
         .to.be.revertedWith("Grace extension too long");
+    });
+  });
+
+  describe("Settlement config limits (audit L-2)", function () {
+    // A zero-delay registry, so only the limits are under test.
+    async function open() {
+      const [operator] = await ethers.getSigners();
+      return (await ethers.getContractFactory("AssetRegistry", operator))
+        .deploy(operator.address, operator.address, operator.address, 0);
+    }
+
+    it("Refuses a TWAP window longer than the outage recovery period", async function () {
+      const registry = await open();   // detection on: recovery 1 hour
+      await expect(registry.setSettlementConfig(7200, 200, 36 * 3600, 2, 100))
+        .to.be.revertedWith("TWAP window longer than the outage recovery period");
+      await registry.setSettlementConfig(3600, 200, 36 * 3600, 2, 100);   // equal is fine
+    });
+
+    it("Allows a longer window once detection is off, but never beyond a day", async function () {
+      const registry = await open();
+      await registry.setOutageConfig(0, 0, 0);
+      await registry.setSettlementConfig(7200, 200, 36 * 3600, 2, 100);
+      await expect(registry.setSettlementConfig(86401, 200, 36 * 3600, 2, 100))
+        .to.be.revertedWith("TWAP window too long");
+    });
+
+    it("Caps the global grace at 7 days and the bounty rate at 100% an hour", async function () {
+      const registry = await open();
+      await expect(registry.setSettlementConfig(1800, 200, 7 * 86400 + 1, 2, 100))
+        .to.be.revertedWith("Grace period too long");
+      await expect(registry.setSettlementConfig(1800, 200, 36 * 3600, 10001, 100))
+        .to.be.revertedWith("Bounty rate too high");
     });
   });
 
@@ -234,7 +250,6 @@ describe("Krait observation — exposure cap uses the worst tier since originati
     const Mock = await ethers.getContractFactory("MockERC20", operator);
     const weth = await Mock.deploy("WETH", "WETH", 18);
     const usdx = await Mock.deploy("USDX", "USDX", 18);
-    const aave = await (await ethers.getContractFactory("MockAavePool", operator)).deploy();
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
     const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
@@ -248,9 +263,9 @@ describe("Krait observation — exposure cap uses the worst tier since originati
     await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
     await kyc.verify(lender.address, 7, ethers.id("test-fixture"));  // lenders are screened too (#7)
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
-      operator.address, await aave.getAddress(), await router.getAddress(), await uniFactory.getAddress(), await weth.getAddress(), 0);
-    await registry.addAssetWithTier(await weth.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 0);
-    await registry.addAssetWithTier(await usdx.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, 2); // Speculative: 25% cap
+      operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+    await registry.addAssetWithTier(await usdx.getAddress(), 0, 2); // Speculative: 25% cap
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
