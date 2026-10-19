@@ -375,7 +375,7 @@ first review did not walk.
 |---|---|---|---|
 | 10 | Insurance pool drainable via an instant factory repoint | HIGH | **FIXED** |
 | 11 | Swap router and Uniswap factory repointable under live vaults | HIGH | **FIXED** |
-| 12 | Other live-loan parameters change instantly | MEDIUM | **FIXED** (per-asset grace pending) |
+| 12 | Other live-loan parameters change instantly | MEDIUM | **FIXED** |
 | 13 | A mandate can be filled repeatedly | MEDIUM | **FIXED** |
 | 14 | Settlement has no fallback when swap-back is impossible | MEDIUM | **FIXED** (in-kind settlement) |
 | 15 | ERC20 assumptions, and timelock entries that never expire | LOW | **FIXED** (bounty note stands) |
@@ -441,7 +441,7 @@ smaller change: nothing in the tests, scripts or frontend called it.
 
 ---
 
-## 12. Other live-loan parameters change instantly — MEDIUM — **FIXED** (per-asset grace pending)
+## 12. Other live-loan parameters change instantly — MEDIUM — **FIXED**
 
 > **Fixed 18 October 2026.** `AssetRegistry` is now `Timelocked`, and the
 > registry and `InsurancePool` gain `queueAction(id)` / `cancelAction(id)`,
@@ -457,7 +457,8 @@ smaller change: nothing in the tests, scripts or frontend called it.
 > | `setVenue` | pointing at Aave or an ERC-4626 vault | setting None |
 > | `InsurancePool.setDrawCapBps` | every change | — |
 > | `setTier` | — | both ways: loans read the worst tier since origination |
-> | `setGracePeriod` (per asset) | **decision pending** | currently instant |
+> | `setGracePeriod` (per asset) | every change (19 October) | — |
+> | re-listing a removed asset | a different grace extension, or a new non-None venue | the same terms, or a brand-new asset |
 >
 > The exposure cap now reads the worst tier since origination
 > (`maxExposureBpsSince`), closing the Krait observation below, and the
@@ -467,6 +468,32 @@ smaller change: nothing in the tests, scripts or frontend called it.
 > `ParameterTimelocks.test.js`, all with a real 48-hour delay. **Limit:** a
 > change still reaches a loan already in its grace window once it lands; the
 > timelock gives warning, not immunity.
+>
+> **Per-asset grace, 19 October 2026.** Timelocked in both directions, as the
+> global grace already was. It cannot be snapshotted at origination, because
+> which assets a vault holds is only known at expiry, so a change reaches
+> every live loan holding the asset: shortening it cuts the borrower's window
+> to exit at a fair price, lengthening it holds keepers and the lender's
+> recovery off for longer. Building it exposed a bypass: `removeAsset` is
+> instant, and re-listing overwrote the grace extension AND the yield venue
+> with no delay, while vaults could still hold the asset. Re-listing on
+> different terms now waits too, and listing enforces the same 14-day cap
+> (`MAX_GRACE_EXTENSION`) as the setter. Six tests; five fail against
+> `50ae32e`, the sixth confirms new listings stay instant.
+>
+> **Considered and deferred: a trading-hours rule.** Holding keepers to each
+> asset's market hours (a per-asset weekly schedule plus a timelocked holiday
+> list) would be more precise than a fixed extension, which does not
+> guarantee a weekday: a loan due Tuesday evening ends grace early Saturday.
+> It was not adopted before audit because it would not remove the need for
+> this timelock (the schedule is itself a live-loan parameter); its benefit
+> is small while the lender can settle at any time in grace and forced sales
+> must land within the TWAP tolerance; it protects only against keepers, not
+> a party settling against a thin weekend pool; and it adds a new failure
+> mode (a wrong schedule blocks keepers for that asset), annual holiday
+> maintenance, and scope. To revisit with data on out-of-hours pool
+> behaviour. Both residual risks are listed in the README's known
+> limitations.
 
 
 Several operator setters still take effect immediately and are read live by
@@ -857,7 +884,9 @@ heartbeat bot (item 16).
 checked against deliberately broken contracts), which found and fixed the
 in-kind window bug above. 354 Hardhat tests passing.
 
-**Before freeze:** the per-asset grace decision (item 12). All four Krait observations are closed.
+**Done (19 October 2026):** per-asset grace timelocked both ways, and the re-listing bypass closed (item 12). 360 Hardhat tests passing.
+
+**Before freeze:** nothing outstanding in the code. All four Krait observations are closed.
 Item 8's premium calibration remains modelling work.
 
 The KYC adapter work is

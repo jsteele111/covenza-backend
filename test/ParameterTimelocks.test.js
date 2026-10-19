@@ -146,6 +146,74 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
     });
   });
 
+  describe("Per-asset grace extension", function () {
+    const H72 = 72 * 3600;
+
+    it("Waits to lengthen it, because keepers and the lender's recovery are held off longer", async function () {
+      const { registry, usdx } = await loadFixture(registryStack);
+      const asset = await usdx.getAddress();
+      await expect(registry.setGracePeriod(asset, H72)).to.be.revertedWith("Action was not queued");
+      await announce(registry, "setGracePeriod", [asset, H72]);
+      await expect(registry.setGracePeriod(asset, H72)).to.be.revertedWith("Timelock has not elapsed");
+      await time.increase(DELAY);
+      await registry.setGracePeriod(asset, H72);
+      expect(await registry.gracePeriodOf(asset)).to.equal((await registry.swapBackGracePeriod()) + BigInt(H72));
+    });
+
+    it("Waits to shorten it too, because the borrower's window to exit fairly is cut", async function () {
+      const { registry, usdx } = await loadFixture(registryStack);
+      const asset = await usdx.getAddress();
+      await announce(registry, "setGracePeriod", [asset, H72]);
+      await time.increase(DELAY);
+      await registry.setGracePeriod(asset, H72);
+      await expect(registry.setGracePeriod(asset, 0)).to.be.revertedWith("Action was not queued");
+      await announce(registry, "setGracePeriod", [asset, 0]);
+      await time.increase(DELAY);
+      await registry.setGracePeriod(asset, 0);
+      expect(await registry.gracePeriodOf(asset)).to.equal(await registry.swapBackGracePeriod());
+    });
+
+    it("Cannot be changed by removing and re-listing the asset", async function () {
+      const { registry, usdx } = await loadFixture(registryStack);
+      const asset = await usdx.getAddress();
+      await registry.removeAsset(asset);   // instant: it only stops new positions
+      await expect(registry.addAssetWithVenue(asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72))
+        .to.be.revertedWith("Action was not queued");
+      await announce(registry, "addAssetWithVenue", [asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72]);
+      await time.increase(DELAY);
+      await registry.addAssetWithVenue(asset, ethers.ZeroAddress, 0, ethers.ZeroAddress, H72);
+      expect(await registry.gracePeriodOf(asset)).to.equal((await registry.swapBackGracePeriod()) + BigInt(H72));
+    });
+
+    it("Re-listing on the same terms stays instant, and so does a brand-new listing", async function () {
+      const { registry, usdx, operator } = await loadFixture(registryStack);
+      const asset = await usdx.getAddress();
+      await registry.removeAsset(asset);
+      await registry.addAsset(asset, ethers.ZeroAddress);   // same grace (0), no venue
+      expect(await registry.isWhitelisted(asset)).to.equal(true);
+
+      const fresh = await (await ethers.getContractFactory("MockERC20", operator)).deploy("NEW", "NEW", 18);
+      await registry.addAssetWithVenue(await fresh.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, H72);
+    });
+
+    it("Cannot point a re-listed asset at a yield venue without the delay either", async function () {
+      const { registry, usdx, stranger } = await loadFixture(registryStack);
+      const asset = await usdx.getAddress();
+      await registry.removeAsset(asset);
+      await expect(registry.addAssetWithVenue(asset, ethers.ZeroAddress, 2, stranger.address, 0))
+        .to.be.revertedWith("Action was not queued");
+    });
+
+    it("Caps the extension at 14 days, at listing as well as on change", async function () {
+      const { registry, usdx, operator } = await loadFixture(registryStack);
+      const fresh = await (await ethers.getContractFactory("MockERC20", operator)).deploy("NEW", "NEW", 18);
+      await expect(registry.addAssetWithVenue(await fresh.getAddress(), ethers.ZeroAddress, 0, ethers.ZeroAddress, 15 * 86400))
+        .to.be.revertedWith("Grace extension too long");
+      await expect(registry.setGracePeriod(await usdx.getAddress(), 15 * 86400))
+        .to.be.revertedWith("Grace extension too long");
+    });
+  });
+
   describe("Insurance draw cap", function () {
     it("Waits in both directions", async function () {
       const { pool } = await loadFixture(registryStack);

@@ -76,6 +76,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
 
     uint32  public twapWindow          = 1800;  // 30 min TWAP window for forced swap-back pricing
     uint256 public twapToleranceBps    = 200;   // swap output must be within 2% of TWAP-implied value
+    uint256 public constant MAX_GRACE_EXTENSION = 14 days; // per-asset extension cap, at listing and on change
     uint256 public swapBackGracePeriod = 36 hours; // post-expiry window where only lender/borrower may settle a foreign-asset vault
     uint256 public bountyRatePerHourBps = 2;    // keeper bounty accrual: bps of principal per hour past grace end
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
@@ -423,7 +424,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     ) internal {
         require(_asset != address(0), "Invalid asset address");
         require(!assetConfig[_asset].whitelisted, "Asset already whitelisted");
+        require(_gracePeriod <= MAX_GRACE_EXTENSION, "Grace extension too long");
         _validateVenue(_venue, _aToken, _venueAddress);
+
+        // Re-listing a removed asset is not a fresh start: vaults may still
+        // hold it (swap-back is always allowed), so its grace extension and
+        // venue reach live loans. Without this, remove-then-re-add changed
+        // either instantly, around the timelocks on setGracePeriod and
+        // setVenue. Re-listing on the same terms stays instant.
+        if (_relistChangesLiveTerms(_asset, _aToken, _venue, _venueAddress, _gracePeriod)) {
+            _consumeIfDelayed(keccak256(msg.data));
+        }
 
         // Preserve any tier already assigned. Re-adding a previously removed
         // asset overwrites the whole struct, and silently resetting a
@@ -461,6 +472,23 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         emit AssetAdded(_asset, _aToken);
         emit VenueUpdated(_asset, _venue, _venueAddress);
         if (_gracePeriod > 0) { emit GracePeriodUpdated(_asset, _gracePeriod); }
+    }
+
+    /// @dev True when re-listing a previously added asset would change its
+    ///      grace extension, or point it at a different (non-None) venue.
+    ///      Removing the venue on re-listing stays instant, as in setVenue.
+    function _relistChangesLiveTerms(
+        address    _asset,
+        address    _aToken,
+        YieldVenue _venue,
+        address    _venueAddress,
+        uint256    _gracePeriod
+    ) internal view returns (bool) {
+        if (!_everAdded[_asset]) { return false; }
+        AssetConfig storage old = assetConfig[_asset];
+        if (_gracePeriod != old.gracePeriod) { return true; }
+        if (_venue == YieldVenue.None) { return false; }
+        return _venue != old.venue || _venueAddress != old.venueAddress || _aToken != old.aToken;
     }
 
     function _validateVenue(YieldVenue _venue, address _aToken, address _venueAddress) internal pure {
@@ -640,14 +668,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     }
 
     /// @notice Sets how much this asset extends the global swap-back grace by.
-    /// @dev    DECISION PENDING (item 12): the intended treatment is the
-    ///         timelock in both directions, since shortening grace hurts the
-    ///         borrower and lengthening it hurts the lender. Instant until
-    ///         that is confirmed. The GLOBAL grace, in setSettlementConfig,
-    ///         is already timelocked.
+    /// @dev    Timelocked in BOTH directions (item 12), like the global grace in
+    ///         setSettlementConfig. The extension is read at settlement, not
+    ///         snapshotted, because which assets a vault holds is only known at
+    ///         expiry. So a change reaches every live loan holding the asset:
+    ///         shortening it cuts the borrower's window to exit at a fair
+    ///         price, and lengthening it holds keepers, and the lender's
+    ///         recovery, off for longer. The delay gives both sides warning.
     function setGracePeriod(address _asset, uint256 _gracePeriod) external onlyOperator {
         require(_everAdded[_asset], "Unknown asset");
-        require(_gracePeriod <= 14 days, "Grace extension too long");
+        require(_gracePeriod <= MAX_GRACE_EXTENSION, "Grace extension too long");
+        _consumeIfDelayed(keccak256(msg.data));
 
         assetConfig[_asset].gracePeriod = _gracePeriod;
         emit GracePeriodUpdated(_asset, _gracePeriod);

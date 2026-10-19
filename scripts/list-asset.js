@@ -17,6 +17,7 @@
  */
 
 const hre = require("hardhat");
+const { sendOrQueue } = require("./lib/timelock");
 const fs = require("fs");
 const path = require("path");
 
@@ -60,14 +61,19 @@ async function main() {
     // whitelisted at the default tier in between, which on a fresh registry is
     // Speculative — harmless here, but it is a real window on a registry
     // serving live loans and there is no reason to open it.
-    await (await registry.addAssetWithTier(
+    //
+    // Re-listing a previously removed asset with a DIFFERENT grace extension
+    // waits on the timelock (item 12): vaults may still hold it. sendOrQueue
+    // sends at once when nothing changes, and announces otherwise.
+    const result = await sendOrQueue(registry, "addAssetWithTier", [
       asset,
       ethers.ZeroAddress,   // no Aave on this chain
       0,                    // YieldVenue.None
       ethers.ZeroAddress,
       GRACE_HOURS * 3600,
-      TIER
-    )).wait();
+      TIER,
+    ], { network: hre.network.name, label: `list ${SYMBOL || asset}` });
+    if (result !== "executed") return;
     console.log("\nWhitelisted.");
   }
 

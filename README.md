@@ -21,7 +21,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 |---|---:|---|
 | `contracts/Vault.sol` | 676 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, yield venues, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall, last-resort in-kind settlement (unsellable assets handed over at TWAP value; frozen tokens claimable later) |
 | `contracts/VaultFactory.sol` | 566 | Clones vaults from one implementation. identity gating through `IIdentityAdapter` (borrowers need all three claims, lenders sanctions screening; loosening is timelocked), whitelist gating, mandates (publish, fill atomically, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
-| `contracts/AssetRegistry.sol` | 431 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
+| `contracts/AssetRegistry.sol` | 450 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset yield venue and grace period, immutable integration addresses, settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery). Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 190 | Identity adapter backed by third-party attesters. EIP-712 attestations bound to chain and contract, carrying claim flags (KYC, sanctions, jurisdiction) and an expiry of at most 365 days, checked at every origination. Timelocked attester additions and rotations. Manual grants: timelocked, 30 days, once per wallet per year, case reference on chain, marked manual, at most 5 per 30 days. No identity data stored |
 | `contracts/InsurancePool.sol` | 115 | Per-asset reserves, draws capped as a % of principal and as a share of the remaining reserve (so no run of claims empties it), vault-only draws, timelocked withdrawals, factory and draw-limit changes |
 | `contracts/Timelocked.sol` | 51 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
@@ -31,7 +31,7 @@ Counted on 18 October 2026, as non-blank, non-comment lines. The exact frozen co
 | `contracts/interfaces/IIdentityAdapter.sol` | 10 | The one identity question the protocol asks (`isEligible(wallet, claims)`), and the claim flags. Lets a ZK adapter replace KYCRegistry without changing the lending contracts |
 | `contracts/libraries/SafeTransfer.sol` | 34 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code. A non-reverting variant for in-kind hand-over of frozen tokens |
 | `contracts/libraries/UniswapTwap.sol` | 142 | TWAP quote helper, deployed as a linked library. 53 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,292** | 2,203 written for Covenza + 89 vendored |
+| **Total** | **2,311** | 2,222 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -96,7 +96,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**354 Hardhat tests** across 20 suites, plus **9 Foundry invariants** and one
+**360 Hardhat tests** across 20 suites, plus **9 Foundry invariants** and one
 handler-path test.
 
 ```bash
@@ -127,7 +127,7 @@ forge test                           # invariants: about a minute
 | `OutageGrace.test.js` | 11 | Sequencer outages: grace extended by lost time, keeper's own settle records the outage first, recovery hold for keepers only, bounty from recovery, 72-hour cap, config bounds |
 | `InKindSettlement.test.js` | 12 | Item 14: opens 7 days after grace, and only once the chain has recovered from any outage; cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender with no insurance draw; insurance only on the shortfall after in-kind value |
 | `DrawShare.test.js` | 7 | Item 8: each insurance draw limited to 5% of the remaining reserve; a 40-claim crash pays everyone something; timelocked both ways |
-| `ParameterTimelocks.test.js` | 16 | Live-loan parameters wait on a real 48-hour timelock by direction; exposure cap uses the worst tier since origination |
+| `ParameterTimelocks.test.js` | 22 | Live-loan parameters wait on a real 48-hour timelock by direction, including the per-asset grace extension and re-listing a removed asset on new terms; exposure cap uses the worst tier since origination |
 
 Loss scenarios run against real state changes. Mock Aave, Uniswap and ERC-4626 contracts with configurable rates and TWAP ticks reproduce a genuine loss deterministically rather than stubbing it.
 
@@ -224,7 +224,9 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **Outage detection depends on a heartbeat bot.** `scripts/heartbeat-bot.js` calls `AssetRegistry.heartbeat()` every 5 minutes, under pm2, with Telegram alerts (see *Heartbeat bot* above). If it stops, quiet periods are read as outages: the parties get extra time and keepers wait, capped at 72 hours per loan. Nobody is locked out, but the keeper backstop slows.
 - **Fee-on-transfer and rebasing tokens must never be listed.** The accounting assumes a transfer delivers what was sent. This is a listing rule for the operator, stated in `AssetRegistry`, not something the code detects. USDT-style tokens that return no data are supported.
 - **No commercial identity provider is integrated yet.** Attester curation is the main control on who can borrow; attestations now expire within a year and carry the claims checked. A ZK adapter can be added later behind the same interface.
-- **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool or a new yield venue); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. The **per-asset grace extension** is still instant, pending a design decision. Item 12.
+- **Live-loan parameters wait on the timelock** (settlement tolerance, TWAP window, global grace, bounty, draw cap, a raised exposure cap, a loosened entry-impact limit, a changed pool, a new yield venue, any change to an asset's grace extension, and re-listing a removed asset on different terms); risk-reducing changes are instant. A loan in its grace window when a change lands does feel it: the timelock gives warning, not immunity. Item 12.
+- **Grace for tokenised equities is a fixed extension, not a trading calendar.** The 72-hour extension covers a weekend for loans due late in the week, but a keeper can still force-settle at a weekend when grace happens to end there (a loan due Tuesday evening ends grace early Saturday). The forced sale must still land within the TWAP tolerance or it reverts, so the exposure is a failed or thin-market settlement, not an arbitrary price. A per-asset trading schedule was considered and deferred until there is data on how these pools behave out of hours.
+- **Lenders and borrowers may settle against a thin out-of-hours pool.** Only keepers are held back by grace. A party settling on a weekend is bound by the same TWAP floor, but a thin weekend pool makes that average cheaper to move.
 - **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
 - **A held asset that cannot be sold is handed over in kind.** If a forced swap-back cannot complete (a frozen tokenised equity, a dead pool), anyone may call `settleInKind()` 7 days after keepers could first settle: the lender gets the cash and then the asset at its TWAP value up to what they are owed, and a frozen token is claimable once it moves. The lender may end up holding the asset rather than cash. Item 14.
 
@@ -237,7 +239,7 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 354 Hardhat tests, 20 suites
+test/                 360 Hardhat tests, 20 suites
 test-foundry/         Foundry invariant suite and handler
 lib/forge-std/        Foundry test library (git submodule)
 scripts/              Deployment, proofs, operator and diagnostic scripts
