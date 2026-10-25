@@ -1,0 +1,16 @@
+{
+  "target": "covenza-backend",
+  "commit": "089ce71",
+  "date": "2026-10-25",
+  "findings": [
+    {"id": "KRAIT-004", "severity": "High", "evidence": "POC-PASS",
+     "title": "A lender can make the held asset unpriceable, block every exit, and take the borrower's whole position in kind",
+     "files": ["contracts/Vault.sol:1009-1048", "contracts/Vault.sol:1218-1223", "contracts/libraries/UniswapTwap.sol"],
+     "condition": "approved pool observationCardinality <= twapWindow",
+     "fix": "require observationCardinality > twapWindow at entry (UniswapTwap.cannotBeStarved) and in setPoolFeeTier"},
+    {"id": "KRAIT-005", "severity": "Low", "evidence": "POC-PASS",
+     "title": "After the lender-only period, anyone can choose settleInKind() over settle() and cancel the lender's insurance draw",
+     "files": ["contracts/Vault.sol:946-996"],
+     "fix": "require(heldAssets.length > 0) after the sale loop"}
+  ]
+}

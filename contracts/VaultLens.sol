@@ -65,6 +65,8 @@ contract VaultLens {
         // the position, and the swap-back quote is what settlement will need.
         if (!UniswapTwap.canQuote(uniFactory, loanAsset, tokenOut, poolFee, window)) return (false, 0, 0);
         if (!UniswapTwap.canQuote(uniFactory, tokenOut, loanAsset, poolFee, window)) return (false, 0, 0);
+        // Vault.swap() refuses a pool whose history could be starved (KRAIT-004).
+        if (!UniswapTwap.cannotBeStarved(uniFactory, loanAsset, tokenOut, poolFee, window)) return (false, 0, 0);
 
         twapOut = UniswapTwap.quote(uniFactory, loanAsset, tokenOut, poolFee, amountIn, window);
 

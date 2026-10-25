@@ -23,6 +23,10 @@ interface IUniswapV3Factory {
 interface IUniswapV3Pool {
     function observe(uint32[] calldata secondsAgos)
         external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+    function slot0() external view returns (
+        uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality,
+        uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked
+    );
 }
 
 /**
@@ -110,6 +114,33 @@ library UniswapTwap {
         } catch {
             return false;
         }
+    }
+
+    /**
+     * @notice Whether the pool keeps more price-history slots than `window`
+     *         has seconds, so that its TWAP cannot be made unreadable.
+     *
+     * @dev    Audit KRAIT-004. A pool writes at most one observation per
+     *         second, and anyone can write one cheaply (a dust liquidity
+     *         mint). If the ring holds `window` slots or fewer, an attacker
+     *         can fill every slot with observations younger than the window;
+     *         observe() then reverts "OLD" until they stop. Every exit from a
+     *         vault needs the TWAP, so that blocks swap-back and settlement,
+     *         and makes the held asset look unpriceable to settleInKind().
+     *         A ring of more than `window` slots always holds an observation
+     *         at least `window` seconds old, so it cannot be starved.
+     */
+    function cannotBeStarved(
+        address factory,
+        address tokenA,
+        address tokenB,
+        uint24  fee,
+        uint32  window
+    ) public view returns (bool) {
+        address pool = IUniswapV3Factory(factory).getPool(tokenA, tokenB, fee);
+        if (pool == address(0)) return false;
+        (, , , uint16 cardinality, , , ) = IUniswapV3Pool(pool).slot0();
+        return uint256(cardinality) > uint256(window);
     }
 
     /// @dev Arithmetic mean tick over the window. Ported from Uniswap

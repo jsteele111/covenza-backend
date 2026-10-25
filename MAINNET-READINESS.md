@@ -898,6 +898,8 @@ and the three remaining informational items accepted and documented. See
 *Pre-freeze audit pass* below. 355 Hardhat tests (21 suites) and 10 Foundry
 tests passing.
 
+**Done (25 October 2026, Krait re-run on 089ce71):** KRAIT-004 (High) and KRAIT-005 (Low) fixed; see items 26 and 27. 361 Hardhat tests (22 suites) and 10 Foundry tests passing.
+
 **Before freeze:** nothing outstanding in the code. All four Krait observations are closed.
 Item 8's premium calibration remains modelling work.
 
@@ -923,7 +925,7 @@ concept before it was fixed, and each fix has a regression test.
 | M-3 | Forced swap-back can be sandwiched within the TWAP tolerance | Medium | **Accepted, documented** | — |
 | L-1 | A wallet can lend to itself | Low | **Fixed** | `KraitFindings.test.js` |
 | L-2 | Settlement config had no upper limits and could break the window/recovery rule | Low | **Fixed** | `ParameterTimelocks.test.js` |
-| L-3 | `settleInKind` charges no protocol fee, so a borrower holding dust could choose it | Low | **Accepted, mitigated by M-2's fix** | `InKindSettlement.test.js` (lender-only period) |
+| L-3 | `settleInKind` charges no protocol fee, so a borrower holding dust could choose it | Low | **Closed by KRAIT-005 (25 October)** | `InKindSettlement.test.js` |
 | L-4 | `settlementWindow` cost grows with every outage recorded | Low | **Fixed** | `OutageGrace.test.js` |
 | L-5 | Zero-value payouts were still sent; tokens that reject them would block total-loss settlements | Low | **Fixed** | `Payouts.test.js` |
 | L-6 | A mandate fill had no borrower-side APR limit | Low | **Fixed** | `Mandates.test.js` |
@@ -992,7 +994,7 @@ limitations.
   may not exceed the outage recovery period. Before, widening the window here
   quietly broke that rule, and an unbounded window longer than any pool's
   history would make every quote revert.
-- **L-3 (accepted):** `settleInKind()` charges no protocol fee, so a patient
+- **L-3 (accepted; closed 25 October by KRAIT-005, item 27):** `settleInKind()` charges no protocol fee, so a patient
   borrower holding 1 wei of a dust asset could choose it to avoid the fee.
   M-2's fix closes most of that route: the borrower cannot call it until
   7 days after grace plus the 7-day lender-only period, and the lender can
@@ -1036,4 +1038,64 @@ limitations.
   asset), the identity requirements (no new borrowers) and the timelocks. Live
   loans cannot be frozen by anyone, which is intended: a pause would be one
   key holding every borrower's exit.
+
+---
+
+# Krait re-run — 25 October 2026
+
+Krait's full pipeline (recon, three detection passes, rescan, per-contract,
+state analysis, verification) re-run on `089ce71`, with items 1–25 treated as
+known. Two new findings, both reproduced by executed proofs of concept; the
+High against **real Uniswap V3** (the v3-core factory and pool and
+SwapRouter02), because it lives in how a real pool stores price history. The
+full report is in `.audit/krait-report-2026-10-25.md`.
+
+## 26. KRAIT-004 — the TWAP could be starved: a lender could block every exit and take the position in kind — HIGH — **FIXED**
+
+Every price the vault uses comes from `pool.observe([twapWindow, 0])`. A
+Uniswap V3 pool keeps its history in a ring of `observationCardinality` slots
+and writes at most one observation a second, on any mint or burn of in-range
+liquidity and any swap that moves the tick. If every slot holds an
+observation younger than the window, `observe` reverts "OLD". Anyone could
+cause that with dust liquidity mints, which leave the price untouched.
+
+While starved, `swapBack`, early close, `settle()` and keeper settlement all
+reverted, and `settleInKind()` found the held asset "unpriceable", which gives
+all of it to the lender. The lender alone may call `settleInKind()` for its
+first week. So a lender could block every exit from just before the deadline,
+then take the borrower's whole position. In the PoC (10 WETH loan, 64-slot
+pool, the 1,800-second window) the lender over-collected 1.45 WETH: the
+borrower's entire deposit. Any gains on the position would have gone too.
+Cost: about 64 dust mints per 30 minutes for the ~8.5 days to in-kind, or
+only 64 if a loan reached in-kind anyway. Our own testnet pools use 64 slots,
+and `TwapGuard.test.js` notes a real Robinhood mainnet pool with 1.
+
+**Fix:** a pool may be approved (`AssetRegistry.setPoolFeeTier`), and a
+position opened in it (`Vault.swap`, via `UniswapTwap.cannotBeStarved`), only
+if its ring has more slots than the window has seconds. At one observation a
+second, such a ring always holds one at least a window old, so it cannot be
+starved. `VaultLens` reports such a pool as not quotable. Tests:
+`OracleStarvation.test.js` (real Uniswap V3) and `TwapGuard.test.js`.
+
+**Operator procedure:** grow every pool's ring past the window before
+approving it (`scripts/lib/pool-history.js` checks this and says how).
+Never raise `twapWindow` above an approved pool's ring: positions already open
+in that pool would become starvable again. Production needs more than 1,800
+slots per pool; testnet's 64 slots are enough only for its 60-second window.
+
+## 27. KRAIT-005 — `settleInKind()` could stand in for `settle()` and skip the insurance draw — LOW — **FIXED**
+
+`settleInKind()` sells every held asset it can first. If every sale
+succeeded, it still finished as a cash settlement, but without the insurance
+draw, bounty or protocol fee that `settle()` would apply. After the
+lender-only week, anyone could pick it for a losing loan and cancel the
+lender's draw (PoC: lender 8.23 instead of 9.23 WETH). A losing loan has no
+keeper incentive, so a passive lender's loan could still be open by then.
+
+**Fix:** `settleInKind()` refuses with "Everything sold - use settle()" when
+nothing is left to hand over. That also closes L-3's dust route completely.
+Test: `InKindSettlement.test.js`.
+
+In-scope size after this pass: **2,129 nSLOC** (2,040 written for Covenza plus
+89 vendored).
 

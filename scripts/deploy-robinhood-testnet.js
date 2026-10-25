@@ -35,6 +35,7 @@ const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig } = require("./lib/production-guards");
 const { sendOrQueue } = require("./lib/timelock");
+const { checkPoolHistory } = require("./lib/pool-history");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
 const TWAP_TOLERANCE_BPS       = 300;  // 3%
@@ -258,6 +259,8 @@ async function main() {
     if (!a || !b) { console.log(`  pool ${p.address}: cannot tell its tokens — skipped`); continue; }
     const listed = (await registry.isWhitelisted(a)) && (await registry.isWhitelisted(b));
     if (!listed) { console.log(`  pool ${p.address}: a token is not listed — skipped`); continue; }
+    const history = await checkPoolHistory(registry, a, b, p.fee, deployer);
+    if (!history.ok) { console.log(`  pool ${p.address}: not approved — ${history.reason}`); continue; }
     await sendOrQueue(registry, "setPoolFeeTier", [a, b, p.fee], {
       network, label: `approved pool ${p.pair || "tUSDG/tWETH"} (fee ${p.fee})`,
     });

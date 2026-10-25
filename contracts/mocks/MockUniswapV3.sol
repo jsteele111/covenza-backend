@@ -37,6 +37,19 @@ contract MockUniswapV3Pool {
      */
     uint32 public maxWindow = type(uint32).max;
 
+    /// @notice Observation ring size reported by slot0(). Defaults to the
+    ///         Uniswap maximum, so the KRAIT-004 entry check passes unless a
+    ///         test lowers it.
+    uint16 public observationCardinality = type(uint16).max;
+
+    function setObservationCardinality(uint16 _cardinality) external {
+        observationCardinality = _cardinality;
+    }
+
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (0, avgTick, 0, observationCardinality, observationCardinality, 0, true);
+    }
+
     function setAvgTick(int24 _tick) external {
         avgTick = _tick;
     }

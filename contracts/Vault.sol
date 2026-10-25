@@ -577,6 +577,13 @@ contract Vault {
             ),
             "No TWAP history for this pair and fee tier"
         );
+        // Audit KRAIT-004: refuse a pool whose price history could be
+        // starved, because a starved pool blocks every exit and makes the
+        // held asset look unpriceable at in-kind settlement.
+        require(
+            UniswapTwap.cannotBeStarved(registry.uniswapFactory(), tokenOut, asset, poolFee, registry.twapWindow()),
+            "Pool keeps too little price history for the TWAP window"
+        );
 
         // The lender's risk mandate, measured over the life of the loan rather
         // than at this instant.
@@ -970,6 +977,12 @@ contract Vault {
             }
         }
 
+
+        // Audit KRAIT-005: if everything sold, this is an ordinary cash
+        // settlement and must go through settle(), which draws insurance for
+        // a loss and charges the protocol fee. Otherwise anyone could pick
+        // this path to skip both.
+        require(heldAssets.length > 0, "Everything sold - use settle()");
 
         uint256 cash = IERC20(asset).balanceOf(address(this));
         uint256 fee = accruedFee();

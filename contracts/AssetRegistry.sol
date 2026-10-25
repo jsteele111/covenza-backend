@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "./OperatorControlled.sol";
 import "./Timelocked.sol";
-import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory, for pool-existence checks
+import "./libraries/UniswapTwap.sol"; // IUniswapV3Factory and IUniswapV3Pool, for pool checks
 
 /**
  * @title AssetRegistry
@@ -551,10 +551,13 @@ contract AssetRegistry is OperatorControlled, Timelocked {
             assetConfig[_tokenA].whitelisted && assetConfig[_tokenB].whitelisted,
             "Asset not whitelisted"
         );
-        require(
-            IUniswapV3Factory(uniswapFactory).getPool(_tokenA, _tokenB, _fee) != address(0),
-            "No pool at this fee tier"
-        );
+        address pool = IUniswapV3Factory(uniswapFactory).getPool(_tokenA, _tokenB, _fee);
+        require(pool != address(0), "No pool at this fee tier");
+        // Audit KRAIT-004: the pool must keep more price-history slots than
+        // the TWAP window has seconds, or anyone can make its TWAP unreadable.
+        // Grow it first with the pool's increaseObservationCardinalityNext.
+        (, , , uint16 cardinality, , , ) = IUniswapV3Pool(pool).slot0();
+        require(uint256(cardinality) > uint256(twapWindow), "Pool keeps too little price history");
 
         // Naming the first pool for a pair is instant: no position can exist
         // in a pair with no approved pool. Changing it waits.

@@ -180,14 +180,25 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await vault.settledProtocolFee()).to.equal(0);
   });
 
-  it("Still sells whatever CAN be sold, exactly as settle() would", async function () {
-    const { lender, weth, usdx, vault, toInKindWindow } = await loadFixture(stack);
-    await toInKindWindow();   // the sale works: nothing needs handing over
+  it("Refuses when every asset sells, and points at settle(), which draws insurance for a loss (audit KRAIT-005)", async function () {
+    const { lender, stranger, usdx, router, uniPool, vault, toInKindWindow } = await loadFixture(stack);
+    // A loss: USDX is now worth half a WETH, at spot and at the TWAP alike.
+    await router.setRate(await usdx.getAddress(), await vault.asset(), 1, 2);
+    await uniPool.setAvgTick(tickFor(await usdx.getAddress(), await vault.asset(), -6932));
+    await toInKindWindow();
+    await time.increase(7 * 86400);   // past the lender-only period: anyone may call
 
-    await expect(vault.connect(lender).settleInKind()).to.not.emit(vault, "InKindAllocated");
-    expect(await usdx.balanceOf(lender.address)).to.equal(0);
-    expect(await vault.settledLenderPayout()).to.equal(P + (await vault.settledFee()));
+    // Every sale clears its floor here, so nothing would be handed over in
+    // kind. Before the fix this ran as a cash settlement that skipped the
+    // insurance draw, the bounty and the protocol fee.
+    await expect(vault.connect(stranger).settleInKind()).to.be.revertedWith("Everything sold - use settle()");
+
+    await vault.connect(stranger).settle();
+    expect(await vault.settledInKind()).to.equal(false);
+    // 3.5 cash + 8 USDX sold for 4 = 7.5 against 10 principal: a 1 WETH draw (10% cap).
+    expect(await vault.settledInsuranceDraw()).to.equal(E("1"));
     expect(await usdx.balanceOf(await vault.getAddress())).to.equal(0);
+    expect(await usdx.balanceOf(lender.address)).to.equal(0);
   });
 
   it("Leaves settle() available throughout; whichever succeeds first closes the loan", async function () {

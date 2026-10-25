@@ -186,6 +186,38 @@ describe("TWAP availability guard", function () {
     ).to.be.revertedWith("No TWAP history for this pair and fee tier");
   });
 
+  it("Refuses to approve a pool with no more history slots than the TWAP window has seconds (audit KRAIT-004)", async function () {
+    const { registry, weth, usdx, poolWithWindow } = await loadFixture(fixture);
+
+    // At most one observation is written per second, so a ring of
+    // TWAP_WINDOW slots can be filled with observations younger than the
+    // window. Anyone could then make the TWAP unreadable at will.
+    const p = await poolWithWindow(TWAP_WINDOW * 10);
+    await p.setObservationCardinality(TWAP_WINDOW);
+    await expect(
+      registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), ALT_FEE)
+    ).to.be.revertedWith("Pool keeps too little price history");
+
+    // One slot more and it can no longer be starved.
+    await p.setObservationCardinality(TWAP_WINDOW + 1);
+    await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), ALT_FEE);
+  });
+
+  it("Refuses entry, and the lens says so, once the pool's history slots no longer exceed the window (audit KRAIT-004)", async function () {
+    const { vault, lens, borrower, usdx, uniPool } = await loadFixture(fixture);
+
+    // As if the TWAP window had since been raised past this pool's ring.
+    await uniPool.setObservationCardinality(TWAP_WINDOW);
+    const [quotable] = await lens.quoteSwapOut(await vault.getAddress(), await usdx.getAddress(), E("1"), POOL_FEE);
+    expect(quotable).to.equal(false);
+    await expect(
+      vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), POOL_FEE)
+    ).to.be.revertedWith("Pool keeps too little price history for the TWAP window");
+
+    await uniPool.setObservationCardinality(TWAP_WINDOW + 1);
+    await vault.connect(borrower).swap(await usdx.getAddress(), E("1"), E("0.9"), POOL_FEE);
+  });
+
   it("Leaves vault balances untouched when a swap is rejected", async function () {
     const { vault, borrower, weth, usdx, poolWithWindow } = await loadFixture(fixture);
     await poolWithWindow(0);

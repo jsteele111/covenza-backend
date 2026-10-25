@@ -18,6 +18,7 @@
 
 const hre = require("hardhat");
 const { sendOrQueue } = require("./lib/timelock");
+const { checkPoolHistory } = require("./lib/pool-history");
 const fs = require("fs");
 const path = require("path");
 
@@ -102,8 +103,13 @@ async function main() {
   } else if (Number(await registry.poolFeeTier(asset, usdg)) !== 0) {
     console.log(`Approved pool already named (fee ${await registry.poolFeeTier(asset, usdg)}).`);
   } else {
-    await (await registry.setPoolFeeTier(asset, usdg, pool.fee)).wait();
-    console.log(`Approved pool named: tUSDG/${sym || asset} at fee ${pool.fee}.`);
+    const history = await checkPoolHistory(registry, asset, usdg, pool.fee, operator);
+    if (!history.ok) {
+      console.log(`Pool NOT approved: ${history.reason}`);
+    } else {
+      await (await registry.setPoolFeeTier(asset, usdg, pool.fee)).wait();
+      console.log(`Approved pool named: tUSDG/${sym || asset} at fee ${pool.fee}.`);
+    }
   }
 
   for (const days of [7, 30]) {

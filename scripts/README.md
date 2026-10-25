@@ -25,6 +25,7 @@ environment variables.
 | `execute-timelocked.js` | Executes admin calls announced earlier, once their delay has passed. `LIST_ONLY=1` to just report. |
 | `lib/timelock.js` | Shared helper: sends a timelocked call if it can take effect now, otherwise announces it and records it in `pending-timelock.json`; prints Safe transactions when control is with a Safe. |
 | `lib/production-guards.js` | Refuses a mainnet deploy carrying testnet values (zero timelock, 60 s TWAP, outage detection off, deployer as operator or attester). |
+| `lib/pool-history.js` | Checks a pool keeps more price-history slots than the TWAP window has seconds before `setPoolFeeTier` (audit KRAIT-004), and says how to grow it if not. Used by the deploy and listing scripts. |
 | `check-sizes.js` | Bytecode size of every contract against the 24,576-byte limit (`npx hardhat run scripts/check-sizes.js`). |
 
 ## Heartbeat bot (item 16)

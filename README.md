@@ -15,23 +15,23 @@ It is **low-collateral, not uncollateralised**, and it is **non-liquidating**. T
 
 ## Audit scope
 
-Counted on 19 October 2026, as non-blank, non-comment lines. The exact frozen commit will be confirmed with the auditor before the engagement starts.
+Counted on 25 October 2026, as non-blank, non-comment lines. The exact frozen commit will be confirmed with the auditor before the engagement starts.
 
 | File | nSLOC | Responsibility |
 |---|---:|---|
-| `contracts/Vault.sol` | 578 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall in which a payout the token refuses is held for the recipient to claim, last-resort in-kind settlement (lender-only for its first 7 days; unsellable assets handed over at TWAP value; no insurance draw) |
+| `contracts/Vault.sol` | 583 | Per-loan vault (EIP-1167 clone). Deposit invariant, swaps through the approved pool (which must keep more price-history slots than the TWAP window has seconds) with tier ceiling, exposure caps, entry-impact and full-exit checks, measured swap output, internal holdings record, TWAP-bounded swap-back (voluntary and forced), three-tier settlement, keeper bounty, protocol fee, payout waterfall in which a payout the token refuses is held for the recipient to claim, last-resort in-kind settlement (lender-only for its first 7 days; unsellable assets handed over at TWAP value; no insurance draw) |
 | `contracts/VaultFactory.sol` | 569 | Clones vaults from one implementation. Lender and borrower must differ; identity gating through `IIdentityAdapter` (borrowers need all three claims, lenders sanctions screening; loosening is timelocked), whitelist gating, mandates (publish, fill atomically with a borrower APR limit, cancel, per-loan range plus total capacity), approved-referrer list, pricing quotes, insurance premium routing, protocol fee config, timelocked registry repointing, two-step ownership |
 | `contracts/AssetRegistry.sol` | 352 | Operator-curated whitelist, risk tiers with tier history (risk ceiling and exposure cap both read the worst tier since origination), on-chain deposit floors, approved Uniswap pool per pair, per-asset grace period, immutable integration addresses, bounded settlement config, sequencer-outage record (heartbeat; grace extended by outages, keepers held through recovery; lookup cost independent of later outages). Changes that reach open loans wait on the timelock |
 | `contracts/KYCRegistry.sol` | 176 | Identity adapter backed by third-party attesters. EIP-712 attestations bound to chain and contract, carrying claim flags (KYC, sanctions, jurisdiction) and an expiry of at most 365 days, checked at every origination. Timelocked attester additions and rotations. Manual grants: timelocked, 30 days, once per wallet per year, case reference on chain, marked manual, at most 5 per 30 days. No identity data stored |
 | `contracts/InsurancePool.sol` | 115 | Per-asset reserves, draws capped as a % of principal and as a share of the remaining reserve (so no run of claims empties it), vault-only draws, timelocked withdrawals, factory and draw-limit changes |
 | `contracts/Timelocked.sol` | 51 | Announce-then-execute delay for risk-increasing admin actions. Immutable delay, call-bound queue IDs, 14-day execution window after which an approval lapses |
-| `contracts/VaultLens.sol` | 37 | Read-only swap quote for the interface (`quoteSwapOut`). Holds no state; nothing in the protocol calls it. Moved off Vault for contract size |
+| `contracts/VaultLens.sol` | 38 | Read-only swap quote for the interface (`quoteSwapOut`). Holds no state; nothing in the protocol calls it. Moved off Vault for contract size |
 | `contracts/OperatorControlled.sol` | 32 | Two-step (nominate, then accept) operator transfer shared by three contracts |
 | `contracts/interfaces/IERC20.sol` | 8 | Minimal ERC20 interface |
 | `contracts/interfaces/IIdentityAdapter.sol` | 10 | The one identity question the protocol asks (`isEligible(wallet, claims)`), and the claim flags. Lets a ZK adapter replace KYCRegistry without changing the lending contracts |
 | `contracts/libraries/SafeTransfer.sol` | 36 | Token transfers and approvals that accept tokens returning `true` or no data (USDT-style), and fail on `false`, a revert, or an address with no code. A non-reverting variant for payouts a token may refuse, which still reverts when out of gas |
-| `contracts/libraries/UniswapTwap.sol` | 143 | TWAP quote helper, deployed as a linked library. 54 lines of Covenza wrapper (`quote`, `canQuote`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
-| **Total** | **2,107** | 2,018 written for Covenza + 89 vendored |
+| `contracts/libraries/UniswapTwap.sol` | 159 | TWAP quote helper, deployed as a linked library. 70 lines of Covenza wrapper (`quote`, `canQuote`, `cannotBeStarved`, `_consult`); 89 lines of tick/price maths vendored unchanged from Uniswap v3-core/periphery |
+| **Total** | **2,129** | 2,040 written for Covenza + 89 vendored |
 
 Out of scope: `contracts/mocks/` (test-only contracts, never deployed to production), `scripts/`, `test/`.
 
@@ -97,7 +97,7 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 
 ## Tests
 
-**355 Hardhat tests** across 21 suites, plus **9 Foundry invariants** and one
+**361 Hardhat tests** across 22 suites, plus **9 Foundry invariants** and one
 handler-path test.
 
 ```bash
@@ -120,14 +120,15 @@ forge test                           # invariants: about a minute
 | `Mandates.test.js` | 35 | Publish, fill, cancel, cancel-all, expiry, binding deposit, pricing surface, total capacity, borrower APR limit |
 | `ProductionGuards.test.js` | 10 | Deploy guards, including outage detection left on |
 | `RiskTiers.test.js` | 24 | Tier floors, term limits, exposure caps, tier history (both directions) |
-| `TwapGuard.test.js` | 14 | Unquotable and manipulated pools; only the approved pool per pair; the lens quote agrees with the swap; amounts too large to quote |
+| `TwapGuard.test.js` | 16 | Unquotable and manipulated pools; only the approved pool per pair; the lens quote agrees with the swap; amounts too large to quote; pools with too few history slots refused at listing and entry |
+| `OracleStarvation.test.js` | 4 | Audit KRAIT-004 against real Uniswap V3: a starvable pool's TWAP can be made unreadable; such a pool cannot be listed or entered; with enough history slots the attack fails and the loan settles normally |
 | `AssetGrace.test.js` | 5 | Per-asset grace: global grace for continuously traded assets, the extended window for 24/5 assets, longest governs, keepers held off but the parties not |
 | `Payouts.test.js` | 7 | Audit M-1 and L-5: a blacklisted borrower, lender, treasury or referrer blocks nobody; held payouts claimable by their owner alone; zero-value payouts skipped |
 | `AdminTimelocks.test.js` | 14 | Insurance-pool factory changes are timelocked; integration addresses cannot be repointed |
 | `KraitFindings.test.js` | 17 | Regression tests from Krait's proofs of concept: swap-back held to the TWAP floor; self-dealing cannot draw on the insurance pool, and a wallet cannot lend to itself; settlement cannot be stalled (approved pool, held-amount record, full-exit check); measured swap output |
 | `TokenSafety.test.js` | 9 | USDT-style tokens through a whole loan; `false`-returning and code-less tokens still fail; timelock approvals lapse after 14 days |
 | `OutageGrace.test.js` | 12 | Sequencer outages: grace extended by lost time, keeper's own settle records the outage first, recovery hold for keepers only, bounty from recovery, 72-hour cap, config bounds, constant cost however many outages follow |
-| `InKindSettlement.test.js` | 13 | Item 14: opens 7 days after grace, and only once the chain has recovered from any outage; lender only for the first 7 days; cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender; never draws insurance; reported as loss severity 3 |
+| `InKindSettlement.test.js` | 13 | Item 14: opens 7 days after grace, and only once the chain has recovered from any outage; lender only for the first 7 days; refused when every asset sells (use settle()); cash to the lender first, then the asset at TWAP value; frozen tokens claimable later; unpriceable assets to the lender; never draws insurance; reported as loss severity 3 |
 | `DrawShare.test.js` | 7 | Item 8: each insurance draw limited to 5% of the remaining reserve; a 40-claim crash pays everyone something; timelocked both ways |
 | `ParameterTimelocks.test.js` | 23 | Live-loan parameters wait on a real 48-hour timelock by direction, including the per-asset grace extension and re-listing a removed asset on new terms; settlement config upper limits; exposure cap uses the worst tier since origination |
 
@@ -230,8 +231,9 @@ Stated plainly, because a reviewer will find them anyway. The full self-review i
 - **Grace for tokenised equities is a fixed extension, not a trading calendar.** The 72-hour extension covers a weekend for loans due late in the week, but a keeper can still force-settle at a weekend when grace happens to end there (a loan due Tuesday evening ends grace early Saturday). The forced sale must still land within the TWAP tolerance or it reverts, so the exposure is a failed or thin-market settlement, not an arbitrary price. A per-asset trading schedule was considered and deferred until there is data on how these pools behave out of hours.
 - **Lenders and borrowers may settle against a thin out-of-hours pool.** Only keepers are held back by grace. A party settling on a weekend is bound by the same TWAP floor, but a thin weekend pool makes that average cheaper to move.
 - **A pool can thin out after entry.** Vaults trade only through the protocol's approved pool, record what they bought, and refuse any position they could not sell back in one go at the time of purchase (item 20, fixed). None of that stops liquidity being withdrawn later, for example by a borrower who is also the pool's main provider. Item 14 is the backstop.
-- **A held asset that cannot be sold is handed over in kind.** If a forced swap-back cannot complete (a frozen tokenised equity, a dead pool), `settleInKind()` opens 7 days after grace ends, to the lender alone for 7 days and to anyone after that: the lender gets the cash and then the asset at its TWAP value up to what they are owed, and a frozen token is claimable once it moves. It never draws insurance, because the TWAP of a pool too thin to sell into is cheap to move (audit M-2). The lender may end up holding the asset rather than cash. Item 14.
-- **In-kind settlement charges no protocol fee** (audit L-3, accepted). A borrower would have to make the sale fail and then wait out two weeks during which the lender can settle; the fee forgone is small next to that.
+- **A held asset that cannot be sold is handed over in kind.** If a forced swap-back cannot complete (a frozen tokenised equity, a dead pool), `settleInKind()` opens 7 days after grace ends, to the lender alone for 7 days and to anyone after that, and only when some asset really cannot be sold: the lender gets the cash and then the asset at its TWAP value up to what they are owed, and a frozen token is claimable once it moves. It never draws insurance, because the TWAP of a pool too thin to sell into is cheap to move (audit M-2). The lender may end up holding the asset rather than cash. Item 14.
+- **In-kind settlement charges no protocol fee.** It now runs only when an asset genuinely cannot be sold (audit KRAIT-005), which closes the dust route of audit L-3.
+- **Approved pools must keep more price-history slots than the TWAP window has seconds** (audit KRAIT-004). A Uniswap V3 pool writes at most one observation a second, and anyone can write one cheaply, so a smaller ring can be filled with recent observations to make the TWAP unreadable, which would block every exit. `setPoolFeeTier` and `Vault.swap` enforce this. Operators must grow each pool's ring (`increaseObservationCardinalityNext`) past the window before listing it, and must not raise `twapWindow` above an approved pool's ring: open positions in such a pool would become starvable again.
 - **A forced swap-back can be sandwiched within the TWAP tolerance** (audit M-3, accepted). A searcher can take up to the tolerance from the sale. It falls on the borrower's residual first and reaches the lender only in a loss. This is the cost of having no oracle; the tolerance is timelocked and should be kept tight on mainnet.
 - **Interest stops at the deadline.** A lender's capital can stay in the vault through grace and the in-kind window without earning.
 - **Tokens sent to a vault by mistake are stuck.** There is deliberately no sweep function; any path to an arbitrary address is a path out of the vault.
@@ -247,11 +249,11 @@ contracts/            Solidity sources (audit scope above)
   interfaces/         Minimal IERC20
   libraries/          UniswapTwap (linked library)
   mocks/              Test-only mocks, out of scope
-test/                 355 Hardhat tests, 21 suites
+test/                 361 Hardhat tests, 22 suites
 test-foundry/         Foundry invariant suite and handler
 lib/forge-std/        Foundry test library (git submodule)
 scripts/              Deployment, proofs, operator and diagnostic scripts
-  lib/                Production deploy guards
+  lib/                Production deploy guards, timelock helper, pool-history check
 tools/                compute_volatility.py (historical volatility model)
 MAINNET-READINESS.md  Self-review: findings, fixes, what remains open
 deployed-addresses.json  Single source of truth for deployments
