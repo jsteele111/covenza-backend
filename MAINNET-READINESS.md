@@ -1099,3 +1099,32 @@ Test: `InKindSettlement.test.js`.
 In-scope size after this pass: **2,129 nSLOC** (2,040 written for Covenza plus
 89 vendored).
 
+
+## Final pre-freeze checks — 25 October 2026 (on `4abcb00`)
+
+- **Krait, third pass** (KRAIT-004 and KRAIT-005 treated as known): no new
+  findings. The original KRAIT-004 attack, replayed against `4abcb00`, cannot
+  even be set up: the 64-slot pool is refused at listing.
+- **Slither 0.11.6** (all detectors): every High and Medium result triaged as
+  a false positive or intended. Notable ones: `arbitrary-send-erc20` in
+  `payDeposit` (the `from` is the borrower, who must be `msg.sender`);
+  `incorrect-exp` and `divide-before-multiply` in the vendored Uniswap maths
+  (bit-exact upstream code); `reentrancy-balance` in `_executeSwap` (the
+  before/after balance read is item 17's measured output, through the
+  immutable router). The keeper bounty accrues in whole basis points of
+  principal (`divide-before-multiply` in `_accruedBounty`), which rounds in
+  the borrower's favour by under 1 bp.
+- **Invariant fuzzing at 4× depth** (512 runs × 300 calls, 153,600 calls per
+  invariant): all nine invariants hold.
+- **Compiler**: no warnings. Largest contract `Vault` at about 21.5 KB of the
+  24 KB limit.
+- **Secrets**: no key material in the repository or its history; `.env`,
+  `test-wallet-*.json`, `pending-timelock.json` and `.krait-cache/` are
+  ignored.
+- **Runtime dependencies**: `npm audit --omit=dev` clean after patching
+  `express`'s transitive `body-parser`, `proxy-addr` and `qs` (used only by
+  the testnet mock attestation server). Development tooling (Hardhat's own
+  dependencies) still reports advisories; it never ships and is left until
+  after the audit.
+- **Fresh clone**: install, 361 Hardhat tests, 10 Foundry tests, 2,129 nSLOC
+  and the README's per-file and per-suite figures all match.

@@ -26,3 +26,6 @@ pending-timelock.json
 # Foundry build output (forge test)
 out-foundry/
 cache-foundry/
+
+# Krait audit working cache (never commit)
+.krait-cache/
