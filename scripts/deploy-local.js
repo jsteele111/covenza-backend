@@ -54,7 +54,11 @@ const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 3600);
 
 const FEE = 3000;
 const SQRT_PRICE_1_1 = 79228162514264337593543950336n;
-const LIQUIDITY = 10n ** 21n;
+// Full-range liquidity L at a 1:1 price holds about L wei of each token, so
+// 1e23 is ~100,000 a side. The first version used 1e21 (~1,000 a side), where
+// a 10-token swap moved the price past the vault's 1% entry allowance and was
+// refused — correct behaviour, but not what a realistic pool does.
+const LIQUIDITY = 10n ** 23n;
 const MINT_TO_HELPER = 10_000_000n * 10n ** 18n;
 const CARDINALITY = 64;                 // > TWAP window of 60s (KRAIT-004)
 

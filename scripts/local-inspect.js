@@ -37,12 +37,16 @@ async function main() {
   for (const [role, addr] of Object.entries(A.accounts)) {
     if (role === "attester") continue;
     const v = await kyc.verificationOf(addr);
-    const bal = await tokens.tUSDG.balanceOf(addr);
     const allow = await tokens.tUSDG.allowance(addr, A.vaultFactory);
+    const balances = [];
+    for (const [s, t] of Object.entries(tokens)) {
+      const b = await t.balanceOf(addr);
+      if (b > 0n || s === "tUSDG") balances.push(`${s} ${fmt(b)}`);
+    }
     console.log(
       `  ${role.padEnd(9)} claims ${v.claims}  validUntil ${v.validUntil > 0n ? new Date(Number(v.validUntil) * 1000).toISOString().slice(0, 10) : "-"}` +
       `  canBorrow ${await kyc.isEligible(addr, reqB)}  canLend ${reqL === 0n ? true : await kyc.isEligible(addr, reqL)}` +
-      `  tUSDG ${fmt(bal)}  allowance→factory ${fmt(allow)}`
+      `\n            ${balances.join("  ")}  tUSDG allowance→factory ${fmt(allow)}`
     );
   }
 
