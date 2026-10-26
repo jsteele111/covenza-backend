@@ -65,7 +65,12 @@ const SQRT_PRICE_1_1 = 79228162514264337593543950336n;
 // the helper pays whatever the pool asks, so this only has to be large enough
 // that test swaps do not move the price absurdly, and small enough that the
 // helper's funding covers it.
-const LIQUIDITY = 10n ** 21n;
+// ~100,000 of each token at the 1:1 price (full-range L at price 1 holds about
+// L wei a side). Was 1e21 (~1,000 a side): a 10-token swap then moved the price
+// past the vault's 1% entry allowance and was refused — the guard working, but
+// not a pool anyone can usefully test against. Found click-testing locally,
+// 26 October 2026.
+const LIQUIDITY = 10n ** 23n;
 
 const MINT_EACH = ethers.parseEther("10000000");
 
