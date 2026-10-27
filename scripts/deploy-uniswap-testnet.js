@@ -224,29 +224,19 @@ async function main() {
 
   let [c, cNext] = await helper.oracleStatus(poolAddress);
   console.log(`\nCardinality raised: ${c} -> next ${cNext}`);
-  console.log("Capacity is not history — writing observations via swaps.");
+  console.log("Capacity is not history — writing observations with tiny liquidity additions.");
 
-  await (await usdg.mint(deployer.address, ethers.parseEther("10000"))).wait();
-  await (await usdg.approve(routerAddress, ethers.MaxUint256)).wait();
-  await (await weth.approve(routerAddress, ethers.MaxUint256)).wait();
-
-  // Three swaps, ~35s apart, so the observations span more than the 60s TWAP
-  // window we will configure on testnet. The default 1800s window would mean
-  // 30 minutes of real waiting per test — twapWindow is operator-configurable
-  // with a floor of 60, so testnet uses the floor.
+  // Three tiny full-range additions, ~35s apart, so the observations span more
+  // than the 60s TWAP window we will configure on testnet. NOT swaps: a pool
+  // only records an observation on a swap that changes the tick, and in a pool
+  // this deep a 1-token swap does not — the 27 October 2026 redeploy left the
+  // tUSDG/tWETH pool at one slot that way. An in-range mint always records one
+  // and leaves the price where it was. The helper still holds most of
+  // MINT_EACH, so it can pay for these.
   for (let i = 1; i <= 3; i++) {
-    await (await router.exactInputSingle({
-      tokenIn: usdgAddr,
-      tokenOut: wethAddr,
-      fee: FEE,
-      recipient: deployer.address,
-      amountIn: ethers.parseEther("1"),
-      amountOutMinimum: 0n,
-      sqrtPriceLimitX96: 0n,
-    })).wait();
-
+    await (await helper.addFullRangeLiquidity(poolAddress, 10n ** 15n)).wait();
     [c, cNext] = await helper.oracleStatus(poolAddress);
-    console.log(`  swap ${i}/3 — cardinality now ${c}`);
+    console.log(`  observation ${i}/3 — cardinality now ${c}`);
     if (i < 3) await sleep(35000);
   }
 

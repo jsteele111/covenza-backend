@@ -10,8 +10,12 @@
  *   1. prints the pool's state — history slots, slots requested, tick, depth;
  *   2. requests 64 slots (more than the 60-second TWAP window has seconds);
  *   3. tops the pool up to ~100,000 of each token if it is shallower;
- *   4. writes observations with small trades in both directions, 35s apart,
- *      so the price is left where it was;
+ *   4. writes observations with three tiny full-range liquidity additions,
+ *      15s apart. NOT trades: a pool only records an observation on a trade
+ *      that moves the tick, and on a pool ~100,000 deep a 1-token trade moves
+ *      it a fraction of a tick — four trades on testnet wrote nothing and left
+ *      the pool at one slot. Adding liquidity at the current price always
+ *      records one, and leaves the price exactly where it was;
  *   5. prints the result. Then run approve-testnet-pools.js.
  *
  *   npx hardhat run scripts/warm-testnet-pool.js --network robinhoodTestnet
@@ -79,21 +83,19 @@ async function main() {
     console.log(`Added liquidity ${add}.`);
   }
 
-  // Small trades both ways, each in a later block, to write observations.
-  const router = new ethers.Contract(uni.swapRouter, [
-    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256)",
-  ], signer);
-  const amt = ethers.parseEther("1");
-  await (await tok0.mint(signer.address, amt * 10n)).wait();
-  await (await tok1.mint(signer.address, amt * 10n)).wait();
-  await (await tok0.approve(uni.swapRouter, ethers.MaxUint256)).wait();
-  await (await tok1.approve(uni.swapRouter, ethers.MaxUint256)).wait();
-  for (let i = 1; i <= 4; i++) {
-    const [tin, tout] = i % 2 ? [t0, t1] : [t1, t0];
-    await (await router.exactInputSingle({ tokenIn: tin, tokenOut: tout, fee, recipient: signer.address, amountIn: amt, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n })).wait();
+  // Tiny liquidity additions, each in a later block, to write observations.
+  // The first write after the request above is what turns the extra slots on.
+  if (!uni.liquidityHelper) throw new Error("uniswap-testnet.json has no liquidityHelper address.");
+  const Helper = await ethers.getContractFactory("UniswapLiquidityHelper");
+  const helper = Helper.attach(uni.liquidityHelper);
+  const dust = 10n ** 15n;
+  await (await tok0.mint(uni.liquidityHelper, ethers.parseEther("10"))).wait();
+  await (await tok1.mint(uni.liquidityHelper, ethers.parseEther("10"))).wait();
+  for (let i = 1; i <= 3; i++) {
+    await (await helper.addFullRangeLiquidity(poolAddr, dust)).wait();
     s = await pool.slot0();
-    console.log(`  trade ${i}/4 — history slots ${s.observationCardinality}`);
-    if (i < 4) await sleep(35000);
+    console.log(`  observation ${i}/3 — history slots ${s.observationCardinality}`);
+    if (i < 3) await sleep(15000);
   }
 
   await show("After");

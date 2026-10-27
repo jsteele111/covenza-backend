@@ -162,16 +162,15 @@ async function main() {
     await (await helper.addFullRangeLiquidity(poolA, LIQUIDITY)).wait();
     await (await helper.warmUpOracle(poolA, CARDINALITY)).wait();
 
-    // Capacity is not history: observations are written by trades in later
-    // blocks. Small trades both ways, 20s apart, keep the price at 1:1 while
-    // filling the slots and covering well over the 60s window.
+    // Capacity is not history: observations are written in later blocks.
+    // Tiny full-range liquidity additions, 20s apart, not trades: a pool only
+    // records an observation on a trade that changes the tick, which 1-token
+    // trades here did only because the pool starts exactly on a tick boundary
+    // (on testnet the same pattern wrote nothing, 27 October 2026). An in-range
+    // mint always records one and leaves the price at 1:1.
     for (let i = 0; i < 8; i++) {
       await advance(20);
-      const [tokenIn, tokenOut] = i % 2 === 0 ? [usdgA, otherA] : [otherA, usdgA];
-      await (await router.exactInputSingle({
-        tokenIn, tokenOut, fee: FEE, recipient: operator.address,
-        amountIn: 10n ** 18n, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n,
-      })).wait();
+      await (await helper.addFullRangeLiquidity(poolA, 10n ** 15n)).wait();
     }
     const s = await pool.slot0();
     console.log(`Pool ${label.padEnd(12)} ${poolA}  history slots ${s[3]}`);

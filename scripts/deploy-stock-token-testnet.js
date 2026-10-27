@@ -177,24 +177,15 @@ async function main() {
   // --- 4. Oracle -------------------------------------------------------
 
   await (await helper.warmUpOracle(poolAddr, TARGET_CARDINALITY)).wait();
-  console.log("\nCardinality raised. Writing observations via swaps.");
+  console.log("\nCardinality raised. Writing observations with tiny liquidity additions.");
 
-  const router = new ethers.Contract(uni.swapRouter, ROUTER_ARTIFACT.abi, deployer);
-  await (await usdg.mint(deployer.address, ethers.parseEther("10000"))).wait();
-  await (await usdg.approve(uni.swapRouter, ethers.MaxUint256)).wait();
-
+  // NOT swaps: a pool records an observation only on a swap that changes the
+  // tick, which a small trade in a deep pool may not (it left a testnet pool at
+  // one slot on 27 October 2026). An in-range mint always records one.
   for (let i = 1; i <= 3; i++) {
-    await (await router.exactInputSingle({
-      tokenIn: usdgAddr,
-      tokenOut: stockAddr,
-      fee: FEE,
-      recipient: deployer.address,
-      amountIn: ethers.parseEther("10"),
-      amountOutMinimum: 0n,
-      sqrtPriceLimitX96: 0n,
-    })).wait();
+    await (await helper.addFullRangeLiquidity(poolAddr, 10n ** 15n)).wait();
     const [c] = await helper.oracleStatus(poolAddr);
-    console.log(`  swap ${i}/3 — cardinality ${c}`);
+    console.log(`  observation ${i}/3 — cardinality ${c}`);
     if (i < 3) await sleep(35000);
   }
 
