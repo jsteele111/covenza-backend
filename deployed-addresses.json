@@ -1,12 +1,46 @@
 {
   "localhost": {
-    "network": "localhost",
-    "kycRegistry": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
-    "vaultFactory": "0x5FC8d32690cc91D4c39d9d3abcBD16989F875707",
-    "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-    "verifierKey": "0x00a5Bc38649a654f11a6a68033ae1B6c2c203cC8",
-    "verifiedBorrower": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-    "deployedAt": "2026-07-14T10:37:50.822Z"
+    "chainId": 31337,
+    "kycRegistry": "0x70e0bA845a1A0F2DA3359C97E0285013525FFC49",
+    "assetRegistry": "0x99bbA657f2BbC93c02D617f8bA121cB8Fc104Acf",
+    "insurancePool": "0x4826533B4897376654Bb4d4AD88B7faFD0C98528",
+    "vaultFactory": "0xc351628EB244ec633d5f21fBD6621e1a683B1181",
+    "vaultLens": "0x7bc06c482DEAd17c0e297aFbC32f6e63d3846650",
+    "vaultImplementation": "0x7969c5eD335650692Bc04293B07F5BF2e7A673C0",
+    "uniswapTwapLibrary": "0x2bdCC0de6bE1f7D2ee689a0342D76F52E8EFABa3",
+    "treasury": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "tokens": {
+      "tUSDG": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "tWETH": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+      "tAAPL": "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+    },
+    "uniswap": {
+      "factory": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+      "router": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+      "pools": [
+        {
+          "pair": "tUSDG/tWETH",
+          "address": "0x85D0A94fDf174F4cA0110419CC55E67b75952Eeb",
+          "fee": 3000
+        },
+        {
+          "pair": "tUSDG/tAAPL",
+          "address": "0x97ecD864dFF367CBb3FE4038884c276cA092051A",
+          "fee": 3000
+        }
+      ]
+    },
+    "accounts": {
+      "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "lender": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "borrower": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+      "keeper": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+      "attester": "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
+      "newcomer": "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
+    },
+    "twapWindow": 60,
+    "timelockDelay": 3600,
+    "deployedAt": "2026-10-25T07:53:40.726Z"
   },
   "arbitrumSepolia": {
     "network": "arbitrumSepolia",
@@ -38,29 +72,30 @@
   },
   "robinhoodTestnet": {
     "chainId": 46630,
-    "kycRegistry": "0xCeC02Aab9e97F8a658D7FED455703E4aAfa1B7ed",
-    "assetRegistry": "0xd3Cc52565faae7419c2BFA6B9FeA9Eed1b28f284",
-    "insurancePool": "0xf7fEb99a5df10Ad3BD37DBB9E3eaAFc79A87e9B1",
-    "vaultFactory": "0x70b5a6c403FB33D0F601fd8F63E1c09b682d2EED",
-    "vaultImplementation": "0x66a400775d1B599bF85fD6676d66D127FE2f51CD",
-    "uniswapTwapLibrary": "0x80Fd8Be02D8573d2B4D31A2EA4b4Ea24dD33CC70",
+    "kycRegistry": "0xE67Da97d9d9A56032Dc08c01F0AA0f12E6A0A641",
+    "assetRegistry": "0x3910c7fa358212dF4A629d4F809cdAE643619926",
+    "insurancePool": "0x0eeB323aeD8b830817A74BE4eBbdfc97940d4214",
+    "vaultFactory": "0xff2273b60b69DaB7d106027b4735ddeA2e421a4d",
+    "vaultImplementation": "0xea81E07A7D3b56C74a84b6B742F479115a9ba7B4",
+    "uniswapTwapLibrary": "0x9DBEEAfDcDE2E8851C4aB91dBDcabf6FE1D0a848",
     "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
     "yieldVenue4626": "0x86d6b40BD8aE3f75F7850BCe7fCefbf6Ea960f53",
     "verifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
     "keeper": "0x26c6fba1774EA978482c0D9CDd1560641DB401c0",
     "tokens": {
-      "tUSDG": "0xF727a9E9813d884bfFf2Be906633f4C5C963DC99",
-      "tWETH": "0x3981D4CC453ebc7F5eeC503fF00Da34BF5e65F5C"
+      "tUSDG": "0x6ce0243a7790347C18805101947Bb10e7A4D427d",
+      "tWETH": "0x5218C7c2Fde6E8Ae083c32D714F624c69fc383f6"
     },
     "uniswap": {
-      "factory": "0xC509Ed62cf655AD8eFd33a1B6Ba4724E38621680",
-      "router": "0x70Ce56aFf68cD3C5352c66C665B37258915b3F14",
-      "pool": "0x44A3024740aCDFe744500A606a8B3552717B5B76",
+      "factory": "0xCd5EEAd4bfF7460d4ef15d3B3bE35327505b0Be3",
+      "router": "0x4C400720218A2D2a76A925BBae5901A97e376A16",
+      "pool": "0x65B8164c11aB2BEb86178bEb379196D06c10f86b",
       "note": "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js"
     },
     "twapWindow": 60,
-    "deployedAt": "2026-08-05T05:55:51.254Z",
+    "deployedAt": "2026-10-26T08:36:59.302Z",
     "operatorSafe": "0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c",
-    "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B"
+    "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B",
+    "vaultLens": "0x92ebA00eC7d12A5fEF6b550e2017c2fCb6379aae"
   }
 }
