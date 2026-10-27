@@ -8,7 +8,7 @@ Covenza removes that dependency. The principal is sent to a purpose-built vault,
 
 It is **low-collateral, not uncollateralised**, and it is **non-liquidating**. There are no margin calls and no forced closure mid-term. Deposit floors, exposure caps and term limits do the job that liquidation does elsewhere, which is why they are strict.
 
-**Status:** live on Robinhood Chain testnet against real Uniswap V3. Pre-audit. Not deployed to mainnet.
+**Status:** frozen for independent audit (Zealynx) at tag [`audit-freeze-2026-10`](https://github.com/jsteele111/covenza-backend/tree/audit-freeze-2026-10). Live on Robinhood Chain testnet against real Uniswap V3. Not deployed to mainnet.
 **Target:** Robinhood Chain, an Arbitrum Orbit L2, with lending against tokenised equities as the end goal. A test tokenised stock (tAAPL) is already listed on testnet with its own risk tier.
 
 ---
@@ -84,8 +84,8 @@ Covenza performs no identity check itself. `KYCRegistry` records that a recognis
 ## Governance and admin safety
 
 - **Two-step role transfer** on every admin role (nominate, then accept), so a handover to a multisig proves the multisig can transact before anything depends on it.
-- **Timelocks on risk-increasing actions only:** insurance withdrawals, changing the pool's factory, repointing the factory's registries, and adding attesters. Risk-reducing actions stay instant. The delay is immutable, and each queued action is bound to its exact arguments.
-- **Roles held by Safes on testnet:** operator `0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c`, owner `0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B`. The deploying key governs nothing. These are currently 1-of-1 Safes. Adding real co-signers is required before mainnet.
+- **Timelocks on risk-increasing actions only:** insurance withdrawals, changing the pool's factory, repointing the factory's registries, adding attesters, manual grants, loosening identity requirements, and every parameter an open loan reads at settlement when the change loosens protection (item 12). Risk-reducing actions stay instant. The delay is immutable, each queued action is bound to its exact arguments, and an approval lapses after 14 days.
+- **Handover to Safes is built and proven** (`scripts/transfer-control.js`, `safe-accept-roles.js`, `verify-handover.js`): in August the operator and owner roles moved to two Safes, and the old key was shown to be refused. Those Safes govern a superseded deployment. **The current testnet stack (27 October 2026) is governed by the deploying key**, with a 1-hour timelock, so it can be exercised quickly. Mainnet requires the handover with real co-signers at a threshold above one; the production deploy guard refuses the deployer as operator.
 - **Production deploy guards** (`scripts/lib/production-guards.js`) refuse a production deploy with:
   - a TWAP window under 1800s;
   - a timelock under 24h;
@@ -171,23 +171,31 @@ Real Uniswap V3: the factory and router were deployed from the audited `@uniswap
 
 | Contract | Address |
 |---|---|
-| VaultFactory | `0x70b5a6c403FB33D0F601fd8F63E1c09b682d2EED` |
-| Vault implementation | `0x66a400775d1B599bF85fD6676d66D127FE2f51CD` |
-| AssetRegistry | `0xd3Cc52565faae7419c2BFA6B9FeA9Eed1b28f284` |
-| InsurancePool | `0xf7fEb99a5df10Ad3BD37DBB9E3eaAFc79A87e9B1` |
-| KYCRegistry | `0xCeC02Aab9e97F8a658D7FED455703E4aAfa1B7ed` |
-| UniswapTwap library | `0x80Fd8Be02D8573d2B4D31A2EA4b4Ea24dD33CC70` |
+| VaultFactory | `0xff2273b60b69DaB7d106027b4735ddeA2e421a4d` |
+| Vault implementation | `0xea81E07A7D3b56C74a84b6B742F479115a9ba7B4` |
+| AssetRegistry | `0x3910c7fa358212dF4A629d4F809cdAE643619926` |
+| InsurancePool | `0x0eeB323aeD8b830817A74BE4eBbdfc97940d4214` |
+| KYCRegistry | `0xE67Da97d9d9A56032Dc08c01F0AA0f12E6A0A641` |
+| VaultLens | `0x92ebA00eC7d12A5fEF6b550e2017c2fCb6379aae` |
+| UniswapTwap library | `0x9DBEEAfDcDE2E8851C4aB91dBDcabf6FE1D0a848` |
+| Treasury | `0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3` |
+| Test tokens | tUSDG `0x6ce0243a7790347C18805101947Bb10e7A4D427d`, tWETH `0x5218C7c2Fde6E8Ae083c32D714F624c69fc383f6`, tAAPL `0x5B25fD2570480067E1f1391f04673163D7B47B6A` |
+| Uniswap V3 | factory `0xCd5EEAd4bfF7460d4ef15d3B3bE35327505b0Be3`, SwapRouter02 `0x4C400720218A2D2a76A925BBae5901A97e376A16` |
 
-Explorer: [explorer.testnet.chain.robinhood.com](https://explorer.testnet.chain.robinhood.com). The full record, including test tokens, Uniswap pools and the Safes, is in `deployed-addresses.json` under `robinhoodTestnet`.
+Explorer: [explorer.testnet.chain.robinhood.com](https://explorer.testnet.chain.robinhood.com). The full record, including the Uniswap pools, is in `deployed-addresses.json` under `robinhoodTestnet`, and is the only source of truth.
 
 **Proven on chain** (scripts in `scripts/`):
 - `lifecycle-proof-robinhood.js` — all three settlement tiers, including an organic loss absorbed entirely by the borrower's deposit;
 - `prove-insurance-draw.js` — the insurance pool paying a lender after a deposit is exhausted;
 - `prove-keeper-bounty.js` — a third-party keeper settling after grace and earning the bounty.
 
-Robinhood testnet periodically wipes contract state. These proofs ran against earlier deployments of this code. The current stack was redeployed on 5 August 2026 after the KYC badge was removed.
+Robinhood testnet periodically wipes contract state. These proofs ran against earlier deployments. **The current stack is the frozen audit code, redeployed on 27 October 2026**, and checked two ways:
+- `verify-testnet-deploy.js` — 54 independent checks of every address, the wiring, roles, timelocks, settlement, insurance and tier parameters, approved pools and their price history, the insurance reserve, and the test wallets' eligibility: 54 passed;
+- a live loan through the public interface (100 tUSDG for 2 days, a swap out and back, early close), whose settlement paid lender 100.049534, treasury 0.004953 and borrower 19.885605 tUSDG — reconciled on the explorer against the vault's 120 tUSDG, less Uniswap's swap fees.
 
-Testnet settlement parameters are deliberately demo-tuned so every path can be exercised in one sitting: a 60s TWAP window, short grace and a steep bounty. The production deploy guard refuses these values.
+The redeploy order is in `scripts/README.md`.
+
+Testnet settlement parameters are deliberately demo-tuned so every path can be exercised in one sitting: a 60s TWAP window, short grace, a steep bounty and a 1-hour timelock. The production deploy guard refuses these values.
 
 The earlier Arbitrum Sepolia deployment predates mandates and risk tiers and is no longer supported by the interface.
 

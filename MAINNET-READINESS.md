@@ -110,7 +110,16 @@ removing the power.
 
 ---
 
-## 3. Everything is one key — CRITICAL — **RESOLVED ON TESTNET**
+## 3. Everything is one key — CRITICAL — **RESOLVED ON TESTNET** (August stack; see the 27 October note)
+
+> **27 October 2026.** The frozen code was redeployed to testnet with the
+> roles left on the deploying key and a 1-hour timelock, so the interface and
+> scripts can exercise every path quickly. The Safes below govern the
+> superseded August stack. Nothing about the fix is lost — the two-step
+> transfer is in the frozen contracts and the scripts are unchanged — but on
+> the stack people will actually use, this item is currently not applied. It
+> must be redone, with real co-signers, at mainnet; the deploy guard refuses
+> the deployer as operator or attester.
 
 > Two Safes now hold the roles, proven end to end on chain:
 > operator `0x0A2e01…5B1c`, owner `0x7FfCbd…988B`. The deploying key governs
@@ -1128,3 +1137,51 @@ In-scope size after this pass: **2,129 nSLOC** (2,040 written for Covenza plus
   after the audit.
 - **Fresh clone**: install, 361 Hardhat tests, 10 Foundry tests, 2,129 nSLOC
   and the README's per-file and per-suite figures all match.
+
+---
+
+# Testnet redeploy of the frozen code — 27 October 2026
+
+Not a review pass: a record of putting the audited code on chain, and of
+what that taught. Work on branch `local-test`; the `audit-freeze-2026-10`
+tag is unchanged.
+
+- **Deployed** with `TIMELOCK_DELAY=3600`: the full stack, tAAPL, and pools
+  about 100,000 deep a side. Announced actions executed after the hour.
+- **Independent check:** `scripts/verify-testnet-deploy.js` — 54 checks of
+  addresses, wiring, roles, timelocks, settlement, insurance and tier
+  parameters, approved pools and their history, the insurance reserve, the
+  attester and both test wallets: **54 passed**.
+- **Live loan** through covenza.xyz: 100 tUSDG for 2 days, a 10 tUSDG swap
+  into tWETH and back, early close. Settlement paid lender 100.049534,
+  treasury 0.004953 (10% of the interest) and borrower 19.885605 — 119.94 of
+  the 120 in the vault, the rest being Uniswap's fees on the two swaps.
+  Reported as a borrower-only loss, correctly.
+- **Governance:** held by the deploying key on this stack — see item 3.
+- **Test grants** for the lender and borrower expire on 26 November 2026.
+
+### The pool that would not warm
+
+The tUSDG/tWETH pool kept **one** history slot after 64 were requested, so it
+could not be approved (item 26). Requesting slots only reserves them; they
+come into use when the pool writes an observation, and a Uniswap V3 pool
+writes one only on a swap that **changes the tick** or on an in-range
+liquidity change. In a pool this deep a 1-token trade moves the price a
+fraction of a tick, so four warm-up trades wrote nothing. The same script had
+passed locally only because the local pool started exactly on a tick
+boundary, where the first trade crosses one.
+
+**Fix (scripts only, no contract change):** `warm-testnet-pool.js`,
+`deploy-uniswap-testnet.js`, `deploy-stock-token-testnet.js` and
+`deploy-local.js` now write observations with tiny full-range liquidity
+additions, which always write one and leave the price where it was. The fix
+was rehearsed on a pool reproduced in the stuck state (one slot, 64
+requested, price inside a tick) before it was run on testnet. This is the
+same mechanism item 26 describes from the attacker's side.
+
+### Noted, not changed
+
+- **Speculative pays a lower premium than Standard (100 vs 250 bps).**
+  Deliberate (item 8): its 40% deposit exceeds its 25% maximum possible
+  loss, so the pool's exposure on that tier is zero. Recorded here because it
+  reads as an error on the dashboard.

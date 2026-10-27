@@ -27,6 +27,47 @@ environment variables.
 | `lib/production-guards.js` | Refuses a mainnet deploy carrying testnet values (zero timelock, 60 s TWAP, outage detection off, deployer as operator or attester). |
 | `lib/pool-history.js` | Checks a pool keeps more price-history slots than the TWAP window has seconds before `setPoolFeeTier` (audit KRAIT-004), and says how to grow it if not. Used by the deploy and listing scripts. |
 | `check-sizes.js` | Bytecode size of every contract against the 24,576-byte limit (`npx hardhat run scripts/check-sizes.js`). |
+| `warm-testnet-pool.js` | Gives a pool the price history approval needs: requests 64 slots, tops liquidity up to ~100,000 a side if shallower, then writes observations with three tiny full-range liquidity additions. Not trades: a pool writes an observation only on a trade that changes the tick, which a 1-token trade in a deep pool does not. `POOL=0x…` for a pool other than the first. |
+| `approve-testnet-pools.js` | Names the approved pool for every pair still without one, after checking its history (`lib/pool-history.js`). Run only once the 60-second TWAP window has been executed through the timelock. |
+| `verify-testnet-deploy.js` | Read-only, 54 PASS/FAIL checks of a testnet deployment against the values in its `EXPECT` block: code at every address, wiring, roles and timelocks, settlement, insurance and tier parameters, tiers and approved pools, pool history, the reserve, the attester and both test wallets. |
+
+## Redeploying testnet, in order
+
+Two steps wait on the timelock, and pools can only be approved once the
+settlement config they are checked against has been executed. In PowerShell,
+from the repository root:
+
+```
+npx hardhat run scripts/deploy-uniswap-testnet.js --network robinhoodTestnet      # only if testnet was wiped
+$env:TIMELOCK_DELAY=3600; npx hardhat run scripts/deploy-robinhood-testnet.js --network robinhoodTestnet
+npx hardhat run scripts/deploy-stock-token-testnet.js --network robinhoodTestnet
+# wait one hour
+npx hardhat run scripts/execute-timelocked.js --network robinhoodTestnet
+npx hardhat run scripts/warm-testnet-pool.js --network robinhoodTestnet           # any pool under 61 slots
+npx hardhat run scripts/approve-testnet-pools.js --network robinhoodTestnet
+npx hardhat run scripts/verify-testnet-deploy.js --network robinhoodTestnet       # expect 54 passed
+```
+
+Then copy the addresses from `deployed-addresses.json` into the frontend's
+`src/config/contracts.js`. The full checklist, with the reason for each step,
+is the Regression-Test Checklist v3.
+
+## Local click-testing
+
+A local Hardhat chain with real Uniswap V3 and pools about 100,000 deep, for
+the paths testnet cannot exercise on demand: moving time, and a token that
+refuses transfers. Start `npx hardhat node` in its own window, then:
+
+| Script | Purpose |
+|---|---|
+| `deploy-local.js` | Full stack against real Uniswap: tUSDG, tWETH and a freezable tAAPL, pools warmed, 1-hour timelock fast-forwarded, outage detection off; wallets verify through the interface with `mock-verify-server.js` and account #4's key. Addresses are deterministic on a fresh node. |
+| `local-inspect.js` | Read-only snapshot: every account's token balances and every vault's state. |
+| `local-freeze.js` | Freezes or unfreezes tAAPL (`FROZEN='true'` or `'false'`), to exercise refused swaps, refused payouts and in-kind settlement. |
+| `local-time-travel.js` | Moves chain time forward `HOURS` hours, to reach grace, keeper and in-kind windows. |
+
+The six Hardhat default accounts play operator, lender, borrower, keeper,
+attester and a newcomer. Their keys are public test keys: use a separate
+browser profile.
 
 ## Heartbeat bot (item 16)
 
@@ -94,5 +135,5 @@ TELEGRAM_CHAT_ID=
 ATTESTER_KEY=                 # address of the initial attester (production: a provider, never the deployer)
 VERIFIER_PRIVATE_KEY=         # mock attester's signing key, testnet only
 TREASURY_ADDRESS=             # protocol fee recipient
-TIMELOCK_DELAY=               # seconds; 0 on testnet, at least 86400 on mainnet
+TIMELOCK_DELAY=               # seconds; 3600 on testnet (27 October stack), at least 86400 on mainnet
 ```
