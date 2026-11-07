@@ -95,6 +95,7 @@ describe("TWAP availability guard", function () {
     // longer embeds Vault bytecode and needs no library link. The
     // IMPLEMENTATION does — it delegatecalls UniswapTwap.
     // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+    await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();

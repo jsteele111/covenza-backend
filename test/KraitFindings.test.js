@@ -49,6 +49,7 @@ async function stack() {
 
   const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
   // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+  await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
   const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
   const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();

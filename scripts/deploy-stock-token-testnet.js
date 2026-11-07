@@ -41,7 +41,7 @@
 const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
-const { checkPoolHistory } = require("./lib/pool-history");
+const { checkPoolHistory, ensureMinPoolLiquidity } = require("./lib/pool-history");
 
 const FACTORY_ARTIFACT = require("@uniswap/v3-core/artifacts/contracts/UniswapV3Factory.sol/UniswapV3Factory.json");
 const POOL_ARTIFACT    = require("@uniswap/v3-core/artifacts/contracts/UniswapV3Pool.sol/UniswapV3Pool.json");
@@ -212,8 +212,11 @@ async function main() {
   // Vaults trade only through the pool the registry names for each pair
   // (KRAIT-003 / item 20). Naming the first pool for a pair is instant.
   const history = await checkPoolHistory(registry, stockAddr, usdgAddr, FEE, deployer);
-  if (!history.ok) {
-    console.log(`Pool NOT approved: ${history.reason}`);
+  const depth = history.ok
+    ? await ensureMinPoolLiquidity(registry, stockAddr, usdgAddr, history, process.env.MIN_POOL_LIQUIDITY, (m, args, label) => registry[m](...args).then((tx) => tx.wait()).then(() => console.log(label)))
+    : history;
+  if (!depth.ok) {
+    console.log(`Pool NOT approved: ${depth.reason}`);
   } else {
     await (await registry.setPoolFeeTier(stockAddr, usdgAddr, FEE)).wait();
     console.log(`Approved pool: tUSDG/${SYMBOL} at fee ${FEE}.`);

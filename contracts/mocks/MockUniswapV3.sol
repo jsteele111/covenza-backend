@@ -42,6 +42,19 @@ contract MockUniswapV3Pool {
     ///         test lowers it.
     uint16 public observationCardinality = type(uint16).max;
 
+    /// @notice Liquidity reported by liquidity(). Defaults to the maximum so
+    ///         the M-01 approval check passes unless a test lowers it.
+    uint128 public liquidity = type(uint128).max;
+
+    /// @notice Simulated harmonic-mean liquidity over any window. Zero (the
+    ///         default) reports no seconds-per-liquidity accumulator, which
+    ///         UniswapTwap.meanLiquidity reads as unbounded, so every
+    ///         pre-existing test behaves as before.
+    uint128 public meanLiquidityValue;
+
+    function setLiquidity(uint128 _liquidity) external { liquidity = _liquidity; }
+    function setMeanLiquidity(uint128 _mean) external { meanLiquidityValue = _mean; }
+
     function setObservationCardinality(uint16 _cardinality) external {
         observationCardinality = _cardinality;
     }
@@ -72,6 +85,11 @@ contract MockUniswapV3Pool {
             // observation older than the pool retains.
             require(secondsAgos[i] <= maxWindow, "OLD");
             tickCumulatives[i] = int56(avgTick) * -int56(uint56(secondsAgos[i]));
+            if (meanLiquidityValue > 0) {
+                // Accumulator at (now - secondsAgo) for a constant liquidity.
+                uint256 t = block.timestamp - secondsAgos[i];
+                secondsPerLiquidityCumulativeX128s[i] = uint160((t << 128) / meanLiquidityValue);
+            }
         }
     }
 }

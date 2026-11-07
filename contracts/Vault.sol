@@ -1025,6 +1025,9 @@ contract Vault {
         address uniFactory = registry.uniswapFactory();
         uint32 window = registry.twapWindow();
         if (!UniswapTwap.canQuote(uniFactory, held, asset, feeTier, window)) { return (false, 0); }
+        // Audit M-01: a price taken over a window the pool spent (nearly)
+        // empty is whatever price it was left at. Not a valuation.
+        if (!_poolDeepEnough(held, feeTier)) { return (false, 0); }
         if (amount == 0) { return (true, 0); }
         return (true, UniswapTwap.quote(uniFactory, held, asset, feeTier, amount, window));
     }
@@ -1229,10 +1232,24 @@ contract Vault {
     ///      TWAP-implied value less twapToleranceBps. One floor for every exit
     ///      path — voluntary swap-back, the exit simulation, and settlement.
     function _exitFloor(address held, uint256 amount, uint24 feeTier) internal view returns (uint256) {
+        // Audit M-01 (Zealynx): refuse a floor set by a pool that held too
+        // little liquidity across the window. An empty pool keeps reporting
+        // the tick it was left at, so whoever emptied it chose the floor.
+        // settle() then reverts before any insurance is drawn, and the
+        // delayed settleInKind() hands the asset over instead.
+        require(_poolDeepEnough(held, feeTier), "Pool too thin over the TWAP window");
         uint256 twapOut = UniswapTwap.quote(
             registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
         );
         return (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+    }
+
+    /// @dev Whether the pair's pool held at least the registry's minimum
+    ///      liquidity, on average, across the TWAP window (audit M-01).
+    function _poolDeepEnough(address held, uint24 feeTier) internal view returns (bool) {
+        return UniswapTwap.meanLiquidity(
+            registry.uniswapFactory(), held, asset, feeTier, registry.twapWindow()
+        ) >= registry.minPoolLiquidity(held, asset);
     }
 
     /**

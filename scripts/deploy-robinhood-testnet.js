@@ -35,7 +35,7 @@ const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig } = require("./lib/production-guards");
 const { sendOrQueue } = require("./lib/timelock");
-const { checkPoolHistory } = require("./lib/pool-history");
+const { checkPoolHistory, ensureMinPoolLiquidity } = require("./lib/pool-history");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
 const TWAP_TOLERANCE_BPS       = 300;  // 3%
@@ -261,6 +261,12 @@ async function main() {
     if (!listed) { console.log(`  pool ${p.address}: a token is not listed — skipped`); continue; }
     const history = await checkPoolHistory(registry, a, b, p.fee, deployer);
     if (!history.ok) { console.log(`  pool ${p.address}: not approved — ${history.reason}`); continue; }
+    const depth = await ensureMinPoolLiquidity(registry, a, b, history, p.minLiquidity,
+      (m, args, label) => sendOrQueue(registry, m, args, { network, label: `${label} for ${p.pair || "tUSDG/tWETH"}` }));
+    if (!depth.ok) { console.log(`  pool ${p.address}: not approved — ${depth.reason}`); continue; }
+    if ((await registry.minPoolLiquidity(a, b)) === 0n) {
+      console.log(`  pool ${p.address}: minimum pool liquidity announced; approve the pool after the delay`); continue;
+    }
     await sendOrQueue(registry, "setPoolFeeTier", [a, b, p.fee], {
       network, label: `approved pool ${p.pair || "tUSDG/tWETH"} (fee ${p.fee})`,
     });

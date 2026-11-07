@@ -128,12 +128,31 @@ describe("Item 12 — live-loan parameters are timelocked", function () {
     it("Names the FIRST pool for a pair instantly, but waits to change it", async function () {
       const { registry, weth, usdx } = await loadFixture(registryStack);
       const a = await weth.getAddress(), b = await usdx.getAddress();
+      await registry.setMinPoolLiquidity(a, b, 1n);   // audit M-01
       await registry.setPoolFeeTier(a, b, POOL_FEE);
       await expect(registry.setPoolFeeTier(a, b, ALT_FEE)).to.be.revertedWith("Action was not queued");
       await announce(registry, "setPoolFeeTier", [a, b, ALT_FEE]);
       await time.increase(DELAY);
       await registry.setPoolFeeTier(a, b, ALT_FEE);
       expect(await registry.poolFeeTier(b, a)).to.equal(ALT_FEE);
+    });
+
+    it("Audit M-01: sets a pair's minimum pool liquidity instantly before its pool is named, then waits either way", async function () {
+      const { registry, weth, usdx, stranger } = await loadFixture(registryStack);
+      const a = await weth.getAddress(), b = await usdx.getAddress();
+      await expect(registry.connect(stranger).setMinPoolLiquidity(a, b, 5n)).to.be.reverted;
+      await registry.setMinPoolLiquidity(a, b, 5n);
+      await registry.setMinPoolLiquidity(a, b, 10n);               // still no pool: instant
+      await registry.setPoolFeeTier(a, b, POOL_FEE);
+      // Lowering lets thinner pools price live loans; raising pushes them to in-kind.
+      for (const next of [1n, 20n]) {
+        await expect(registry.setMinPoolLiquidity(a, b, next)).to.be.revertedWith("Action was not queued");
+        await expect(registry.setMinPoolLiquidity(b, a, next)).to.be.revertedWith("Action was not queued");
+      }
+      await announce(registry, "setMinPoolLiquidity", [b, a, 20n]);
+      await time.increase(DELAY);
+      await registry.setMinPoolLiquidity(b, a, 20n);
+      expect(await registry.minPoolLiquidity(a, b)).to.equal(20n);
     });
 
   });
@@ -266,6 +285,7 @@ describe("Krait observation — exposure cap uses the worst tier since originati
       operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
     await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
     await registry.addAssetWithTier(await usdx.getAddress(), 0, 2); // Speculative: 25% cap
+    await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();

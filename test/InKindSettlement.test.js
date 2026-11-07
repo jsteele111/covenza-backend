@@ -58,6 +58,7 @@ async function stack() {
     operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
   await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
   await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
+  await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
   // Outage detection off: these tests jump the clock by days, which would
   // otherwise be recorded as a sequencer outage and move every window.

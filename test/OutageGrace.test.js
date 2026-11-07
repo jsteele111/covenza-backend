@@ -39,6 +39,7 @@ describe("Item 16 — sequencer outages and the grace window", function () {
       operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
     await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
     await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
+    await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);

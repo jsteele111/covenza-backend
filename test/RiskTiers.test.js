@@ -94,10 +94,13 @@ describe("Risk tiers", function () {
 
     // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
 
+    await registry.setMinPoolLiquidity(await usdx.getAddress(), await weth.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await usdx.getAddress(), await weth.getAddress(), POOL_FEE);
 
+    await registry.setMinPoolLiquidity(await usdx.getAddress(), await aapl.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await usdx.getAddress(), await aapl.getAddress(), POOL_FEE);
 
+    await registry.setMinPoolLiquidity(await usdx.getAddress(), await meme.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await usdx.getAddress(), await meme.getAddress(), POOL_FEE);
 
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();

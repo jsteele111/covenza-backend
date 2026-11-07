@@ -46,6 +46,7 @@ async function stack() {
     operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
   await registry.addAssetWithTier(await usdc.getAddress(), 0, 0);
   await registry.addAssetWithTier(await tok.getAddress(), 0, 0);
+  await registry.setMinPoolLiquidity(await usdc.getAddress(), await tok.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await usdc.getAddress(), await tok.getAddress(), FEE);
   await registry.setOutageConfig(0, 0, 0);
   await registry.setTierConfig(0, 0, 0, 365 * 86400, 10000, 100);

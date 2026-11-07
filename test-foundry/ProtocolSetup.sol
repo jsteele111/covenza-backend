@@ -70,6 +70,7 @@ abstract contract ProtocolSetup is Test {
         registry = new AssetRegistry(address(this), address(router), address(uniFactory), 0);
         registry.addAssetWithTier(address(weth), 0, AssetRegistry.RiskTier.BlueChip);
         registry.addAssetWithTier(address(usdx), 0, AssetRegistry.RiskTier.BlueChip);
+        registry.setMinPoolLiquidity(address(weth), address(usdx), 1);   // audit M-01
         registry.setPoolFeeTier(address(weth), address(usdx), 3000);
         registry.setSettlementConfig(1800, 200, 1 days, 100, 200);
         // Permissive tier: only the vault's own rules bind, not the floors.

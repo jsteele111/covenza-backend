@@ -223,6 +223,11 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      */
     mapping(address => mapping(address => uint24)) private _poolFeeTier;
 
+    /// @dev Audit M-01: the least harmonic-mean in-range liquidity a pair's
+    ///      approved pool must show over the TWAP window before its price is
+    ///      trusted, in the pool's own liquidity units. Symmetric.
+    mapping(address => mapping(address => uint128)) private _minPoolLiquidity;
+
     // --- Sequencer outages (MAINNET-READINESS item 16) ---
     //
     // Robinhood Chain has a single sequencer. While it is down nothing can be
@@ -262,6 +267,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     event AssetRemoved(address indexed asset);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
     event PoolFeeTierUpdated(address indexed tokenA, address indexed tokenB, uint24 fee);
+    event MinPoolLiquidityUpdated(address indexed tokenA, address indexed tokenB, uint128 minLiquidity);
     event OutageRecorded(uint256 start, uint256 end);
     event OutageConfigUpdated(uint256 gapThreshold, uint256 recoveryPeriod, uint256 maxGraceExtension);
     event TierUpdated(address indexed asset, RiskTier tier);
@@ -558,6 +564,11 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         // Grow it first with the pool's increaseObservationCardinalityNext.
         (, , , uint16 cardinality, , , ) = IUniswapV3Pool(pool).slot0();
         require(uint256(cardinality) > uint256(twapWindow), "Pool keeps too little price history");
+        // Audit M-01: a pool may be named only against a minimum depth set
+        // for the pair, and only while it currently meets it.
+        uint128 minLiquidity = _minPoolLiquidity[_tokenA][_tokenB];
+        require(minLiquidity > 0, "Set the pair's minimum pool liquidity first");
+        require(IUniswapV3Pool(pool).liquidity() >= minLiquidity, "Pool liquidity below the pair's minimum");
 
         // Naming the first pool for a pair is instant: no position can exist
         // in a pair with no approved pool. Changing it waits.
@@ -566,6 +577,34 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         _poolFeeTier[_tokenA][_tokenB] = _fee;
         _poolFeeTier[_tokenB][_tokenA] = _fee;
         emit PoolFeeTierUpdated(_tokenA, _tokenB, _fee);
+    }
+
+    /**
+     * @notice Sets the least liquidity a pair's approved pool must have held,
+     *         on average over the TWAP window, for vaults to trust its price.
+     *         Below it, cash settlement and the exit check refuse the pool
+     *         and a vault falls back to delayed in-kind settlement.
+     *
+     * @dev    Audit M-01. Instant while the pair has no approved pool, since
+     *         no position can depend on it yet. Afterwards it reaches every
+     *         live loan in the pair in BOTH directions, so it waits: raising
+     *         it sends more loans to in-kind settlement (the borrower's risk),
+     *         lowering it lets thinner pools set settlement prices (the
+     *         lender's and the insurance pool's risk).
+     */
+    function setMinPoolLiquidity(address _tokenA, address _tokenB, uint128 _minLiquidity) external onlyOperator {
+        require(_tokenA != _tokenB, "Identical tokens");
+        require(_minLiquidity > 0, "Minimum pool liquidity must be nonzero");
+        if (_poolFeeTier[_tokenA][_tokenB] != 0) { _consumeIfDelayed(keccak256(msg.data)); }
+
+        _minPoolLiquidity[_tokenA][_tokenB] = _minLiquidity;
+        _minPoolLiquidity[_tokenB][_tokenA] = _minLiquidity;
+        emit MinPoolLiquidityUpdated(_tokenA, _tokenB, _minLiquidity);
+    }
+
+    /// @notice The minimum pool liquidity for a pair, or zero if none is set.
+    function minPoolLiquidity(address _tokenA, address _tokenB) external view returns (uint128) {
+        return _minPoolLiquidity[_tokenA][_tokenB];
     }
 
     /// @notice The approved fee tier for a pair, or zero if none.
