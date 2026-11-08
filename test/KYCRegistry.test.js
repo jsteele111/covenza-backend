@@ -268,8 +268,42 @@ describe("KYCRegistry", function () {
     it("Should revert if non-operator tries to revoke", async function () {
       await expect(registry.connect(otherAccount).revoke(wallet1.address)).to.be.revertedWith("Caller is not the operator");
     });
-    it("Should revert if address is not verified", async function () {
-      await expect(registry.revoke(wallet2.address)).to.be.revertedWith("Address is not verified");
+  });
+
+  // --- Audit L-03 (Zealynx): revoking a wallet not yet admitted ---
+  //
+  // revoke() required isVerified, so an adverse notice that arrived after an
+  // attester had signed for a wallet, but before the wallet submitted the
+  // signature, could not be acted on: the call reverted, the nonce stayed put,
+  // and the wallet could still be admitted and borrow.
+  describe("Audit L-03 — revocation reaches a wallet before it is first admitted", function () {
+    it("The finding: a signature issued but never submitted dies when its wallet is revoked", async function () {
+      const pending = await attest(verifierKey, wallet2.address);   // signed while screening passed
+      expect(await registry.isVerified(wallet2.address)).to.equal(false);
+      const nonceBefore = await registry.nonces(wallet2.address);
+
+      await expect(registry.revoke(wallet2.address)).to.emit(registry, "AddressRevoked");   // no longer reverts
+      expect(await registry.nonces(wallet2.address)).to.equal(nonceBefore + 1n);
+
+      await expect(registry.verifyWithSignature(...pending))
+        .to.be.revertedWith("Signature is not from a recognised attester");
+      expect(await registry.isVerified(wallet2.address)).to.equal(false);
+      expect(await registry.isEligible(wallet2.address, ALL)).to.equal(false);
+    });
+
+    it("A fresh signature at the new nonce admits the wallet again, if an attester issues one", async function () {
+      await registry.revoke(wallet2.address);
+      await registry.verifyWithSignature(...await attest(verifierKey, wallet2.address));
+      expect(await registry.isEligible(wallet2.address, ALL)).to.equal(true);
+    });
+
+    it("Repeated revocation moves the nonce each time and stays operator-only", async function () {
+      const n = await registry.nonces(wallet2.address);
+      await registry.revoke(wallet2.address);
+      await registry.revoke(wallet2.address);
+      expect(await registry.nonces(wallet2.address)).to.equal(n + 2n);
+      await expect(registry.connect(otherAccount).revoke(wallet2.address))
+        .to.be.revertedWith("Caller is not the operator");
     });
   });
 
