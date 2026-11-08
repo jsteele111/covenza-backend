@@ -104,7 +104,7 @@ describe("Admin timelocks — InsurancePool factory", function () {
       // A contributor funds the reserve; the former key-holder cannot draw on it.
       await pool.connect(other).fund(await usdc.getAddress(), 1_000_000_000n);
       expect(await pool.isRegisteredVault(attacker.address)).to.equal(false);
-      await expect(pool.connect(attacker).draw(await usdc.getAddress(), 1_000_000_000n, 10n ** 18n))
+      await expect(pool.connect(attacker).draw(await usdc.getAddress(), 1_000_000_000n, 10n ** 18n, attacker.address))
         .to.be.revertedWith("Only registered vaults can draw");
       expect(await pool.reserveOf(await usdc.getAddress())).to.equal(1_000_000_000n);
     });
@@ -126,7 +126,7 @@ describe("Admin timelocks — InsurancePool factory", function () {
     await expect(pool.connect(attacker).registerVault(attacker.address))
       .to.be.revertedWith("Only factory can register vaults");
     await expect(
-      pool.connect(attacker).draw(await usdc.getAddress(), 1_000_000_000n, 10n ** 18n)
+      pool.connect(attacker).draw(await usdc.getAddress(), 1_000_000_000n, 10n ** 18n, attacker.address)
     ).to.be.revertedWith("Only registered vaults can draw");
 
     expect(await pool.reserveOf(await usdc.getAddress())).to.equal(1_000_000_000n);
@@ -210,7 +210,7 @@ describe("Admin timelocks — InsurancePool factory", function () {
     await pool.setVaultFactory(other.address);
 
     // 10% cap on a 1,000-unit principal = 100.
-    await expect(pool.connect(vault).draw(await usdc.getAddress(), 500n, 1_000n))
+    await expect(pool.connect(vault).draw(await usdc.getAddress(), 500n, 1_000n, vault.address))
       .to.emit(pool, "Drawn")
       .withArgs(await usdc.getAddress(), vault.address, 500n, 100n);
   });

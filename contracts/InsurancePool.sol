@@ -57,6 +57,12 @@ contract InsurancePool is Timelocked, OperatorControlled {
     ///         going through fund() are not counted as reserves).
     mapping(address => uint256) public reserveOf;
 
+    /// @notice Q8: insurance a vault's settlement was entitled to but could
+    ///         not be paid, because the token refused the transfer. Held for
+    ///         the lender (asset => lender => amount), outside the reserve, and
+    ///         paid by claimDeferredDraw() once the token allows it.
+    mapping(address => mapping(address => uint256)) public deferredDrawOf;
+
     /// @notice Vaults registered by the factory and permitted to draw.
     mapping(address => bool) public isRegisteredVault;
 
@@ -91,6 +97,8 @@ contract InsurancePool is Timelocked, OperatorControlled {
     event VaultRegistered(address indexed vault);
     event Funded(address indexed asset, address indexed from, uint256 amount);
     event Drawn(address indexed asset, address indexed vault, uint256 requested, uint256 paid);
+    event DrawDeferred(address indexed asset, address indexed vault, address indexed beneficiary, uint256 amount);
+    event DeferredDrawClaimed(address indexed asset, address indexed beneficiary, uint256 amount);
     event AdminWithdrawal(address indexed asset, address indexed to, uint256 amount);
 
     // --- Constructor ---
@@ -256,8 +264,9 @@ contract InsurancePool is Timelocked, OperatorControlled {
      *           2. the draw cap (drawCapBps of the loan's principal),
      *           3. maxDrawShareBps of the asset's current reserve (item 8).
      *
-     *         Never reverts for lack of funds — pays what it can and reports
-     *         the actual amount, so settlement always completes. The pool
+     *         Never reverts for lack of funds, or because the token refuses
+     *         the transfer (Q8) — pays what it can and reports the actual
+     *         amount, so settlement always completes. The pool
      *         reduces the probability and size of lender-impacted losses;
      *         it does not and cannot eliminate them (see UI disclosure
      *         requirements in the Build-Readiness Spec).
@@ -265,13 +274,18 @@ contract InsurancePool is Timelocked, OperatorControlled {
      * @param asset     The loan's denomination asset.
      * @param shortfall The uncovered loss remaining after the deposit.
      * @param principal The loan's principal (basis for the draw cap).
+     * @param beneficiary The vault's lender, for whom a refused transfer is held (Q8).
      * @return paid     The amount actually transferred to the vault.
+     * @return deferred The amount the token refused to transfer, held for
+     *                  `beneficiary` in deferredDrawOf (Q8). At most one of
+     *                  the two is nonzero.
      */
     function draw(
         address asset,
         uint256 shortfall,
-        uint256 principal
-    ) external returns (uint256 paid) {
+        uint256 principal,
+        address beneficiary
+    ) external returns (uint256 paid, uint256 deferred) {
         require(isRegisteredVault[msg.sender], "Only registered vaults can draw");
         require(asset != address(0), "Invalid asset");
         require(shortfall > 0, "Shortfall must be greater than zero");
@@ -279,16 +293,39 @@ contract InsurancePool is Timelocked, OperatorControlled {
         uint256 cap   = (principal * drawCapBps) / 10000;
         uint256 share = (reserveOf[asset] * maxDrawShareBps) / 10000;
 
-        paid = shortfall;
-        if (paid > cap)   { paid = cap; }
-        if (paid > share) { paid = share; }
+        uint256 amount = shortfall;
+        if (amount > cap)   { amount = cap; }
+        if (amount > share) { amount = share; }
 
-        if (paid > 0) {
-            reserveOf[asset] -= paid;
-            SafeTransfer.safeTransfer(asset, msg.sender, paid);
+        if (amount > 0) {
+            reserveOf[asset] -= amount;
+            // Q8 (Covenza, answering Zealynx's kickoff question 8): a token
+            // that refuses this transfer (paused, or the pool or vault
+            // blocked by its issuer) used to revert the draw and with it the
+            // whole settlement, so nobody was paid. The insurance is now held
+            // for the lender instead, outside the reserve, and the vault
+            // settles with the cash it has. The waterfall is unchanged: the
+            // lender is still owed it, only later.
+            if (SafeTransfer.trySafeTransfer(asset, msg.sender, amount)) {
+                paid = amount;
+            } else {
+                deferred = amount;
+                deferredDrawOf[asset][beneficiary] += amount;
+                emit DrawDeferred(asset, msg.sender, beneficiary, amount);
+            }
         }
 
         emit Drawn(asset, msg.sender, shortfall, paid);
+    }
+
+    /// @notice Pays the caller the insurance held for them by a deferred draw
+    ///         (Q8). Reverts, keeping the claim, while the token still refuses.
+    function claimDeferredDraw(address asset) external returns (uint256 amount) {
+        amount = deferredDrawOf[asset][msg.sender];
+        require(amount > 0, "Nothing deferred");
+        deferredDrawOf[asset][msg.sender] = 0;
+        SafeTransfer.safeTransfer(asset, msg.sender, amount);
+        emit DeferredDrawClaimed(asset, msg.sender, amount);
     }
 
     // --- Administrative withdrawal (operator-only) ---

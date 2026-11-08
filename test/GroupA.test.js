@@ -217,7 +217,7 @@ describe("Group A — InsurancePool", function () {
   it("Should reject draws from unregistered callers", async function () {
     const { pool, usdc, other } = await loadFixture(deployPoolFixture);
     await expect(
-      pool.connect(other).draw(await usdc.getAddress(), 1000n, 10_000n)
+      pool.connect(other).draw(await usdc.getAddress(), 1000n, 10_000n, other.address)
     ).to.be.revertedWith("Only registered vaults can draw");
   });
 
@@ -227,7 +227,7 @@ describe("Group A — InsurancePool", function () {
     await pool.connect(other).fund(usdcAddr, 500_000_000n);
 
     // principal 1,000 USDC -> cap = 10% = 100 USDC. Shortfall 50 USDC: fully paid.
-    await expect(pool.connect(vaultSigner).draw(usdcAddr, 50_000_000n, 1_000_000_000n))
+    await expect(pool.connect(vaultSigner).draw(usdcAddr, 50_000_000n, 1_000_000_000n, vaultSigner.address))
       .to.emit(pool, "Drawn")
       .withArgs(usdcAddr, vaultSigner.address, 50_000_000n, 50_000_000n);
 
@@ -241,7 +241,7 @@ describe("Group A — InsurancePool", function () {
     await pool.connect(other).fund(usdcAddr, 500_000_000n);
 
     // Shortfall 300 USDC but cap = 10% of 1,000 = 100 USDC: pays exactly 100.
-    await expect(pool.connect(vaultSigner).draw(usdcAddr, 300_000_000n, 1_000_000_000n))
+    await expect(pool.connect(vaultSigner).draw(usdcAddr, 300_000_000n, 1_000_000_000n, vaultSigner.address))
       .to.emit(pool, "Drawn")
       .withArgs(usdcAddr, vaultSigner.address, 300_000_000n, 100_000_000n);
 
@@ -253,7 +253,7 @@ describe("Group A — InsurancePool", function () {
     const usdcAddr = await usdc.getAddress();
     await pool.connect(other).fund(usdcAddr, 30_000_000n); // only 30 USDC in reserve
 
-    await expect(pool.connect(vaultSigner).draw(usdcAddr, 80_000_000n, 1_000_000_000n))
+    await expect(pool.connect(vaultSigner).draw(usdcAddr, 80_000_000n, 1_000_000_000n, vaultSigner.address))
       .to.emit(pool, "Drawn")
       .withArgs(usdcAddr, vaultSigner.address, 80_000_000n, 30_000_000n);
 
@@ -264,7 +264,7 @@ describe("Group A — InsurancePool", function () {
     const { pool, usdc, vaultSigner } = await loadFixture(deployPoolFixture);
     const usdcAddr = await usdc.getAddress();
 
-    await expect(pool.connect(vaultSigner).draw(usdcAddr, 80_000_000n, 1_000_000_000n))
+    await expect(pool.connect(vaultSigner).draw(usdcAddr, 80_000_000n, 1_000_000_000n, vaultSigner.address))
       .to.emit(pool, "Drawn")
       .withArgs(usdcAddr, vaultSigner.address, 80_000_000n, 0);
   });

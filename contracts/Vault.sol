@@ -227,6 +227,7 @@ contract Vault {
 
     uint256 public settledTotalReturned;   // vault's own funds at settlement, BEFORE any insurance draw
     uint256 public settledInsuranceDraw;   // amount actually received from the insurance pool
+    uint256 public settledInsuranceDeferred; // Q8: insurance owed to the lender but held by the pool (token refused the transfer)
     uint256 public settledLenderPayout;
     uint256 public settledBorrowerPayout;
     uint256 public settledFee;
@@ -1209,9 +1210,22 @@ contract Vault {
         // against principal can only come from the vault actually losing
         // value. Found by Krait (KRAIT-002, High) on 1 October 2026; see
         // MAINNET-READINESS item 19.
+        //
+        // THE DEPOSIT IS FIRST-LOSS. It is part of totalReturned, so any loss
+        // eats the borrower's deposit before the insurance pool pays anything:
+        // the pool is drawn only once what the vault holds, deposit included,
+        // has fallen below the principal. Order of payment, below:
+        //   1. lender, up to principal + accrued interest (insurance included)
+        //   2. keeper bounty   3. protocol fee   4. borrower, the residual.
+        //
+        // Q8: if the token refuses the insurance transfer, the pool holds it
+        // for the lender (claimDeferredDraw) and the vault settles now with
+        // its own cash. The lender's place in the order does not change.
         uint256 insuranceDraw = 0;
         if (!early && totalReturned < principal) {
-            insuranceDraw = insurancePool.draw(asset, principal - totalReturned, principal);
+            uint256 deferred;
+            (insuranceDraw, deferred) = insurancePool.draw(asset, principal - totalReturned, principal, lender);
+            settledInsuranceDeferred = deferred;
         }
 
         uint256 available    = totalReturned + insuranceDraw;
