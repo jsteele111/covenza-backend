@@ -113,6 +113,7 @@ describe("Mandates", function () {
       depositCreditBpsPerPoint: DEPOSIT_CREDIT,
       minDepositBps: MIN_DEPOSIT,
       minAprBps: MIN_APR,
+      maxInsuranceSkimRateBps: 0,   // audit L-01: consents to no skim (the default rate)
     };
 
     async function publish(overrides = {}, signer = lender) {
@@ -539,5 +540,55 @@ describe("Mandates", function () {
       factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256)
     ).to.be.reverted;
     expect(await factory.mandateRemaining(id)).to.equal(E("250"));
+  });
+
+  // --- Audit L-01 (Zealynx): the lender's consent to the insurance skim ---
+  //
+  // The skim comes out of the LENDER's wallet on top of the principal, at the
+  // rate in force when a borrower fills — possibly long after the lender
+  // published. A mandate now names the highest rate its lender accepts, and a
+  // fill above it reverts before anything moves.
+
+  describe("Audit L-01 — a raised insurance skim cannot be charged to an older mandate", function () {
+    it("The finding: after a raise from 0, filling the old mandate reverts and the lender's balance is untouched", async function () {
+      const { publish, factory, borrower, lender, usdx } = await loadFixture(fixture);
+      const id = await publish();                       // published at 0, consenting to 0
+      await factory.setInsuranceSkimRateBps(2000);
+      const before = await usdx.balanceOf(lender.address);
+
+      await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
+        .to.be.revertedWith("Insurance skim above the mandate's limit");
+      expect(await usdx.balanceOf(lender.address)).to.equal(before);
+      expect((await factory.mandate(id)).filled).to.equal(0n);
+    });
+
+    it("A mandate republished to accept the rate fills, and debits only principal plus the quoted skim", async function () {
+      const { publish, factory, borrower, lender, usdx } = await loadFixture(fixture);
+      await factory.setInsuranceSkimRateBps(2000);
+      const id = await publish({ maxInsuranceSkimRateBps: 2000 });
+      expect((await factory.mandate(id)).maxInsuranceSkimRateBps).to.equal(2000n);
+      const before = await usdx.balanceOf(lender.address);
+
+      await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+      const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
+      const skim = await factory.quoteInsuranceSkim(PRINCIPAL, await vault.aprBps(), 30 * DAY, true);
+      expect(skim).to.be.greaterThan(0n);
+      expect(before - (await usdx.balanceOf(lender.address))).to.equal(PRINCIPAL + skim);
+    });
+
+    it("The ceiling is a ceiling: a lower rate fills, a higher one is refused", async function () {
+      const { publish, factory, borrower } = await loadFixture(fixture);
+      const id = await publish({ maxInsuranceSkimRateBps: 2000 });
+      await factory.setInsuranceSkimRateBps(1000);
+      await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+      await factory.setInsuranceSkimRateBps(2001);
+      await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
+        .to.be.revertedWith("Insurance skim above the mandate's limit");
+    });
+
+    it("Refuses a ceiling above 100%", async function () {
+      const { publish } = await loadFixture(fixture);
+      await expect(publish({ maxInsuranceSkimRateBps: 10001 })).to.be.revertedWith("Skim ceiling above 100%");
+    });
   });
 });

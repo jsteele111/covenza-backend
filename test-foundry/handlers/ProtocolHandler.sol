@@ -123,7 +123,8 @@ contract ProtocolHandler is Test {
             minTermSeconds: 1 hours, maxTermSeconds: 14 days,
             validForSeconds: 7 days, maxTier: 0, permittedBorrower: address(0),
             baseAprBps: 1200, termPremiumBpsPerDay: 1, depositCreditBpsPerPoint: 1,
-            minDepositBps: 1000, minAprBps: 500, totalCapacity: cap
+            minDepositBps: 1000, minAprBps: 500, totalCapacity: cap,
+            maxInsuranceSkimRateBps: 0
         });
         _mintWeth(lender, cap);
         vm.prank(lender);

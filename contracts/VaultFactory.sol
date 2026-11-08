@@ -589,6 +589,9 @@ contract VaultFactory is Timelocked {
         // --- capacity (MAINNET-READINESS item 13) ---
         uint256 totalCapacity;              // most this mandate lends across ALL fills
         uint256 filled;                     // principal lent so far
+
+        // --- lender's consent to the insurance skim (audit L-01) ---
+        uint256 maxInsuranceSkimRateBps;    // highest insuranceSkimRateBps a fill may charge the lender
     }
 
     /// @dev Published as one struct: eleven-plus arguments would overflow the
@@ -608,6 +611,7 @@ contract VaultFactory is Timelocked {
         uint256 minDepositBps;
         uint256 minAprBps;
         uint256 totalCapacity;
+        uint256 maxInsuranceSkimRateBps;    // audit L-01; 0 = fill only while no skim is charged
     }
 
     Mandate[] internal _mandates;
@@ -654,6 +658,7 @@ contract VaultFactory is Timelocked {
         require(t.minAprBps > 0,                          "Minimum APR must be nonzero");
         require(t.minAprBps <= t.baseAprBps,              "Minimum APR above base");
         require(t.minDepositBps <= 10000,                 "Deposit floor above 100%");
+        require(t.maxInsuranceSkimRateBps <= 10000,       "Skim ceiling above 100%");
         require(
             t.maxTermSeconds <= assetRegistry.maxTermForTier(AssetRegistry.RiskTier(t.maxTier)),
             "Maximum term exceeds the tier's limit"
@@ -683,6 +688,7 @@ contract VaultFactory is Timelocked {
         m.minDepositBps            = t.minDepositBps;
         m.minAprBps                = t.minAprBps;
         m.totalCapacity            = t.totalCapacity;
+        m.maxInsuranceSkimRateBps  = t.maxInsuranceSkimRateBps;
         // cancelled defaults to false; filled starts at zero
 
         emit MandatePublished(id, msg.sender, t.asset, t.maxPrincipal, m.expiry, t.maxTier);
@@ -868,6 +874,14 @@ contract VaultFactory is Timelocked {
                 m.permittedBorrower == address(0) || m.permittedBorrower == msg.sender,
                 "Not the permitted borrower for this mandate"
             );
+            // Audit L-01 (Zealynx): the skim is taken from the LENDER on top of
+            // the principal, at the rate in force when the mandate is FILLED,
+            // possibly long after it was published. A lender who publishes is
+            // consenting to the rate they named, and to no higher one: silence
+            // is not consent to a later repricing. A raised rate leaves older
+            // mandates unfillable until their lender republishes.
+            require(insuranceSkimRateBps <= m.maxInsuranceSkimRateBps,
+                "Insurance skim above the mandate's limit");
             require(
                 principal >= m.minPrincipal && principal <= m.maxPrincipal,
                 "Principal outside the mandate's bounds"
