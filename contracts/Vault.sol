@@ -1112,7 +1112,15 @@ contract Vault {
                     toLender = amount;
                     stillOwed = priced ? stillOwed - value : 0;
                 } else {
-                    toLender = (amount * stillOwed) / value;
+                    // Audit I-02 (Zealynx): round the lender's share UP. The
+                    // floor handed the borrower the unit that would have
+                    // covered the lender's last fraction, then cleared the
+                    // claim; with a coarse (e.g. zero-decimal) asset that left
+                    // the lender a whole unit short of what it was owed. The
+                    // lender is paid first, so it takes the fraction, and can
+                    // end at most one unit's value above what it was owed.
+                    // value > stillOwed here, so the result never exceeds amount.
+                    toLender = (amount * stillOwed + value - 1) / value;
                     stillOwed = 0;
                 }
             }

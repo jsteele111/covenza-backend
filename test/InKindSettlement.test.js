@@ -320,4 +320,90 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     await toInKindWindow();
     await expect(vault.connect(lender).settleInKind()).to.be.revertedWith("Nothing held - use settle()");
   });
+
+  // --- Audit I-02 (Zealynx): rounding a coarse asset's split ---
+  //
+  // The lender's share of a priced, unsellable asset was floored, the rest went
+  // to the borrower, and the lender's claim was cleared. With a zero-decimal
+  // asset that left the lender up to a whole unit short. It is now rounded up.
+  describe("Audit I-02 — the lender's in-kind share is rounded up", function () {
+    /** The same loan, holding a ZERO-decimal stock priced near 0.13 WETH a unit. */
+    async function coarseStack() {
+      const [operator, lender, borrower] = await ethers.getSigners();
+      const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock WETH", "WETH", 18);
+      const stock = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Whole-share stock", "WSTK", 0);
+      const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
+      const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
+      const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
+      await uniFactory.setPool(await weth.getAddress(), await stock.getAddress(), POOL_FEE, await uniPool.getAddress());
+      // 1 unit (raw 1) ≈ 0.13 WETH (raw 1.3e17): price 1.3e17 per raw unit.
+      await uniPool.setAvgTick(tickFor(await stock.getAddress(), await weth.getAddress(), 394000n));
+
+      const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
+      await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+      await kyc.verify(lender.address, 7, ethers.id("test-fixture"));
+      const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
+        operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+      await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+      await registry.addAssetWithTier(await stock.getAddress(), 0, 0);
+      await registry.setMinPoolLiquidity(await weth.getAddress(), await stock.getAddress(), 1n);
+      await registry.setPoolFeeTier(await weth.getAddress(), await stock.getAddress(), POOL_FEE);
+      await registry.setOutageConfig(0, 0, 0);
+
+      const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
+      const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+      const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
+      const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+        await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+      await pool.queueSetVaultFactory(await factory.getAddress());
+      await pool.setVaultFactory(await factory.getAddress());
+
+      // The router trades at exactly the TWAP price of one unit.
+      const q = await twapLib.quote(uniFactory.getAddress(), stock.getAddress(), weth.getAddress(), POOL_FEE, 1n, 1800);
+      await router.setRate(await stock.getAddress(), await weth.getAddress(), q, 1n);
+      await router.setRate(await weth.getAddress(), await stock.getAddress(), 1n, q);
+      await weth.mint(await router.getAddress(), E("1000"));
+      await stock.mint(await router.getAddress(), 1000n);
+
+      await weth.mint(lender.address, P);
+      await weth.connect(lender).approve(await factory.getAddress(), P);
+      await factory.connect(lender).deployVaultWithTier(
+        await weth.getAddress(), borrower.address, P, 1200, 7, false, D, ethers.ZeroAddress, 0);
+      const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
+      const premium = await vault.insurancePremium();
+      await weth.mint(borrower.address, D + premium);
+      await weth.connect(borrower).approve(await vault.getAddress(), D + premium);
+      await vault.connect(borrower).payDeposit();
+      const UNITS = 61n;
+      await vault.connect(borrower).swap(await stock.getAddress(), q * UNITS, 1, POOL_FEE);
+      expect(await stock.balanceOf(await vault.getAddress())).to.equal(UNITS);
+
+      // The sale fails; the TWAP still prices the stock, so it is split by value.
+      await router.setRate(await stock.getAddress(), await weth.getAddress(), 1n, 1n);
+      await time.increaseTo(await vault.inKindFrom());
+      return { lender, borrower, weth, stock, vault, q, UNITS, cash: P + D - q * UNITS };
+    }
+
+    it("The finding: a zero-decimal split gives the lender the unit that covers its last fraction", async function () {
+      const { lender, borrower, weth, stock, vault, q, UNITS, cash } = await coarseStack();
+      const before = await weth.balanceOf(lender.address);
+      await vault.connect(lender).settleInKind();
+
+      const owed = P + (await vault.settledFee());
+      const stillOwed = owed - cash;
+      expect(stillOwed % q).to.not.equal(0n);                     // a genuine fraction of a unit
+      const floor = stillOwed / q;                                 // what the lender used to receive
+      expect(await stock.balanceOf(lender.address)).to.equal(floor + 1n);
+      expect(await stock.balanceOf(borrower.address)).to.equal(UNITS - floor - 1n);
+
+      // Cash plus units at the TWAP now reach what the lender was owed, and
+      // exceed it by less than one unit's value.
+      const received = (await weth.balanceOf(lender.address)) - before + (floor + 1n) * q;
+      expect(received).to.be.greaterThanOrEqual(owed);
+      expect(received - owed).to.be.lessThan(q);
+      // Nothing is created or lost.
+      expect((await stock.balanceOf(lender.address)) + (await stock.balanceOf(borrower.address))).to.equal(UNITS);
+      expect(await stock.balanceOf(await vault.getAddress())).to.equal(0n);
+    });
+  });
 });
