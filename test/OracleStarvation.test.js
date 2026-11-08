@@ -98,6 +98,7 @@ async function protocol(env, { listWindow = WINDOW } = {}) {
     signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await id.getAddress(), await registry.getAddress(), await ipool.getAddress(), operator.address, await impl.getAddress(), 0);
+  await ipool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await ipool.setVaultFactory(await factory.getAddress());
 
   const P = E("10");

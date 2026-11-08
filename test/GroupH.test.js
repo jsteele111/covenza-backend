@@ -131,6 +131,7 @@ describe("Group H — protocol fee", function () {
       treasury.address,
       await vaultImpl.getAddress()   // clone source
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
     // Only approved integrators earn the referrer share (Krait observation).
     await factory.setReferrerApproved(referrer.address, true);

@@ -80,6 +80,7 @@ abstract contract ProtocolSetup is Test {
         pool = new InsurancePool(address(this), 1000, 0);
         Vault impl = new Vault();
         factory = new VaultFactory(address(id), address(registry), address(pool), treasury, address(impl), 0);
+        pool.queueSetVaultFactory(address(factory));   // audit M-05: the first wiring is announced too
         pool.setVaultFactory(address(factory));
 
         weth.mint(address(this), INITIAL_RESERVE);

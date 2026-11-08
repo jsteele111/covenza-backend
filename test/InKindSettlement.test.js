@@ -69,6 +69,7 @@ async function stack() {
   const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+  await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await pool.setVaultFactory(await factory.getAddress());
 
   // Reserve of 100 WETH, so the 5% per-draw share (item 8) is 5 WETH and the

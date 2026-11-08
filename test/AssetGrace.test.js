@@ -107,6 +107,7 @@ describe("Per-asset grace", function () {
       treasury.address,
       await vaultImpl.getAddress()   // clone source
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
     await factory.setProtocolFeeRateBps(0);   // keeps payout arithmetic readable
 

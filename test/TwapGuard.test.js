@@ -113,6 +113,7 @@ describe("TWAP availability guard", function () {
       treasury.address,
       await vaultImpl.getAddress()   // clone source
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
 
     await weth.mint(lender.address, PRINCIPAL + SKIM);

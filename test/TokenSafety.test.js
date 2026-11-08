@@ -31,6 +31,7 @@ describe("Item 15 — token safety and timelock expiry", function () {
     const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury.address, await impl.getAddress(), 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
 
     return { operator, lender, borrower, treasury, nr, pool, factory };
@@ -78,6 +79,10 @@ describe("Item 15 — token safety and timelock expiry", function () {
       const [operator] = await ethers.getSigners();
       const bad = await (await ethers.getContractFactory("MockFalseToken", operator)).deploy();
       const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
+      // Audit M-05: fund() refuses money until a factory is wired, and the
+      // first wiring is announced like any other. A signer stands in for it.
+      await pool.queueSetVaultFactory(operator.address);
+      await pool.setVaultFactory(operator.address);
       await bad.mint(operator.address, E("5"));
       await bad.approve(await pool.getAddress(), E("5"));
       await pool.fund(await bad.getAddress(), E("5"));
@@ -93,6 +98,10 @@ describe("Item 15 — token safety and timelock expiry", function () {
     it("Refuses a 'token' with no code, which would otherwise look like a silent success", async function () {
       const [operator, , , , nobody] = await ethers.getSigners();
       const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
+      // Audit M-05: fund() refuses money until a factory is wired, and the
+      // first wiring is announced like any other. A signer stands in for it.
+      await pool.queueSetVaultFactory(operator.address);
+      await pool.setVaultFactory(operator.address);
       await expect(
         pool.fund(nobody.address, E("1"))
       ).to.be.revertedWith("Token transfer failed");
@@ -106,6 +115,11 @@ describe("Item 15 — token safety and timelock expiry", function () {
     async function poolStack() {
       const [operator] = await ethers.getSigners();
       const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, DELAY);
+      // Audit M-05: fund() refuses money until a factory is wired, and the
+      // first wiring is announced like any other. A signer stands in for it.
+      await pool.queueSetVaultFactory(operator.address);
+      await time.increase(DELAY);
+      await pool.setVaultFactory(operator.address);
       const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("WETH", "WETH", 18);
       await weth.mint(operator.address, E("100"));
       await weth.approve(await pool.getAddress(), E("100"));

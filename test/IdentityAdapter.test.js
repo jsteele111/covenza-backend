@@ -27,6 +27,7 @@ describe("Identity adapter — eligibility checked at origination", function () 
       : await (await ethers.getContractFactory("MockIdentityAdapter", operator)).deploy();
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await adapter.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), factoryDelay);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
     return { operator, lender, borrower, attester, weth, adapter, factory };
   }

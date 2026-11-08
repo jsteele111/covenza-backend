@@ -1,5 +1,5 @@
 const { expect } = require("chai");
-const { loadFixture } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
+const { loadFixture, time } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 const { ethers } = require("hardhat");
 
 /**
@@ -176,6 +176,7 @@ describe("Group A — InsurancePool", function () {
 
     // Wire a signer as the "factory", and register another signer as a
     // "vault" — lets us unit-test draw permissions without real vaults.
+    await pool.queueSetVaultFactory(factorySigner.address);   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(factorySigner.address);
     await pool.connect(factorySigner).registerVault(vaultSigner.address);
 
@@ -362,6 +363,11 @@ describe("Group A — InsurancePool", function () {
     const usdc = await Mock.deploy("USD Coin", "USDC", 6);
     const Pool = await ethers.getContractFactory("InsurancePool");
     const pool = await Pool.deploy(operator.address, 1000, 3600);
+    // Audit M-05: fund() refuses money until a factory is wired, and the
+    // first wiring is announced like any other. A signer stands in for it.
+    await pool.queueSetVaultFactory(operator.address);
+    await time.increase(3600);
+    await pool.setVaultFactory(operator.address);
 
     const usdcAddr = await usdc.getAddress();
     await usdc.mint(other.address, 200_000_000n);

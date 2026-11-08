@@ -122,14 +122,21 @@ contract InsurancePool is Timelocked, OperatorControlled {
     // --- Configuration (operator-only) ---
 
     /**
-     * @notice Sets the VaultFactory allowed to register vaults.
+     * @notice Sets the VaultFactory allowed to register vaults. EVERY call,
+     *         the first included, must be announced with queueSetVaultFactory
+     *         and can only execute after `timelockDelay`.
      *
-     *         The FIRST call is instant: factory and pool reference each
-     *         other, so one must be deployed first and wired to the other, and
-     *         an unwired pool has no registered vaults and nothing to protect.
-     *
-     *         Every LATER call must be announced with queueSetVaultFactory and
-     *         can only execute after `timelockDelay`.
+     * @dev    WHY THE FIRST CALL IS DELAYED TOO (audit M-05, Zealynx). The
+     *         first wiring used to be instant, on the reasoning that an
+     *         unwired pool has nothing to protect. But a registration
+     *         outlives the factory that made it: an operator key compromised
+     *         only during bootstrap could wire its own address, register
+     *         itself as a vault, and keep drawing on reserves funded long
+     *         after the genuine factory was installed. Announcing the first
+     *         wiring like every other gives monitors the same review window,
+     *         and lets the operator cancel an announcement it did not make.
+     *         fund() also refuses money until a factory is wired, so nothing
+     *         can be deposited into a pool whose wiring is still pending.
      *
      * @dev    WHY THE LATER CALLS ARE DELAYED. The factory decides who may
      *         register as a vault, and a registered vault may call draw() with
@@ -148,21 +155,17 @@ contract InsurancePool is Timelocked, OperatorControlled {
      */
     function setVaultFactory(address _factory) external onlyOperator {
         require(_factory != address(0), "Invalid factory address");
-
-        if (vaultFactory != address(0)) {
-            _consume(_vaultFactoryId(_factory));
-        }
+        _consume(_vaultFactoryId(_factory));
 
         address previous = vaultFactory;
         vaultFactory = _factory;
         emit VaultFactoryUpdated(previous, _factory);
     }
 
-    /// @notice Announces a change of factory. Executable after
+    /// @notice Announces a factory, the first included. Executable after
     ///         `timelockDelay`, via setVaultFactory with the same address.
     function queueSetVaultFactory(address _factory) external onlyOperator {
         require(_factory != address(0), "Invalid factory address");
-        require(vaultFactory != address(0), "First factory is set directly");
         _queue(_vaultFactoryId(_factory));
     }
 
@@ -228,6 +231,10 @@ contract InsurancePool is Timelocked, OperatorControlled {
      * @param amount The amount to contribute.
      */
     function fund(address asset, uint256 amount) external {
+        // Audit M-05 / reserve setup: no money in before the pool is wired.
+        // A contributor then always funds a pool whose factory has already
+        // passed the timelock, and never one whose wiring is still pending.
+        require(vaultFactory != address(0), "Pool not wired to a factory yet");
         require(asset != address(0), "Invalid asset");
         require(amount > 0, "Amount must be greater than zero");
 

@@ -91,6 +91,7 @@ describe("Annualised interest", function () {
       treasury.address,
       await vaultImpl.getAddress()   // clone source
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
 
     // The lender skim now defaults to ZERO — the insurance pool is funded by the

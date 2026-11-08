@@ -84,6 +84,7 @@ describe("Mandates", function () {
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(),
       treasury.address, await vaultImpl.getAddress()
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
     await factory.setProtocolFeeRateBps(0);
 

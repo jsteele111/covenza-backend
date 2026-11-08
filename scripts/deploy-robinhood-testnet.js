@@ -34,7 +34,7 @@ const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig } = require("./lib/production-guards");
-const { sendOrQueue } = require("./lib/timelock");
+const { sendOrQueue, readPending, writePending } = require("./lib/timelock");
 const { checkPoolHistory, ensureMinPoolLiquidity } = require("./lib/pool-history");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
@@ -309,8 +309,33 @@ async function main() {
   await factory.waitForDeployment();
   console.log(`VaultFactory    ${await factory.getAddress()}`);
 
-  await (await pool.setVaultFactory(await factory.getAddress())).wait();
-  console.log("  InsurancePool wired to factory");
+  // Audit M-05: the FIRST wiring is announced and waits like any other, and
+  // the pool refuses funding until it is wired. With a delay, the wiring is
+  // recorded for execute-timelocked.js and the reserve is seeded afterwards.
+  const factoryAddr = await factory.getAddress();
+  await (await pool.queueSetVaultFactory(factoryAddr)).wait();
+  let poolWired = false;
+  if (TIMELOCK_DELAY === 0) {
+    await (await pool.setVaultFactory(factoryAddr)).wait();
+    poolWired = true;
+    console.log("  InsurancePool wired to factory");
+  } else {
+    const id = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
+      .encode(["string", "address"], ["setVaultFactory", factoryAddr]));
+    const pending = readPending();
+    const network = hre.network.name;
+    pending[network] = (pending[network] || []).filter((p) => p.id !== id);
+    pending[network].push({
+      label: `InsurancePool.setVaultFactory(${factoryAddr})`,
+      target: await pool.getAddress(), method: "setVaultFactory", args: [factoryAddr],
+      data: pool.interface.encodeFunctionData("setVaultFactory", [factoryAddr]), id,
+      executableAt: new Date((Math.floor(Date.now() / 1000) + TIMELOCK_DELAY) * 1000).toISOString(),
+      queuedBy: deployer.address,
+    });
+    writePending(pending);
+    console.log(`  ⏳ InsurancePool wiring ANNOUNCED (${TIMELOCK_DELAY}s). Run execute-timelocked.js after the delay;`);
+    console.log("     no vault can originate, and the pool accepts no funding, until then.");
+  }
 
   // --- 6. Confirm the guard agrees with reality ------------------------
   //
@@ -347,9 +372,13 @@ async function main() {
   console.log("\nSeeded tUSDG/tWETH to deployer and borrower");
 
   const seed = ethers.parseEther("2000");
-  await (await usdgToken.approve(await pool.getAddress(), seed)).wait();
-  await (await pool.fund(usdg, seed)).wait();
-  console.log("Insurance pool seeded with 2,000 tUSDG");
+  if (poolWired) {
+    await (await usdgToken.approve(await pool.getAddress(), seed)).wait();
+    await (await pool.fund(usdg, seed)).wait();
+    console.log("Insurance pool seeded with 2,000 tUSDG");
+  } else {
+    console.log("Insurance pool NOT seeded: it accepts funding once wired (after execute-timelocked.js).");
+  }
 
   // --- 8. Persist --------------------------------------------------------
 

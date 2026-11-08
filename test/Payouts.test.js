@@ -56,6 +56,7 @@ async function stack() {
   const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await id.getAddress(), await registry.getAddress(), await pool.getAddress(), treasury.address, await impl.getAddress(), 0);
+  await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await pool.setVaultFactory(await factory.getAddress());
   await factory.setReferrerApproved(referrer.address, true);
 
