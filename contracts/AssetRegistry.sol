@@ -771,7 +771,12 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      */
     function heartbeat() external {
         uint256 last = lastHeartbeat;
-        if (outageGapThreshold != 0 && block.timestamp > last + outageGapThreshold) {
+        // Audit L-05 (Zealynx): compare elapsed time rather than adding the
+        // threshold to the last heartbeat. With an oversized threshold the
+        // addition overflowed and reverted, and since settle() and
+        // settleInKind() both call heartbeat() first, every settlement froze
+        // until a timelocked repair. Subtraction cannot overflow here.
+        if (outageGapThreshold != 0 && block.timestamp > last && block.timestamp - last > outageGapThreshold) {
             _outages.push(Outage({ start: uint64(last), end: uint64(block.timestamp) }));
             emit OutageRecorded(last, block.timestamp);
         }
@@ -854,6 +859,9 @@ contract AssetRegistry is OperatorControlled, Timelocked {
             require(_recoveryPeriod == 0 && _maxGraceExtension == 0, "Disable all three together");
         } else {
             require(_gapThreshold >= 5 minutes,       "Gap threshold too short");
+            // Audit L-05: the heartbeat bot pings every few minutes; a gap of a
+            // day already treats a whole day's silence as normal running.
+            require(_gapThreshold <= 1 days,          "Gap threshold too long");
             require(_recoveryPeriod >= twapWindow,    "Recovery shorter than the TWAP window");
             require(_recoveryPeriod <= 1 days,        "Recovery period too long");
             require(_maxGraceExtension <= 7 days,     "Extension cap too long");

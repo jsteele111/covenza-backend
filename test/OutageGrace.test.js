@@ -195,6 +195,43 @@ describe("Item 16 — sequencer outages and the grace window", function () {
       expect(await registry.outageCount()).to.equal(0);
     });
 
+    it("Audit L-05: refuses a gap threshold above one day, and accepts exactly one day", async function () {
+      const { registry } = await loadFixture(stack);
+      await expect(registry.setOutageConfig(24 * HOUR + 1, HOUR, 72 * HOUR))
+        .to.be.revertedWith("Gap threshold too long");
+      await expect(registry.setOutageConfig(ethers.MaxUint256, HOUR, 72 * HOUR))
+        .to.be.revertedWith("Gap threshold too long");
+      await registry.setOutageConfig(24 * HOUR, HOUR, 72 * HOUR);
+      expect(await registry.outageGapThreshold()).to.equal(BigInt(24 * HOUR));
+    });
+
+    it("Audit L-05: an oversized gap already in storage no longer freezes the heartbeat or either settlement path", async function () {
+      const { registry, vault, lender, deadline } = await loadFixture(stack);
+      // The setter now refuses it, so write an oversized legacy value straight
+      // into the threshold's storage slot, found by a distinctive marker.
+      await registry.setOutageConfig(1234, HOUR, 72 * HOUR);
+      const addr = await registry.getAddress();
+      let slot = -1;
+      for (let i = 0; i < 200; i++) {
+        if (BigInt(await ethers.provider.getStorage(addr, i)) === 1234n) { slot = i; break; }
+      }
+      expect(slot).to.be.greaterThanOrEqual(0);
+      await ethers.provider.send("hardhat_setStorageAt", [addr, ethers.toQuantity(slot), ethers.toBeHex(ethers.MaxUint256, 32)]);
+      expect(await registry.outageGapThreshold()).to.equal(ethers.MaxUint256);
+
+      // last + MaxUint256 overflowed; elapsed time compared by subtraction does not.
+      await time.increase(HOUR);
+      await registry.heartbeat();
+      expect(await registry.outageCount()).to.equal(0);
+
+      // settleInKind() gets past its heartbeat to its own timing check...
+      await time.increaseTo(deadline + 1n);
+      await expect(vault.connect(lender).settleInKind()).to.be.revertedWith("In-kind settlement not yet open");
+      // ...and cash settlement completes.
+      await vault.connect(lender).settle();
+      expect(await vault.isSettled()).to.equal(true);
+    });
+
     it("Waits on the timelock when the registry has a delay", async function () {
       const [operator] = await ethers.getSigners();
       const reg = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
