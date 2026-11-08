@@ -613,6 +613,7 @@ contract Vault {
         _enforceEntryImpact(tokenOut, amountIn, amountOut, poolFee);
         _enforceExposureCap(tokenOut, poolFee);
         _enforceExitable(tokenOut, poolFee);
+        _enforceLossBudget();
 
         emit SwapExecuted(asset, tokenOut, amountIn, amountOut, false);
     }
@@ -680,6 +681,43 @@ contract Vault {
             value <= (principal * capBps) / 10000,
             "Exceeds exposure cap for this asset"
         );
+    }
+
+    /**
+     * @dev Audit M-04 (Zealynx). The deposit is a loan-wide budget for
+     *      trading losses, not just a balance each purchase must leave alone.
+     *
+     *      _enforceDepositInvariant() and the per-trade checks bound every
+     *      purchase and exit on its own, but nothing bounded their SUM. A
+     *      borrower who owned the pool's liquidity could round-trip the
+     *      principal through it dozens of times, every trade passing, until
+     *      fees and impact paid into their own position had consumed the
+     *      deposit and then the principal, the shortfall drawn from the
+     *      shared insurance reserve.
+     *
+     *      So after every purchase the vault values itself conservatively:
+     *      its loan-asset cash plus each holding at its exit floor (TWAP less
+     *      tolerance; an unpriceable holding counts as nothing). Starting
+     *      worth is principal plus deposit, so requiring the result to stay
+     *      at or above the principal caps realised plus unrealised trading
+     *      losses at the deposit. This is the same as tracking cost basis and
+     *      realised profit per asset, and it carries across exits to zero
+     *      and changes of asset without any extra record.
+     *
+     *      Purchases only. A sale at or above its floor cannot lower this
+     *      figure, and blocking it would trap a borrower trying to cut a
+     *      market loss; sales stay governed by the floor alone. Settlement,
+     *      including in-kind, is untouched. Interest is not protected by this
+     *      bound, and a later market move can still exceed the deposit.
+     */
+    function _enforceLossBudget() internal view {
+        uint256 worth = IERC20(asset).balanceOf(address(this));
+        uint256 keepBps = 10000 - registry.twapToleranceBps();
+        for (uint256 i = 0; i < heldAssets.length; i++) {
+            (bool priced, uint256 value) = _priceHeld(heldAssets[i]);
+            if (priced) { worth += (value * keepBps) / 10000; }
+        }
+        require(worth >= principal, "Trading losses would exceed the deposit");
     }
 
     /// @dev Carries the simulated exit output out of simulateExit()'s revert.
