@@ -995,7 +995,9 @@ contract Vault {
      *            assets are allocated before unpriceable ones.
      *         4. An asset with no TWAP at all (its pool is gone) cannot be
      *            valued, so the lender receives all of it if anything is still
-     *            owed, and the borrower receives it otherwise.
+     *            owed, and the borrower receives it otherwise. It does not
+     *            count against the claim, so while anything is owed EVERY
+     *            unpriceable asset goes to the lender (Q3B).
      *
      *         NO INSURANCE on this path (M-2). The lender receives the asset
      *         instead of a claim. Drawing on a shortfall measured at the TWAP of
@@ -1110,7 +1112,14 @@ contract Vault {
             if (stillOwed > 0) {
                 if (!priced || value <= stillOwed) {
                     toLender = amount;
-                    stillOwed = priced ? stillOwed - value : 0;
+                    // Q3B (Covenza policy, answering Zealynx's kickoff
+                    // question): an unpriceable asset does NOT reduce what is
+                    // still owed. It used to clear the claim, so the first
+                    // unpriceable asset went to the lender and every later one
+                    // to the borrower. The borrower took the risk that left
+                    // the vault holding assets nobody can value, so while any
+                    // claim remains the lender takes all of them.
+                    if (priced) { stillOwed -= value; }
                 } else {
                     // Audit I-02 (Zealynx): round the lender's share UP. The
                     // floor handed the borrower the unit that would have

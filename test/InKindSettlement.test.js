@@ -100,7 +100,7 @@ async function stack() {
     await time.increaseTo(await vault.inKindFrom());
   }
 
-  return { operator, lender, borrower, stranger, weth, usdx, router, uniPool, registry, pool, vault,
+  return { operator, lender, borrower, stranger, weth, usdx, router, uniFactory, uniPool, registry, pool, vault,
            breakTheSale, toInKindWindow };
 }
 
@@ -404,6 +404,97 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
       // Nothing is created or lost.
       expect((await stock.balanceOf(lender.address)) + (await stock.balanceOf(borrower.address))).to.equal(UNITS);
       expect(await stock.balanceOf(await vault.getAddress())).to.equal(0n);
+    });
+  });
+
+  // --- Q3B (Covenza's answer to Zealynx's kickoff question 3B) ---
+  //
+  // An unpriceable asset used to clear the lender's whole remaining claim, so
+  // with two of them the first went to the lender and the second to the
+  // borrower. It no longer counts against the claim: while anything is still
+  // owed, every unpriceable asset goes to the lender.
+  describe("Q3B — while anything is owed, every unpriceable asset goes to the lender", function () {
+    /** The usual 8 USDX position, plus 2 WETH of a second stock, USDY. */
+    async function twoAssets() {
+      const env = await loadFixture(stack);
+      const { operator, borrower, weth, router, uniFactory, registry, vault } = env;
+      const usdy = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock USDY", "USDY", 18);
+      const poolY = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
+      await uniFactory.setPool(await weth.getAddress(), await usdy.getAddress(), POOL_FEE, await poolY.getAddress());
+      await poolY.setAvgTick(0);
+      await router.setRate(await weth.getAddress(), await usdy.getAddress(), 1, 1);
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 1);
+      await usdy.mint(await router.getAddress(), E("1000"));
+      await registry.addAssetWithTier(await usdy.getAddress(), 0, 0);
+      await registry.setMinPoolLiquidity(await weth.getAddress(), await usdy.getAddress(), 1n);
+      await registry.setPoolFeeTier(await weth.getAddress(), await usdy.getAddress(), POOL_FEE);
+      await vault.connect(borrower).swap(await usdy.getAddress(), E("2"), 1, POOL_FEE);
+      return { ...env, usdy, poolY };
+    }
+
+    it("The finding: two unpriceable assets with a claim outstanding both go to the lender", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, uniPool, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      await uniPool.setMaxWindow(0);                     // neither pool can price its stock
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      // Cash of 1.5 WETH left the lender far short, so both go to the lender.
+      expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
+      expect(await usdy.balanceOf(lender.address)).to.equal(E("2"));
+      expect(await usdx.balanceOf(borrower.address)).to.equal(0n);
+      expect(await usdy.balanceOf(borrower.address)).to.equal(0n);
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);
+      expect(await vault.heldAssetCount()).to.equal(0n);
+    });
+
+    it("A priced asset that does not cover the claim goes to the lender, and the unpriceable one follows it", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();                               // USDX unsellable, still priced at 1:1
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      await poolY.setMaxWindow(0);                        // USDY cannot be priced
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      // Owed ~10.02 against 1.5 of cash: 8 USDX at 1:1 leaves ~0.52 owed, so
+      // the unpriceable USDY goes to the lender too.
+      expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
+      expect(await usdy.balanceOf(lender.address)).to.equal(E("2"));
+    });
+
+    it("Once a priced asset has covered the claim, the unpriceable one goes to the borrower", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, uniPool, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      // USDX's TWAP rises to ~2 WETH a unit: 8 USDX (~16) more than covers the ~8.52 still owed.
+      await uniPool.setAvgTick(tickFor(await usdx.getAddress(), await weth.getAddress(), 6932n));
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      expect(await usdx.balanceOf(lender.address)).to.be.greaterThan(0n);
+      expect(await usdx.balanceOf(borrower.address)).to.be.greaterThan(0n);    // priced split
+      expect(await usdy.balanceOf(borrower.address)).to.equal(E("2"));        // nothing left owed
+      expect(await usdy.balanceOf(lender.address)).to.equal(0n);
+    });
+
+    it("With nothing owed after the cash, every unpriceable asset goes to the borrower", async function () {
+      const { lender, borrower, usdx, usdy, uniPool, poolY, vault, toInKindWindow } = await twoAssets();
+      // Sell back almost everything: 1.5 + 7.9 + 1.9 = 11.3 WETH of cash, above what is owed.
+      await vault.connect(borrower).swapBack(await usdx.getAddress(), E("7.9"), 1);
+      await vault.connect(borrower).swapBack(await usdy.getAddress(), E("1.9"), 1);
+      await uniPool.setMaxWindow(0);
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      expect(await vault.settledLenderPayout()).to.equal(P + (await vault.settledFee()));
+      expect(await usdx.balanceOf(borrower.address)).to.equal(E("0.1"));
+      expect(await usdy.balanceOf(borrower.address)).to.equal(E("0.1"));
+      expect(await usdx.balanceOf(lender.address)).to.equal(0n);
+      expect(await usdy.balanceOf(lender.address)).to.equal(0n);
     });
   });
 });
