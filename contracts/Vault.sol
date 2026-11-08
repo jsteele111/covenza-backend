@@ -806,6 +806,14 @@ contract Vault {
         // the one the vault relies on, and the measured figure is what every
         // later check and the held-amount record use.
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+        // Audit M-03 (Zealynx): and what it actually spent. A Uniswap V3
+        // exact-input swap can stop at its price limit with part of amountIn
+        // unspent and still return enough to pass the floor; every caller
+        // then debits the FULL amount from its record, stranding the rest
+        // in the vault untracked. A partial fill reverts instead, before any
+        // record changes, so the holding stays whole for a full sale later
+        // or for in-kind settlement.
+        uint256 spentBefore = IERC20(tokenIn).balanceOf(address(this));
 
         ISwapRouter(router).exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -821,6 +829,7 @@ contract Vault {
 
         amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, "Received less than minimum");
+        require(spentBefore - IERC20(tokenIn).balanceOf(address(this)) == amountIn, "Swap did not spend the full amount");
     }
 
     /// @dev The tier is recorded once, at first entry, and never overwritten

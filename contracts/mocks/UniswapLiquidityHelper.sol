@@ -78,6 +78,18 @@ contract UniswapLiquidityHelper {
         );
     }
 
+    /// @notice Mints a position over [tickLower, tickUpper] only. Lets a test
+    ///         concentrate a pool's liquidity in a narrow band, so a large
+    ///         sale runs out of liquidity part-way (audit M-03).
+    function addRangeLiquidity(address pool, int24 tickLower, int24 tickUpper, uint128 liquidity)
+        external
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (amount0, amount1) = IUniswapV3PoolActions(pool).mint(
+            address(this), tickLower, tickUpper, liquidity, abi.encode(pool)
+        );
+    }
+
     /// @notice Burns `liquidity` of this contract's full-range position in
     ///         `pool` and collects the tokens back to this contract. Lets a
     ///         test empty a real pool (audit M-01).
