@@ -214,6 +214,7 @@ contract Vault {
 
     address[] public heldAssets;
     mapping(address => bool)   public isHeld;
+    mapping(address => uint256) public admittedToleranceBps; // audit M-02: tolerance the holding's full exit last passed at
     mapping(address => uint24) public swapFeeTierOf;  // pool fee tier recorded at first entry; every later swap in or out of the asset uses it
 
     /// @notice How much of each held asset this vault BOUGHT, measured by
@@ -708,21 +709,31 @@ contract Vault {
      */
     function _enforceExitable(address held, uint24 feeTier) internal {
         uint256 amount = heldAmount[held];
-        uint256 floorOut = _exitFloor(held, amount, feeTier);
+        uint256 tolerance = registry.twapToleranceBps();
+        uint256 floorOut = _exitFloorAt(held, amount, feeTier, tolerance);
 
-        uint256 simulatedOut;
+        require(_simulateExitOut(held, amount, feeTier) >= floorOut,
+            "Position too large to exit within tolerance");
+
+        // Audit M-02: remember the tolerance this whole position was shown
+        // to clear, so settleInKind() can tell a pool that cannot take the
+        // sale from one blocked only by a later, stricter policy. A top-up
+        // updates it only here, after passing the same check.
+        admittedToleranceBps[held] = tolerance;
+    }
+
+    /// @dev Output of a full exit of `amount` of `held`, performed and then
+    ///      undone by simulateExit(). Any revert other than ExitQuote (the
+    ///      pool could not take the trade at all) counts as an exit of zero.
+    function _simulateExitOut(address held, uint256 amount, uint24 feeTier) internal returns (uint256 simulatedOut) {
         try this.simulateExit(held, amount, feeTier) {
             // simulateExit always reverts; reaching here would mean it did not.
             revert("Exit simulation did not revert");
         } catch (bytes memory reason) {
-            // Any revert other than ExitQuote (the pool could not take the
-            // trade at all) counts as an exit of zero.
             if (reason.length == 36 && bytes4(reason) == ExitQuote.selector) {
                 assembly { simulatedOut := mload(add(reason, 36)) }
             }
         }
-
-        require(simulatedOut >= floorOut, "Position too large to exit within tolerance");
     }
 
     /**
@@ -830,6 +841,7 @@ contract Vault {
         if (heldAmount[_asset] == 0 && isHeld[_asset]) {
             isHeld[_asset] = false;
             delete swapFeeTierOf[_asset];
+            delete admittedToleranceBps[_asset];
             for (uint256 i = 0; i < heldAssets.length; i++) {
                 if (heldAssets[i] == _asset) {
                     heldAssets[i] = heldAssets[heldAssets.length - 1];
@@ -974,6 +986,11 @@ contract Vault {
                 // A sale that failed for lack of gas must not be read as an
                 // asset that cannot be sold (63/64 rule; Solodit SOL-Heuristics-5).
                 if (gasleft() <= gasBefore / 63) { revert("Out of gas"); }
+                // Audit M-02: nor may a sale that failed only because the
+                // tolerance was tightened after entry. The pool can still
+                // take it, so this is a cash settlement waiting for the
+                // setting to be restored, with its insurance waterfall.
+                require(!_blockedOnlyByTightening(held), "Sale blocked only by a tightened tolerance - use settle()");
             }
         }
 
@@ -1225,6 +1242,7 @@ contract Vault {
         heldAmount[held] = 0;
         isHeld[held] = false;
         delete swapFeeTierOf[held];
+        delete admittedToleranceBps[held];
         heldAssets.pop();
     }
 
@@ -1232,6 +1250,13 @@ contract Vault {
     ///      TWAP-implied value less twapToleranceBps. One floor for every exit
     ///      path — voluntary swap-back, the exit simulation, and settlement.
     function _exitFloor(address held, uint256 amount, uint24 feeTier) internal view returns (uint256) {
+        return _exitFloorAt(held, amount, feeTier, registry.twapToleranceBps());
+    }
+
+    /// @dev _exitFloor() at a given tolerance.
+    function _exitFloorAt(address held, uint256 amount, uint24 feeTier, uint256 toleranceBps)
+        internal view returns (uint256)
+    {
         // Audit M-01 (Zealynx): refuse a floor set by a pool that held too
         // little liquidity across the window. An empty pool keeps reporting
         // the tick it was left at, so whoever emptied it chose the floor.
@@ -1241,7 +1266,40 @@ contract Vault {
         uint256 twapOut = UniswapTwap.quote(
             registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
         );
-        return (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+        return (twapOut * (10000 - toleranceBps)) / 10000;
+    }
+
+    /**
+     * @dev Audit M-02 (Zealynx). Whether a held asset whose sale just failed
+     *      in settleInKind() could in fact be sold at the tolerance its whole
+     *      position was admitted under, in its pinned pool.
+     *
+     *      Only a tolerance tightened since admission can make a sellable
+     *      position fail; a tighter floor than the pool's own fee (1 bp
+     *      against a 30 bp pool) fails every sale. Such a position is not
+     *      "unsold" in the sense in-kind settlement exists for, and closing
+     *      it in kind forgoes the insurance a cash settle() would draw.
+     *
+     *      False whenever the pool genuinely cannot price or take the sale:
+     *      no TWAP, too thin over the window (M-01), or a simulated exit
+     *      below the admitted floor. Those still close in kind.
+     */
+    function _blockedOnlyByTightening(address held) internal returns (bool) {
+        uint256 admitted = admittedToleranceBps[held];
+        if (registry.twapToleranceBps() >= admitted) { return false; }
+
+        uint256 amount = _sellableAmount(held);
+        uint24 feeTier = swapFeeTierOf[held];
+        if (amount == 0) { return false; }
+        if (!UniswapTwap.canQuote(registry.uniswapFactory(), held, asset, feeTier, registry.twapWindow())) { return false; }
+        if (!_poolDeepEnough(held, feeTier)) { return false; }
+
+        uint256 floorOut = _exitFloorAt(held, amount, feeTier, admitted);
+        uint256 gasBefore = gasleft();
+        uint256 out = _simulateExitOut(held, amount, feeTier);
+        // As above: an exit that failed for lack of gas proves nothing.
+        if (out == 0 && gasleft() <= gasBefore / 63) { revert("Out of gas"); }
+        return out >= floorOut;
     }
 
     /// @dev Whether the pair's pool held at least the registry's minimum
