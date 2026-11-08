@@ -449,7 +449,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         for (uint256 i = h.length; i > 0; i--) {
             TierChange storage c = h[i - 1];
             if (uint8(c.tier) > uint8(worst)) { worst = c.tier; }
-            if (c.at <= _since) { break; }
+            // Audit L-02 (Zealynx): strictly before. A re-tag in the SAME
+            // block as origination shares its timestamp, and stopping at it
+            // skipped the tier the asset held when the loan was written, so
+            // a same-block downgrade from Speculative admitted the asset to an
+            // older Blue chip loan. Reading on to the last entry strictly
+            // before `_since` includes it. A re-tag earlier in the origination
+            // block is then also counted, which only ever errs strict.
+            if (c.at < _since) { break; }
         }
         return worst;
     }

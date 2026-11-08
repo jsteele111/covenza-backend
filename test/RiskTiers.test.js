@@ -447,4 +447,75 @@ describe("Risk tiers", function () {
       originate(SPECULATIVE, { term: 30 * DAY })
     ).to.be.revertedWith("Term exceeds the maximum for this risk tier");
   });
+
+  // --- Audit L-02 (Zealynx): a re-tag in the origination block ---
+  //
+  // Tier history is timestamped, and two transactions in one block share a
+  // timestamp. highestTierSince stopped at the first entry at or before
+  // origination, so a downgrade mined in the SAME block as the loan hid the
+  // tier the asset held when the loan was written.
+
+  describe("Audit L-02 — a same-block re-tag cannot admit a riskier asset to an older loan", function () {
+    /** Sends each transaction with automine off, then mines them all into ONE block, in order. */
+    async function inOneBlock(sends) {
+      await ethers.provider.send("evm_setAutomine", [false]);
+      try {
+        for (const send of sends) { await send(); }
+        await ethers.provider.send("evm_mine", []);
+      } finally {
+        await ethers.provider.send("evm_setAutomine", [true]);
+      }
+    }
+
+    /** A Blue chip loan whose origination and the re-tag of meme to Blue chip share a block. */
+    async function originateWithRetag(env, retagFirst) {
+      const { lender, borrower, usdx, registry, factory, meme } = env;
+      await usdx.mint(lender.address, PRINCIPAL + E("1"));
+      await usdx.connect(lender).approve(await factory.getAddress(), PRINCIPAL + E("1"));
+      const before = await factory.totalVaults();
+
+      const originateTx = () => factory.connect(lender).deployVaultWithTier(
+        usdx.getAddress(), borrower.address, PRINCIPAL, APR_BPS, 30 * DAY, true, DEPOSIT,
+        ethers.ZeroAddress, BLUE_CHIP, { gasLimit: 3_000_000 });
+      const retagTx = () => registry.setTier(meme.getAddress(), BLUE_CHIP, { gasLimit: 300_000 });
+      await inOneBlock(retagFirst ? [retagTx, originateTx] : [originateTx, retagTx]);
+
+      const vault = await ethers.getContractAt("Vault", await factory.allVaults(before));
+      expect(await registry.tierOf(meme.getAddress())).to.equal(BLUE_CHIP);
+      const block = await ethers.provider.getBlock("latest");
+      expect(await vault.originatedAt()).to.equal(BigInt(block.timestamp));   // same block, same second
+
+      await usdx.mint(borrower.address, DEPOSIT);
+      await usdx.connect(borrower).approve(await vault.getAddress(), DEPOSIT);
+      await vault.connect(borrower).payDeposit();
+      return vault;
+    }
+
+    it("The finding: origination, then a downgrade to Blue chip in the same block — the asset is still refused", async function () {
+      const env = await loadFixture(fixture);
+      const vault = await originateWithRetag(env, false);
+      expect(await env.registry.highestTierSince(env.meme.getAddress(), await vault.originatedAt())).to.equal(SPECULATIVE);
+      await expect(vault.connect(env.borrower).swap(env.meme.getAddress(), E("1"), E("0.9"), POOL_FEE))
+        .to.be.revertedWith("Asset exceeds this vault's risk mandate");
+    });
+
+    it("The other order: a downgrade earlier in the origination block is also counted (errs strict)", async function () {
+      const env = await loadFixture(fixture);
+      const vault = await originateWithRetag(env, true);
+      await expect(vault.connect(env.borrower).swap(env.meme.getAddress(), E("1"), E("0.9"), POOL_FEE))
+        .to.be.revertedWith("Asset exceeds this vault's risk mandate");
+    });
+
+    it("A downgrade in a later block is refused, and a loan written in a later block accepts the asset", async function () {
+      const { originate, borrower, registry, meme } = await loadFixture(fixture);
+      const older = await originate(BLUE_CHIP);
+      await registry.setTier(meme.getAddress(), BLUE_CHIP);
+      await expect(older.connect(borrower).swap(meme.getAddress(), E("1"), E("0.9"), POOL_FEE))
+        .to.be.revertedWith("Asset exceeds this vault's risk mandate");
+
+      const newer = await originate(BLUE_CHIP);
+      await newer.connect(borrower).swap(meme.getAddress(), E("1"), E("0.9"), POOL_FEE);
+      expect(await newer.isHeld(meme.getAddress())).to.equal(true);
+    });
+  });
 });
