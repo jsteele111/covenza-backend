@@ -340,11 +340,11 @@ describe("Mandates", function () {
     const id = await publish();
 
     // Offer is 200; allowance 1000; balance 1000. Offer binds.
-    expect(await factory.quoteMandateFillable(id)).to.equal(E("200"));
+    expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(E("200"));
 
     // Drop the allowance below the offer and it binds instead.
     await usdx.connect(lender).approve(factoryAddr, E("50"));
-    expect(await factory.quoteMandateFillable(id)).to.equal(E("50"));
+    expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(E("50"));
   });
 
   it("Reports zero fillable once the allowance is revoked", async function () {
@@ -355,7 +355,7 @@ describe("Mandates", function () {
     // moment. A book showing intent rather than capacity is a book of offers
     // that cannot be taken.
     await usdx.connect(lender).approve(factoryAddr, 0);
-    expect(await factory.quoteMandateFillable(id)).to.equal(0);
+    expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(0);
   });
 
   // --- Filling ---
@@ -518,7 +518,7 @@ describe("Mandates", function () {
     await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
     await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
     expect(await factory.mandateRemaining(id)).to.equal(E("50"));
-    expect(await factory.quoteMandateFillable(id)).to.equal(E("50"));
+    expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(E("50"));
 
     // A third full-size loan no longer fits...
     await expect(
@@ -528,7 +528,7 @@ describe("Mandates", function () {
     // ...but the remainder can still be taken.
     await factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"), ethers.MaxUint256);
     expect(await factory.mandateRemaining(id)).to.equal(0);
-    expect(await factory.quoteMandateFillable(id)).to.equal(0);
+    expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(0);
   });
 
   it("A fill that fails uses up none of the capacity", async function () {
@@ -589,6 +589,113 @@ describe("Mandates", function () {
     it("Refuses a ceiling above 100%", async function () {
       const { publish } = await loadFixture(fixture);
       await expect(publish({ maxInsuranceSkimRateBps: 10001 })).to.be.revertedWith("Skim ceiling above 100%");
+    });
+  });
+
+  // --- Audit L-04 (Zealynx): what can actually be filled ---
+  //
+  // quoteMandateFillable returned the smaller of lender liquidity and the
+  // remaining offer. It ignored the mandate's minimum principal (a remainder
+  // too small to fill was advertised) and the insurance skim the lender pays on
+  // top of principal (an allowance of exactly the principal was advertised as
+  // fillable). It is now quoteMandatePrincipalCapacity, an upper bound that is
+  // zero when nothing can be filled, and previewMandateFill answers for a
+  // specific principal, term and deposit.
+
+  describe("Audit L-04 — the fill preview matches what fillMandate will do", function () {
+    const OK = 0n, PRINCIPAL_BOUNDS = 3n, CAPACITY = 4n, TERM_BOUNDS = 5n, DEPOSIT_MANDATE = 6n,
+          SKIM_LIMIT = 7n, SAME_PARTY = 8n, BORROWER_KYC = 9n, LENDER_FUNDS = 13n;
+
+    const preview = (factory, id, who, principal, days, deposit) =>
+      factory.previewMandateFill(id, who.address, principal, days * DAY, true, deposit);
+
+    it("The finding: a 50 remainder under a 60 minimum is no longer advertised, and the preview says why", async function () {
+      const { publish, factory, borrower } = await loadFixture(fixture);
+      const id = await publish({ minPrincipal: E("60"), maxPrincipal: E("100"), totalCapacity: E("150") });
+      await factory.connect(borrower).fillMandate(id, E("100"), 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+      expect(await factory.mandateRemaining(id)).to.equal(E("50"));
+
+      expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(0n);           // was 50
+      expect((await preview(factory, id, borrower, E("50"), 30, E("10"))).code).to.equal(PRINCIPAL_BOUNDS);
+      expect((await preview(factory, id, borrower, E("60"), 30, E("12"))).code).to.equal(CAPACITY);
+      await expect(factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"), ethers.MaxUint256))
+        .to.be.revertedWith("Principal outside the mandate's bounds");
+    });
+
+    it("A 50 remainder under a 50 minimum is advertised, previews as fillable, and fills", async function () {
+      const { publish, factory, borrower } = await loadFixture(fixture);
+      const id = await publish({ minPrincipal: E("50"), maxPrincipal: E("100"), totalCapacity: E("150") });
+      await factory.connect(borrower).fillMandate(id, E("100"), 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+
+      expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(E("50"));
+      const p = await preview(factory, id, borrower, E("50"), 30, E("10"));
+      expect(p.code).to.equal(OK);
+      await factory.connect(borrower).fillMandate(id, E("50"), 30 * DAY, true, E("10"), ethers.MaxUint256);
+      expect(await factory.mandateRemaining(id)).to.equal(0n);
+    });
+
+    it("The skim: an allowance of exactly the principal previews as short; principal plus skim fills, debiting exactly that", async function () {
+      const { publish, factory, borrower, lender, usdx, factoryAddr } = await loadFixture(fixture);
+      await factory.setInsuranceSkimRateBps(10000);                 // 100% of the full-term fee
+      const id = await publish({ maxInsuranceSkimRateBps: 10000 });
+
+      await usdx.connect(lender).approve(factoryAddr, PRINCIPAL);
+      const short = await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT);
+      expect(short.code).to.equal(LENDER_FUNDS);
+      expect(short.lenderDebit).to.be.greaterThan(PRINCIPAL);
+      expect(await factory.quoteMandatePrincipalCapacity(id)).to.equal(PRINCIPAL);   // an upper bound only
+      await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
+        .to.be.reverted;
+
+      await usdx.connect(lender).approve(factoryAddr, short.lenderDebit);
+      const ok = await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT);
+      expect(ok.code).to.equal(OK);
+      expect(ok.lenderDebit).to.equal(short.lenderDebit);
+      const before = await usdx.balanceOf(lender.address);
+      await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
+      expect(before - (await usdx.balanceOf(lender.address))).to.equal(ok.lenderDebit);
+    });
+
+    it("The term: an allowance that covers a one-day skim previews the one-day fill as fillable and the 30-day fill as short", async function () {
+      const { publish, factory, borrower, lender, usdx, factoryAddr } = await loadFixture(fixture);
+      await factory.setInsuranceSkimRateBps(10000);
+      const id = await publish({ maxInsuranceSkimRateBps: 10000 });
+
+      const oneDay = await preview(factory, id, borrower, PRINCIPAL, 1, DEPOSIT);
+      await usdx.connect(lender).approve(factoryAddr, oneDay.lenderDebit);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 1, DEPOSIT)).code).to.equal(OK);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT)).code).to.equal(LENDER_FUNDS);
+
+      await expect(factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256))
+        .to.be.reverted;
+      await factory.connect(borrower).fillMandate(id, PRINCIPAL, DAY, true, DEPOSIT, ethers.MaxUint256);
+    });
+
+    it("The balance counts as well as the allowance", async function () {
+      const { publish, factory, borrower, lender, outsider, usdx } = await loadFixture(fixture);
+      await factory.setInsuranceSkimRateBps(10000);
+      const id = await publish({ maxInsuranceSkimRateBps: 10000 });
+      const need = (await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT)).lenderDebit;
+
+      await usdx.connect(lender).transfer(outsider.address, (await usdx.balanceOf(lender.address)) - need + 1n);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT)).code).to.equal(LENDER_FUNDS);
+      await usdx.connect(outsider).transfer(lender.address, 1n);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT)).code).to.equal(OK);
+    });
+
+    it("Reports the other refusals fillMandate would make, and the APR it would charge", async function () {
+      const { publish, factory, borrower, lender } = await loadFixture(fixture);
+      const id = await publish();
+      const ok = await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT);
+      expect(ok.code).to.equal(OK);
+      expect(ok.aprBps).to.equal(910n);                              // the formula's 30-day, 20% price
+      expect((await preview(factory, id, borrower, PRINCIPAL, 31, DEPOSIT)).code).to.equal(TERM_BOUNDS);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 30, E("1"))).code).to.equal(DEPOSIT_MANDATE);
+      expect((await preview(factory, id, lender, PRINCIPAL, 30, DEPOSIT)).code).to.equal(SAME_PARTY);
+      const stranger = (await ethers.getSigners())[12];             // never verified
+      expect((await preview(factory, id, stranger, PRINCIPAL, 30, DEPOSIT)).code).to.equal(BORROWER_KYC);
+      await factory.setInsuranceSkimRateBps(1);
+      expect((await preview(factory, id, borrower, PRINCIPAL, 30, DEPOSIT)).code).to.equal(SKIM_LIMIT);
     });
   });
 });
