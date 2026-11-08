@@ -788,43 +788,53 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      *         outages recorded so far.
      * @param  _deadline  The loan's deadline.
      * @param  _graceEnd  The grace end before any extension.
-     * @return graceEnd   `_graceEnd` extended by the outage time that fell after
-     *                    the deadline and within the (extended) window, capped
-     *                    at maxGraceExtension.
+     * @return graceEnd   `_graceEnd` pushed back by every outage that ate into
+     *                    the window, so the parties get the grace period's full
+     *                    length of LIVE chain after the deadline; capped at
+     *                    maxGraceExtension.
      * @return keeperFrom The earliest moment a keeper may settle: the extended
      *                    grace end, or the end of the latest outage plus the
      *                    recovery period, whichever is later. The keeper bounty
      *                    accrues from here.
      *
-     * @dev    Only outages that end after the deadline and start before
-     *         `_graceEnd + maxGraceExtension` (the horizon) can extend the
-     *         window. Outages are recorded in time order and never overlap, so
-     *         these form one contiguous run: a binary search finds where the run
-     *         ends, and the walk goes backwards from there, stopping at the first
-     *         outage that ended on or before the deadline. Cost is logarithmic in
-     *         the outages recorded after the horizon (audit L-4).
+     * @dev    Audit I-01 (Zealynx). An outage extends grace only if it begins
+     *         before the window, as extended so far, has ended. Outages are
+     *         recorded in time order and never overlap, so they are walked
+     *         forwards from the first that ends after the deadline, each one
+     *         that starts inside the window pushing its end back by the time
+     *         it took after the deadline, until one starts after the window's
+     *         end. Previously every outage before a horizon of grace end plus
+     *         the cap counted, so an outage after grace had ended, which cost
+     *         the parties nothing, still postponed the lender's in-kind exit.
+     *         An outage spanning the grace end still restores all the time the
+     *         parties lost; one wholly after it now restores none. keeperFrom
+     *         is unchanged: keepers wait out the recovery of any outage.
+     *
+     *         Cost: a binary search finds the first outage ending after the
+     *         deadline, and the walk stops at the first outage after the
+     *         window, so outages recorded later cost nothing (audit L-4).
      */
     function settlementWindow(uint256 _deadline, uint256 _graceEnd)
         external view returns (uint256 graceEnd, uint256 keeperFrom)
     {
-        uint256 ext;
         uint256 n = _outages.length;
-        uint256 horizon = _graceEnd + maxGraceExtension;
+        uint256 cap = _graceEnd + maxGraceExtension;
 
-        // First outage starting at or after the horizon (or n if none).
+        // First outage ending after the deadline (or n if none).
         uint256 lo = 0;
         uint256 hi = n;
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
-            if (_outages[mid].start < horizon) { lo = mid + 1; } else { hi = mid; }
+            if (_outages[mid].end <= _deadline) { lo = mid + 1; } else { hi = mid; }
         }
-        for (uint256 i = lo; i > 0; i--) {
-            Outage storage o = _outages[i - 1];
-            if (o.end <= _deadline) { break; }
-            ext += o.end - (o.start > _deadline ? o.start : _deadline);
+
+        graceEnd = _graceEnd;
+        for (uint256 i = lo; i < n; i++) {
+            Outage storage o = _outages[i];
+            if (o.start >= graceEnd) { break; }
+            graceEnd += o.end - (o.start > _deadline ? o.start : _deadline);
+            if (graceEnd >= cap) { graceEnd = cap; break; }
         }
-        if (ext > maxGraceExtension) { ext = maxGraceExtension; }
-        graceEnd = _graceEnd + ext;
 
         keeperFrom = graceEnd;
         if (n > 0) {

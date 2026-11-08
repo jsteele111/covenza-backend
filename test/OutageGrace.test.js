@@ -179,6 +179,50 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     expect(keeperFrom).to.equal(graceEnd);
   });
 
+  // --- Audit I-01 (Zealynx): only outages that eat into the window extend it ---
+  //
+  // Every outage before grace end plus the cap used to extend grace, including
+  // one that began after grace had already ended and so cost the parties
+  // nothing. That postponed the lender's in-kind exit for no reason. Grace now
+  // ends when the parties have had its full length of LIVE chain.
+
+  it("Audit I-01: an outage wholly after grace no longer postpones grace or the lender's in-kind exit", async function () {
+    const { registry, vault, deadline, graceEnd } = await loadFixture(stack);
+    await botRunsUntil(registry, graceEnd + BigInt(2 * HOUR));   // grace over, chain live throughout
+    await time.increase(7 * HOUR);                               // then a 7h outage
+    await registry.heartbeat();
+    const [, end] = await registry.outageAt(0);
+
+    const [extended, keeperFrom] = await registry.settlementWindow(deadline, graceEnd);
+    expect(extended).to.equal(graceEnd);                         // previously graceEnd + 7h
+    expect(keeperFrom).to.equal(end + BigInt(HOUR));             // keepers still wait out recovery
+    expect(await vault.inKindFrom()).to.equal(graceEnd + BigInt(7 * 24 * HOUR));
+  });
+
+  it("Audit I-01: outages that start inside the window, as extended so far, each restore their time; a later one restores none", async function () {
+    const { registry, deadline, graceEnd } = await loadFixture(stack);
+    await botRunsUntil(registry, graceEnd - BigInt(HOUR));
+    await time.increase(3 * HOUR);                               // spans the original grace end
+    await registry.heartbeat();
+    const [s1, e1] = await registry.outageAt(0);
+
+    await botRunsUntil(registry, e1 + BigInt(30 * MIN));         // window now ends at graceEnd + 3h
+    await time.increase(2 * HOUR);                               // starts inside the extended window
+    await registry.heartbeat();
+    const [s2, e2] = await registry.outageAt(1);
+    expect(s2).to.be.lessThan(graceEnd + (e1 - s1));
+
+    const [afterTwo] = await registry.settlementWindow(deadline, graceEnd);
+    expect(afterTwo).to.equal(graceEnd + (e1 - s1) + (e2 - s2));
+
+    await botRunsUntil(registry, afterTwo + BigInt(HOUR));        // window has ended
+    await time.increase(HOUR);                                   // starts after it
+    await registry.heartbeat();
+    expect(await registry.outageCount()).to.equal(3);
+    const [afterThree] = await registry.settlementWindow(deadline, graceEnd);
+    expect(afterThree).to.equal(afterTwo);
+  });
+
   describe("Configuration", function () {
     it("Refuses a recovery period shorter than the TWAP window", async function () {
       const { registry } = await loadFixture(stack);
