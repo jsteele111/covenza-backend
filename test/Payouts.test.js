@@ -251,6 +251,72 @@ describe("Audit M-1 — a payout the token refuses is deferred, not fatal", func
       await expect(pool.connect(lender).claimDeferredDraw(await usdc.getAddress())).to.be.revertedWith("Nothing deferred");
     });
 
+    // Audit L-06's own scenario: a CASH-ONLY vault. The loan bought TOK and
+    // sold it all back at a loss, so nothing is held and settleInKind() offers
+    // no way out. Before Q8 a refused pool transfer reverted settle() and the
+    // lender received none of the cash the vault did hold.
+    async function cashOnlyStack() {
+      const env = await loadFixture(stack);
+      const { operator, borrower, usdc, tok, vault, router, uniPool, pool } = env;
+      await usdc.mint(operator.address, RESERVE);
+      await usdc.approve(await pool.getAddress(), RESERVE);
+      await pool.fund(await usdc.getAddress(), RESERVE);
+      await vault.connect(borrower).swap(await tok.getAddress(), U("9000"), 1, FEE);
+
+      await router.setRate(await tok.getAddress(), await usdc.getAddress(), 1, 2);
+      const half = BigInt((await tok.getAddress()).toLowerCase()) < BigInt((await usdc.getAddress()).toLowerCase()) ? -6932n : 6932n;
+      await uniPool.setAvgTick(half);
+      await vault.connect(borrower).swapBack(await tok.getAddress(), U("9000"), 1);   // 3,000 + 4,500 = 7,500 cash
+      await time.increaseTo((await vault.deadline()) + 1n);
+      const reserve = await pool.reserveOf(await usdc.getAddress());
+      return { ...env, reserve };
+    }
+
+    it("L-06: a cash-only vault settles while the pool is blocked, and every token is accounted for", async function () {
+      const { lender, borrower, usdc, tok, vault, pool, reserve } = await cashOnlyStack();
+      expect(await vault.heldAmount(await tok.getAddress())).to.equal(0n);
+      expect(await usdc.balanceOf(await vault.getAddress())).to.equal(U("7500"));
+      await expect(vault.connect(lender).settleInKind()).to.be.revertedWith("Nothing held - use settle()");
+
+      await usdc.setBlacklisted(await pool.getAddress(), true);           // the issuer blocks the pool
+      const poolBalance = await usdc.balanceOf(await pool.getAddress());
+      const before = await usdc.balanceOf(lender.address);
+      await vault.connect(lender).settle();
+
+      // Payout conservation: the vault paid out exactly its cash plus the
+      // insurance that actually arrived (none), and kept nothing.
+      expect(await vault.settledTotalReturned()).to.equal(U("7500"));
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);
+      expect(await usdc.balanceOf(lender.address) - before).to.equal(U("7500"));
+      expect(await usdc.balanceOf(borrower.address)).to.equal(0n);
+      expect(await usdc.balanceOf(await vault.getAddress())).to.equal(0n);
+
+      // Reserve conservation: the allocated draw left the reserve and is held
+      // for the lender; the pool's tokens are exactly reserve plus that claim.
+      expect(await vault.settledInsuranceDeferred()).to.equal(U("1000"));
+      expect(await pool.deferredDrawOf(await usdc.getAddress(), lender.address)).to.equal(U("1000"));
+      expect(await pool.reserveOf(await usdc.getAddress())).to.equal(reserve - U("1000"));
+      expect(await usdc.balanceOf(await pool.getAddress())).to.equal(poolBalance);
+      expect(await pool.reserveOf(await usdc.getAddress()) + await pool.deferredDrawOf(await usdc.getAddress(), lender.address))
+        .to.equal(poolBalance);
+
+      // Once the block lifts the lender collects it, and the lender's total
+      // equals what an unblocked settlement would have paid.
+      await usdc.setBlacklisted(await pool.getAddress(), false);
+      await pool.connect(lender).claimDeferredDraw(await usdc.getAddress());
+      expect(await usdc.balanceOf(lender.address) - before).to.equal(U("8500"));
+    });
+
+    it("L-06 control: the same cash-only vault with the pool unblocked pays the same 8,500 at settlement", async function () {
+      const { lender, usdc, vault, pool, reserve } = await cashOnlyStack();
+      const before = await usdc.balanceOf(lender.address);
+      await vault.connect(lender).settle();
+      expect(await vault.settledInsuranceDraw()).to.equal(U("1000"));
+      expect(await vault.settledInsuranceDeferred()).to.equal(0n);
+      expect(await usdc.balanceOf(lender.address) - before).to.equal(U("8500"));
+      expect(await pool.reserveOf(await usdc.getAddress())).to.equal(reserve - U("1000"));
+    });
+
     it("Nobody else can claim the lender's deferred insurance", async function () {
       const { lender, keeper, usdc, vault, pool } = await lossStack();
       await usdc.setBlacklisted(await pool.getAddress(), true);

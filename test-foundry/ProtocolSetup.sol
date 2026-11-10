@@ -7,8 +7,8 @@ import {Vault} from "../contracts/Vault.sol";
 import {VaultFactory} from "../contracts/VaultFactory.sol";
 import {AssetRegistry} from "../contracts/AssetRegistry.sol";
 import {InsurancePool} from "../contracts/InsurancePool.sol";
-import {MockERC20} from "../contracts/mocks/MockERC20.sol";
 import {MockFreezableToken} from "../contracts/mocks/MockFreezableToken.sol";
+import {MockSenderBlockToken} from "../contracts/mocks/MockSenderBlockToken.sol";
 import {MockSwapRouter} from "../contracts/mocks/MockSwapRouter.sol";
 import {MockUniswapV3Factory, MockUniswapV3Pool} from "../contracts/mocks/MockUniswapV3.sol";
 import {MockIdentityAdapter} from "../contracts/mocks/MockIdentityAdapter.sol";
@@ -36,7 +36,7 @@ abstract contract ProtocolSetup is Test {
     VaultFactory internal factory;
     AssetRegistry internal registry;
     InsurancePool internal pool;
-    MockERC20 internal weth;
+    MockSenderBlockToken internal weth;   // the issuer can block the pool as a sender (audit L-06)
     MockFreezableToken internal usdx;
     MockSwapRouter internal router;
     MockUniswapV3Pool internal uniPool;
@@ -52,7 +52,7 @@ abstract contract ProtocolSetup is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
 
-        weth = new MockERC20("Mock WETH", "WETH", 18);
+        weth = new MockSenderBlockToken("Mock WETH", "WETH", 18);
         usdx = new MockFreezableToken("Mock USDX", "USDX", 18);
 
         router = new MockSwapRouter();
