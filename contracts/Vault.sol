@@ -710,14 +710,35 @@ contract Vault {
      *      market loss; sales stay governed by the floor alone. Settlement,
      *      including in-kind, is untouched. Interest is not protected by this
      *      bound, and a later market move can still exceed the deposit.
+     *
+     *      Audit M-07 (Zealynx): the same pass enforces an exposure BUDGET
+     *      across all holdings. _enforceExposureCap() checks only the asset
+     *      just bought, so a Standard vault could hold two Standard assets at
+     *      their 50% caps — twice the single exposure the deposit and premium
+     *      were priced on. Each holding now uses value / (its cap x principal)
+     *      of one shared budget, which may not exceed 100%. A vault can still
+     *      fill its tier's cap in one asset; putting part of the budget into
+     *      a safer asset (a higher cap) lets more of the principal be invested,
+     *      never more risk. That holds while every safer tier's cap times its
+     *      assumed volatility stays at or below the riskier tier's — a
+     *      calibration rule for the operator. The cap read is the riskiest
+     *      tier each asset has held since origination, as for the single-asset
+     *      check. A holding that cannot be valued, or whose cap is zero, blocks
+     *      purchases until it is sold or reprices; sales are never blocked.
      */
     function _enforceLossBudget() internal view {
         uint256 worth = IERC20(asset).balanceOf(address(this));
+        uint256 used;   // exposure budget used, in principal units
         uint256 keepBps = 10000 - registry.twapToleranceBps();
         for (uint256 i = 0; i < heldAssets.length; i++) {
-            (bool priced, uint256 value) = _priceHeld(heldAssets[i]);
-            if (priced) { worth += (value * keepBps) / 10000; }
+            address held = heldAssets[i];
+            (bool priced, uint256 value) = _priceHeld(held);
+            uint256 capBps = registry.maxExposureBpsSince(held, originatedAt);
+            require(priced && (capBps > 0 || value == 0), "Holdings exceed exposure budget");
+            if (capBps > 0) { used += (value * 10000 + capBps - 1) / capBps; }
+            worth += (value * keepBps) / 10000;
         }
+        require(used <= principal, "Holdings exceed exposure budget");
         require(worth >= principal, "Trading losses would exceed the deposit");
     }
 

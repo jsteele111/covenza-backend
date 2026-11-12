@@ -1,5 +1,5 @@
 const { expect } = require("chai");
-const { loadFixture } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
+const { loadFixture, time } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 const { ethers } = require("hardhat");
 
 /**
@@ -39,6 +39,7 @@ describe("Risk tiers", function () {
     const weth = await Mock.deploy("Mock WETH", "WETH", 18);   // blue chip
     const aapl = await Mock.deploy("Mock AAPL", "AAPL", 18);   // standard
     const meme = await Mock.deploy("Mock MEME", "MEME", 18);   // speculative
+    const nvda = await Mock.deploy("Mock NVDA", "NVDA", 18);   // a second standard asset (audit M-07)
 
     const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
     const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
@@ -47,7 +48,7 @@ describe("Risk tiers", function () {
     // execution and TWAP can be made to DISAGREE — which is what makes the
     // entry-impact check testable at all.
     const pools = {};
-    for (const t of [weth, aapl, meme]) {
+    for (const t of [weth, aapl, meme, nvda]) {
       const p = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
       await p.setAvgTick(0);
       await uniFactory.setPool(await usdx.getAddress(), await t.getAddress(), POOL_FEE, await p.getAddress());
@@ -67,7 +68,7 @@ describe("Risk tiers", function () {
       operator.address, await router.getAddress(),
       await uniFactory.getAddress(), 0
     );
-    for (const t of [usdx, weth, aapl, meme]) {
+    for (const t of [usdx, weth, aapl, meme, nvda]) {
       await registry.addAsset(await t.getAddress(), 0);
     }
     await registry.setSettlementConfig(1800, 300, 3600, 2, 100);
@@ -88,6 +89,7 @@ describe("Risk tiers", function () {
     await registry.setTier(await weth.getAddress(), BLUE_CHIP);
     await registry.setTier(await aapl.getAddress(), STANDARD);
     await registry.setTier(await meme.getAddress(), SPECULATIVE);
+    await registry.setTier(await nvda.getAddress(), STANDARD);
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator))
       .deploy(operator.address, 1000, 0);
@@ -102,6 +104,9 @@ describe("Risk tiers", function () {
 
     await registry.setMinPoolLiquidity(await usdx.getAddress(), await meme.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await usdx.getAddress(), await meme.getAddress(), POOL_FEE);
+
+    await registry.setMinPoolLiquidity(await usdx.getAddress(), await nvda.getAddress(), 1n);   // audit M-01
+    await registry.setPoolFeeTier(await usdx.getAddress(), await nvda.getAddress(), POOL_FEE);
 
     const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
     await twapLib.waitForDeployment();
@@ -141,7 +146,7 @@ describe("Risk tiers", function () {
       return vault;
     }
 
-    return { operator, lender, borrower, usdx, weth, aapl, meme, pools,
+    return { operator, lender, borrower, usdx, weth, aapl, meme, nvda, pools,
              router, registry, pool, factory, originate };
   }
 
@@ -516,6 +521,144 @@ describe("Risk tiers", function () {
       const newer = await originate(BLUE_CHIP);
       await newer.connect(borrower).swap(meme.getAddress(), E("1"), E("0.9"), POOL_FEE);
       expect(await newer.isHeld(meme.getAddress())).to.equal(true);
+    });
+  });
+  // Audit M-07 (Zealynx): the exposure cap was checked one asset at a time, so
+  // a vault could hold several assets each at its own cap — more risk than the
+  // single capped exposure its deposit and premium were priced on. Holdings
+  // now share one budget: each uses value / (its cap x principal), and the
+  // total may not exceed 100%. Caps here are the launch shape: Blue chip 70%,
+  // Standard 50%, Speculative 25%. Principal is 10; every pool is at 1:1.
+  describe("Audit M-07 — holdings share one exposure budget", function () {
+    async function m07() {
+      const env = await loadFixture(fixture);
+      const { registry } = env;
+      await registry.setTierConfig(BLUE_CHIP,   0, 0, YEAR, 7000, 0);
+      await registry.setTierConfig(STANDARD,    0, 0, YEAR, 5000, 0);
+      await registry.setTierConfig(SPECULATIVE, 0, 0, YEAR, 2500, 0);
+      return env;
+    }
+    const buy = (vault, who, token, amt) =>
+      vault.connect(who).swap(token.getAddress(), E(amt), 1, POOL_FEE);
+
+    it("The finding: a Standard vault can no longer hold two Standard assets at 50% each", async function () {
+      const { originate, borrower, aapl, nvda } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "5");                       // 50%: the whole budget
+      await expect(buy(vault, borrower, nvda, "5"))                // passed its own 50% cap before
+        .to.be.revertedWith("Holdings exceed exposure budget");
+      await expect(buy(vault, borrower, nvda, "0.01"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+      expect(await vault.isHeld(nvda.getAddress())).to.equal(false);
+    });
+
+    it("Splits the budget between riskier assets: 25% + 25% fills it, and nothing more fits", async function () {
+      const { originate, borrower, aapl, nvda } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "2.5");
+      await buy(vault, borrower, nvda, "2.5");
+      await expect(buy(vault, borrower, nvda, "0.01"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+    });
+
+    it("A safer asset uses less budget: 25% Standard + 35% Blue chip is allowed, 60% invested", async function () {
+      const { originate, borrower, usdx, aapl, weth } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "2.5");                     // half the budget
+      await buy(vault, borrower, weth, "3.5");                     // 3.5 / 7 = the other half
+      await expect(buy(vault, borrower, weth, "0.01"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+      // 6 of the 10 principal invested, against 5 if the budget ignored tiers.
+      expect(await usdx.balanceOf(vault.getAddress())).to.equal(E("9"));   // 10 + 5 deposit - 6
+    });
+
+    it("A vault can still fill a single asset's cap, and selling frees budget for another", async function () {
+      const { originate, borrower, aapl, weth } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, weth, "7");                       // Blue chip at its own 70% cap
+      await expect(buy(vault, borrower, aapl, "0.01"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+      await vault.connect(borrower).swapBack(weth.getAddress(), E("3.5"), 1);
+      await buy(vault, borrower, aapl, "2.5");                     // half freed, half used
+    });
+
+    it("Caps are configurable: with Standard at 100%, two Standard assets can take the whole principal", async function () {
+      const { originate, borrower, registry, aapl, nvda } = await m07();
+      await registry.setTierConfig(STANDARD, 0, 0, YEAR, 10000, 0);
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "5");
+      await buy(vault, borrower, nvda, "5");
+      expect(await vault.isHeld(nvda.getAddress())).to.equal(true);
+    });
+
+    it("Reads each holding's riskiest tier since origination: a later re-tag safer does not free budget", async function () {
+      const { originate, borrower, registry, aapl, weth } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "5");
+      await registry.setTier(aapl.getAddress(), BLUE_CHIP);        // now nominally a 70% asset
+      await expect(buy(vault, borrower, weth, "1"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+    });
+
+    it("With the budget full across two Standard assets, a joint 50% fall stays within the deposit: no reserve draw", async function () {
+      const { originate, operator, lender, borrower, router, pools, pool, usdx, aapl, nvda } = await m07();
+      await usdx.mint(operator.address, E("100"));
+      await usdx.approve(pool.getAddress(), E("100"));
+      await pool.fund(usdx.getAddress(), E("100"));                // a reserve that COULD be drawn
+
+      const vault = await originate(STANDARD, { deposit: E("3") });
+      await buy(vault, borrower, aapl, "2.5");
+      await buy(vault, borrower, nvda, "2.5");                     // the whole budget, two assets
+
+      for (const t of [aapl, nvda]) {                              // both halve, spot and TWAP together
+        await router.setRate(t.getAddress(), usdx.getAddress(), 1, 2);
+        const half = BigInt(await t.getAddress()) < BigInt(await usdx.getAddress()) ? -6932 : 6932;
+        await pools[await t.getAddress()].setAvgTick(half);
+      }
+      await time.increaseTo((await vault.deadline()) + 1n);
+      await vault.connect(lender).settle();
+
+      expect(await vault.settledTotalReturned()).to.be.gte(E("10"));   // principal back from the vault alone
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);
+      expect(await pool.reserveOf(usdx.getAddress())).to.equal(E("100"));
+    });
+
+    it("Control: the same fall on 5 + 5 (the frozen code's limit, here via a 100% cap) draws on the reserve", async function () {
+      const { originate, operator, lender, borrower, registry, router, pools, pool, usdx, aapl, nvda } = await m07();
+      await registry.setTierConfig(STANDARD, 0, 0, YEAR, 10000, 0);
+      await usdx.mint(operator.address, E("100"));
+      await usdx.approve(pool.getAddress(), E("100"));
+      await pool.fund(usdx.getAddress(), E("100"));
+
+      const vault = await originate(STANDARD, { deposit: E("3") });
+      await buy(vault, borrower, aapl, "5");
+      await buy(vault, borrower, nvda, "5");
+
+      for (const t of [aapl, nvda]) {
+        await router.setRate(t.getAddress(), usdx.getAddress(), 1, 2);
+        const half = BigInt(await t.getAddress()) < BigInt(await usdx.getAddress()) ? -6932 : 6932;
+        await pools[await t.getAddress()].setAvgTick(half);
+      }
+      await time.increaseTo((await vault.deadline()) + 1n);
+      await vault.connect(lender).settle();
+
+      expect(await vault.settledTotalReturned()).to.equal(E("8"));     // 3 deposit + 5 from the sales
+      expect(await vault.settledInsuranceDraw()).to.equal(E("1"));     // capped at 10% of principal
+    });
+
+    it("A holding that cannot be valued blocks purchases until it reprices", async function () {
+      const { originate, borrower, registry, pools, usdx, aapl, weth } = await m07();
+      const vault = await originate(STANDARD);
+      await buy(vault, borrower, aapl, "1");
+      // AAPL's pool falls below its minimum across the window (audit M-01):
+      // the holding can no longer be priced.
+      const aaplPool = pools[await aapl.getAddress()];
+      await aaplPool.setMeanLiquidity(1000);
+      await registry.setMinPoolLiquidity(usdx.getAddress(), aapl.getAddress(), 1001n);
+      await expect(buy(vault, borrower, weth, "1"))
+        .to.be.revertedWith("Holdings exceed exposure budget");
+      await registry.setMinPoolLiquidity(usdx.getAddress(), aapl.getAddress(), 900n);   // or the minimum is lowered
+      await buy(vault, borrower, weth, "1");
     });
   });
 });
