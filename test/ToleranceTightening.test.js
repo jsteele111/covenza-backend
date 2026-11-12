@@ -183,7 +183,7 @@ describe("Audit M-02 — a tightened tolerance cannot force an uninsured in-kind
     expect(await ipool.reserveOf(await weth.getAddress())).to.equal(env.reserve);
   });
 
-  it("Restoring the tolerance lets settle() close in cash, with the insurance draw", async function () {
+  it("Restoring the tolerance lets settle() close in cash (past the insured window by then, so no draw: M-06)", async function () {
     const env = await stack();
     const { lender, outsider, weth, vault, ipool } = env;
     await env.stockFalls();
@@ -195,8 +195,11 @@ describe("Audit M-02 — a tightened tolerance cannot force an uninsured in-kind
     await vault.connect(lender).settle();
     expect(await vault.isSettled()).to.equal(true);
     expect(await vault.settledInKind()).to.equal(false);
-    expect(await vault.settledInsuranceDraw()).to.be.greaterThan(0n);
-    expect(await ipool.reserveOf(await weth.getAddress())).to.be.lessThan(env.reserve);
+    // The in-kind window opens more than a week after grace, beyond the 5-day
+    // insured window (audit M-06), so this cash close pays out the vault's own
+    // funds and draws nothing. The control above draws inside the window.
+    expect(await vault.settledInsuranceDraw()).to.equal(0n);
+    expect(await ipool.reserveOf(await weth.getAddress())).to.equal(env.reserve);
   });
 
   it("Sweep: every tightened tolerance the sale misses is refused; one it clears goes through settle()", async function () {

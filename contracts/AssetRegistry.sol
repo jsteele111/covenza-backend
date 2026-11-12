@@ -73,6 +73,19 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     uint32  public twapWindow          = 1800;  // 30 min TWAP window for forced swap-back pricing
     uint256 public twapToleranceBps    = 200;   // swap output must be within 2% of TWAP-implied value
     uint256 public constant MAX_GRACE_EXTENSION = 14 days; // per-asset extension cap, at listing and on change
+    /// @notice Audit M-06 (Zealynx): how long after its deadline a loan stays
+    ///         insured. Insurance used to cover a loan for as long as it went
+    ///         unsettled, while the deposit floor and premium were priced on the
+    ///         term alone, so a 60-second loan held through grace carried hours
+    ///         of risk at a minute's price. Every loan is now priced on
+    ///         term + insuredWindow, and snapshots the window at origination:
+    ///         the pool pays only on a settlement by deadline + window, extended
+    ///         by any recorded outage that overlaps it. 5 days covers the
+    ///         longest routine US market closure (Thanksgiving) plus a day to
+    ///         act, and outlasts the default grace plus the 72-hour per-asset
+    ///         extension. Timelocked both ways; never shorter than the global
+    ///         grace, so cover cannot end before a keeper may settle.
+    uint256 public insuredWindow = 5 days;
     uint256 public swapBackGracePeriod = 36 hours; // post-expiry window where only lender/borrower may settle a foreign-asset vault
     uint256 public bountyRatePerHourBps = 2;    // keeper bounty accrual: bps of principal per hour past grace end
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
@@ -274,6 +287,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
         uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
     event DepositCoeffUpdated(uint256 previousBps, uint256 newBps);
+    event InsuredWindowUpdated(uint256 previousWindow, uint256 newWindow);
     event MaxEntryImpactUpdated(uint256 previousBps, uint256 newBps);
     event SettlementConfigUpdated(
         uint32  twapWindow,
@@ -529,6 +543,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         maxEntryImpactBps = _newBps;
     }
 
+    /// @notice Audit M-06: sets the insured window. Read by new loans only,
+    ///         and changes the deposit floor and premium they are priced on.
+    ///         Timelocked both ways: longer raises every borrower's price,
+    ///         shorter cuts the cover lenders rely on.
+    function setInsuredWindow(uint256 _window) external onlyOperator {
+        require(_window >= swapBackGracePeriod && _window <= 28 days, "Insured window out of range");
+        _consumeIfDelayed(keccak256(msg.data));
+        emit InsuredWindowUpdated(insuredWindow, _window);
+        insuredWindow = _window;
+    }
+
     /// @notice Updates the volatility coefficient in the deposit floor.
     function setDepositCoeffBps(uint256 _newBps) external onlyOperator {
         require(_newBps > 0 && _newBps <= 50000, "Coefficient out of range");
@@ -664,6 +689,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         // forced exit at once; an unbounded grace postpones keepers for ever.
         require(_twapWindow <= 1 days,                "TWAP window too long");
         require(_swapBackGracePeriod <= 7 days,       "Grace period too long");
+        require(_swapBackGracePeriod <= insuredWindow, "Grace longer than insured window");   // audit M-06
         require(_bountyRatePerHourBps <= 10000,       "Bounty rate too high");
         // The rule setOutageConfig enforces, checked from this side too: after
         // an outage the TWAP is stale for a full window, so keepers must be
@@ -743,7 +769,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     {
         TierConfig storage cfg = tierConfig[_tier];
 
-        uint256 sqrtTermScaled = _sqrt((_termSeconds * 1e36) / YEAR);
+        // Audit M-06: the risk horizon is the term plus the insured window.
+        uint256 sqrtTermScaled = _sqrt(((_termSeconds + insuredWindow) * 1e36) / YEAR);
         uint256 volFloor =
             (depositCoeffBps * cfg.assumedVolBps * sqrtTermScaled) / (10000 * 1e18);
 

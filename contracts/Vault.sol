@@ -193,11 +193,16 @@ contract Vault {
      *         headline figure and the worst possible friction to put on the
      *         scarce side of the market.
      *
-     *         Priced on the FULL term and snapshotted here, so a later change
-     *         to tier pricing cannot reprice a live loan.
+     *         Priced on the FULL term plus the insured window (audit M-06) and
+     *         snapshotted here, so a later change to tier pricing cannot
+     *         reprice a live loan.
      */
     uint256 public insurancePremium;
     uint256 public deadline;
+    /// @notice Audit M-06: the end of this loan's insurance cover, before any
+    ///         outage extension. deadline + the registry's insuredWindow at
+    ///         origination, so a later change cannot reach a live loan.
+    uint256 public insuredUntil;
     bool    public isSettled;
 
     uint256 private _requiredDeposit;
@@ -348,11 +353,15 @@ contract Vault {
 
         // Keyed to the CEILING the lender granted, not the loan's own asset.
         // What is being insured is whatever the borrower is permitted to hold.
+        // Audit M-06: insured for the term plus the window after it, and
+        // priced on both.
+        uint256 window = AssetRegistry(_terms.registry).insuredWindow();
+        insuredUntil = deadline + window;
         insurancePremium =
             (principal
              * AssetRegistry(_terms.registry).insurancePremiumBpsForTier(
                    AssetRegistry.RiskTier(_terms.maxTier))
-             * term) / (10000 * YEAR);
+             * (term + window)) / (10000 * YEAR);
 
         // Fee terms are snapshotted, not referenced. No require() here: a
         // zero treasury or zero rate simply means no protocol fee is taken,
@@ -1243,7 +1252,11 @@ contract Vault {
         // for the lender (claimDeferredDraw) and the vault settles now with
         // its own cash. The lender's place in the order does not change.
         uint256 insuranceDraw = 0;
-        if (!early && totalReturned < principal) {
+        // Audit M-06: and only within the insured window, extended by any
+        // recorded outage that overlaps it (the same rule as grace). A later
+        // cash settlement still pays out the vault's own funds.
+        (uint256 insuredEnd, ) = registry.settlementWindow(deadline, insuredUntil);
+        if (!early && totalReturned < principal && block.timestamp <= insuredEnd) {
             uint256 deferred;
             (insuranceDraw, deferred) = insurancePool.draw(asset, principal - totalReturned, principal, lender);
             settledInsuranceDeferred = deferred;

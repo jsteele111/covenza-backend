@@ -140,8 +140,10 @@ describe("Risk tiers", function () {
       );
       const vault = await ethers.getContractAt("Vault", await factory.allVaults(before));
 
-      await usdx.mint(borrower.address, deposit);
-      await usdx.connect(borrower).approve(await vault.getAddress(), deposit);
+      // Deposit plus any insurance premium the tier charges (audit M-06 tests set one).
+      const due = deposit + await vault.insurancePremium();
+      await usdx.mint(borrower.address, due);
+      await usdx.connect(borrower).approve(await vault.getAddress(), due);
       await vault.connect(borrower).payDeposit();
       return vault;
     }
@@ -379,11 +381,13 @@ describe("Risk tiers", function () {
     const { registry } = await loadFixture(fixture);
     await registry.setTierConfig(BLUE_CHIP, 6000, 0, YEAR, 10000, 0);   // 60% vol
 
-    const thirty  = await registry.minimumDepositBpsForTier(BLUE_CHIP, 30 * DAY);
-    const oneTwenty = await registry.minimumDepositBpsForTier(BLUE_CHIP, 120 * DAY);
+    // Audit M-06: the horizon is the term plus the 5-day insured window, so
+    // 25 and 115 days of term are 30 and 120 days of priced risk.
+    const thirty  = await registry.minimumDepositBpsForTier(BLUE_CHIP, 25 * DAY);
+    const oneTwenty = await registry.minimumDepositBpsForTier(BLUE_CHIP, 115 * DAY);
 
-    // Four times the term, twice the requirement — not four times. This is the
-    // whole reason a linear term premium is the wrong shape.
+    // Four times the horizon, twice the requirement — not four times. This is
+    // the whole reason a linear term premium is the wrong shape.
     expect(Number(oneTwenty) / Number(thirty)).to.be.closeTo(2.0, 0.02);
 
     // 1.8 x 0.60 x sqrt(30/365) = 0.3096
@@ -659,6 +663,123 @@ describe("Risk tiers", function () {
         .to.be.revertedWith("Holdings exceed exposure budget");
       await registry.setMinPoolLiquidity(usdx.getAddress(), aapl.getAddress(), 900n);   // or the minimum is lowered
       await buy(vault, borrower, weth, "1");
+    });
+  });
+
+  // Audit M-06 (Zealynx): the deposit floor and premium were priced on the
+  // term alone, while insurance paid on a settlement at ANY time after the
+  // deadline. A 60-second loan held through 36 hours of grace carried hours of
+  // risk at a minute's price, with cover that never expired. Every loan is now
+  // priced on term + the insured window (5 days), snapshots that window at
+  // origination, and draws insurance only on a settlement by deadline + window,
+  // extended by any recorded outage that overlaps it.
+  describe("Audit M-06 — loans are priced and insured for term + the insured window", function () {
+    const WINDOW = 5 * DAY;
+    const sqrtYears = (seconds) => Math.sqrt(seconds / YEAR);
+
+    it("Defaults the insured window to 5 days, and prices the deposit floor on term + window", async function () {
+      const { registry } = await loadFixture(fixture);
+      expect(await registry.insuredWindow()).to.equal(WINDOW);
+      await registry.setTierConfig(BLUE_CHIP, 6000, 1000, YEAR, 10000, 0);   // 60% vol, 10% minimum
+
+      // 1.8 x 0.60 x sqrt((60 s + 5 d) / 365 d) = 12.6%: above the 10% minimum
+      // that used to bind a 60-second loan.
+      const floor = Number(await registry.minimumDepositBpsForTier(BLUE_CHIP, 60));
+      expect(floor).to.be.closeTo(Math.round(18000 * 0.6 * sqrtYears(60 + WINDOW)), 2);
+      expect(floor).to.be.greaterThan(1000);
+    });
+
+    it("The finding: a 60-second Blue chip loan at a 10% deposit is refused; the quoted floor is accepted", async function () {
+      const { originate, registry, factory } = await loadFixture(fixture);
+      await registry.setTierConfig(BLUE_CHIP, 6000, 1000, YEAR, 10000, 0);
+
+      await expect(originate(BLUE_CHIP, { term: 60, deposit: E("1") }))
+        .to.be.revertedWith("Deposit below the volatility floor for this tier and term");
+
+      const quoted = await factory.quoteMinimumDeposit(PRINCIPAL, BLUE_CHIP, 60, true);
+      const vault = await originate(BLUE_CHIP, { term: 60, deposit: quoted });
+      expect(await vault.depositPaid()).to.equal(true);
+    });
+
+    it("Charges the premium on term + window, across short and long terms", async function () {
+      const { originate, registry } = await loadFixture(fixture);
+      await registry.setTierConfig(BLUE_CHIP, 0, 0, YEAR, 10000, 250);      // 2.5% a year
+      for (const term of [60, DAY, 30 * DAY]) {
+        const vault = await originate(BLUE_CHIP, { term });
+        const expected = (PRINCIPAL * 250n * BigInt(term + WINDOW)) / (10000n * BigInt(YEAR));
+        expect(await vault.insurancePremium(), `term ${term}`).to.equal(expected);
+        expect(await vault.insuredUntil()).to.equal((await vault.deadline()) + BigInt(WINDOW));
+      }
+    });
+
+    // A loss beyond the deposit, so insurance has something to pay:
+    // 7 of 10 principal in WETH at a 1 deposit, and WETH halves.
+    async function lossStack(opts = {}) {
+      const env = await loadFixture(fixture);
+      const { operator, borrower, registry, router, pools, pool, usdx, weth, originate } = env;
+      await registry.setOutageConfig(...(opts.outages ?? [0, 0, 0]));
+      await usdx.mint(operator.address, E("100"));
+      await usdx.approve(pool.getAddress(), E("100"));
+      await pool.fund(usdx.getAddress(), E("100"));
+
+      const vault = await originate(BLUE_CHIP, { deposit: E("1"), term: 7 * DAY });
+      await vault.connect(borrower).swap(weth.getAddress(), E("7"), 1, POOL_FEE);
+      await router.setRate(weth.getAddress(), usdx.getAddress(), 1, 2);
+      const half = BigInt(await weth.getAddress()) < BigInt(await usdx.getAddress()) ? -6932 : 6932;
+      await pools[await weth.getAddress()].setAvgTick(half);
+      return { ...env, vault };
+    }
+
+    it("Draws insurance on a settlement inside the window", async function () {
+      const { lender, vault } = await lossStack();
+      await time.increaseTo((await vault.deadline()) + BigInt(WINDOW - DAY));
+      await vault.connect(lender).settle();
+      expect(await vault.settledTotalReturned()).to.equal(E("7.5"));      // 4 cash (incl. deposit) + 3.5 from the sale
+      expect(await vault.settledInsuranceDraw()).to.equal(E("1"));        // 10% cap
+    });
+
+    it("Draws nothing after the window; the cash settlement still pays out the vault's own funds", async function () {
+      const { lender, usdx, pool, vault } = await lossStack();
+      const reserve = await pool.reserveOf(usdx.getAddress());
+      await time.increaseTo((await vault.deadline()) + BigInt(WINDOW + DAY));
+      const before = await usdx.balanceOf(lender.address);
+      await vault.connect(lender).settle();
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);
+      expect(await usdx.balanceOf(lender.address) - before).to.equal(E("7.5"));
+      expect(await pool.reserveOf(usdx.getAddress())).to.equal(reserve);
+    });
+
+    it("Extends the cut-off by a recorded outage that overlaps the window", async function () {
+      // Outage detection on: a silence over an hour is an outage, capped at 72 h.
+      const { lender, registry, vault } = await lossStack({ outages: [3600, 3600, 72 * 3600] });
+      await registry.heartbeat();
+      // Two days of silence that span the deadline: the window ends two days later.
+      await time.increaseTo((await vault.deadline()) + BigInt(DAY));
+      await registry.heartbeat();
+      // A day after the unextended window ends, but inside the extended one.
+      await time.increaseTo((await vault.deadline()) + BigInt(WINDOW + DAY));
+      await vault.connect(lender).settle();
+      expect(await vault.settledInsuranceDraw()).to.equal(E("1"));
+    });
+
+    it("Snapshots the window: a later change does not reach a live loan", async function () {
+      const { lender, registry, vault } = await lossStack();
+      await registry.setInsuredWindow(28 * DAY);
+      await time.increaseTo((await vault.deadline()) + BigInt(WINDOW + DAY));
+      await vault.connect(lender).settle();
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);           // still the 5-day window
+    });
+
+    it("Bounds the window: never shorter than grace, never over 28 days, and grace cannot outgrow it", async function () {
+      const { registry } = await loadFixture(fixture);
+      const grace = Number(await registry.swapBackGracePeriod());
+      await expect(registry.setInsuredWindow(grace - 1)).to.be.revertedWith("Insured window out of range");
+      await expect(registry.setInsuredWindow(28 * DAY + 1)).to.be.revertedWith("Insured window out of range");
+      await registry.setInsuredWindow(grace);
+      await expect(registry.setSettlementConfig(1800, 300, grace + 1, 2, 100))
+        .to.be.revertedWith("Grace longer than insured window");
+      await expect(registry.connect((await ethers.getSigners())[2]).setInsuredWindow(WINDOW))
+        .to.be.reverted;                                                   // operator only
     });
   });
 });

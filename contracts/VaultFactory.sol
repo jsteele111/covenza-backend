@@ -1030,7 +1030,8 @@ contract VaultFactory is Timelocked {
         uint256 premiumBps = assetRegistry.insurancePremiumBpsForTier(
             AssetRegistry.RiskTier(_mandates[id].maxTier)
         );
-        return (deposit, (principal * premiumBps * termSeconds) / (10000 * 365 days));
+        // Audit M-06: priced on term + the insured window, as Vault.initialize does.
+        return (deposit, (principal * premiumBps * (termSeconds + assetRegistry.insuredWindow())) / (10000 * 365 days));
     }
 
     /**

@@ -299,7 +299,7 @@ describe("Krait observation — exposure cap uses the worst tier since originati
 
   async function originate(f, ceiling) {
     const { weth, factory, lender, borrower } = f;
-    const P = E("10"), D = E("6");
+    const P = E("10"), D = E("7");   // audit M-06: a 7-day Speculative loan now prices on 12 days (65.3%)
     await weth.mint(lender.address, P);
     await weth.connect(lender).approve(await factory.getAddress(), P);
     await factory.connect(lender).deployVaultWithTier(

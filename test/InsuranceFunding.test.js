@@ -31,7 +31,10 @@ const YEAR      = 365 * DAY;
 
 const BLUE_CHIP = 0;
 const PREMIUM_BPS = 100n;        // 1% annualised
-const YEAR_PREMIUM = E("1");     // 1% of 100 over a full year
+// Audit M-06: every loan is priced on its term plus the 5-day insured window
+// after it, so a one-year loan pays a year and five days of premium.
+const INSURED_WINDOW = 5 * DAY;
+const YEAR_PREMIUM = (E("100") * PREMIUM_BPS * BigInt(YEAR + INSURED_WINDOW)) / (10000n * BigInt(YEAR));
 
 describe("Insurance funding and cancellation", function () {
 
@@ -116,15 +119,15 @@ describe("Insurance funding and cancellation", function () {
 
   // --- Pricing ---
 
-  it("Prices the premium on the FULL term, not on time elapsed", async function () {
+  it("Prices the premium on the FULL term plus the insured window, not on time elapsed", async function () {
     const { originate } = await loadFixture(fixture);
 
     const yearVault = await originate(YEAR);
     expect(await yearVault.insurancePremium()).to.equal(YEAR_PREMIUM);
 
-    // Thirty days is 30/365 of the annual figure.
+    // Thirty days plus the five-day window is 35/365 of the annual figure.
     const monthVault = await originate(30 * DAY);
-    const expected = (PRINCIPAL * PREMIUM_BPS * BigInt(30 * DAY)) / (10000n * BigInt(YEAR));
+    const expected = (PRINCIPAL * PREMIUM_BPS * BigInt(30 * DAY + INSURED_WINDOW)) / (10000n * BigInt(YEAR));
     expect(await monthVault.insurancePremium()).to.equal(expected);
   });
 
@@ -212,7 +215,7 @@ describe("Insurance funding and cancellation", function () {
     const vault = await originate(YEAR);
     await fund(vault);
 
-    // Interest is 3% of 100 = 3; a 20% skim is 0.6. Plus the 1.0 premium.
+    // Interest is 3% of 100 = 3; a 20% skim is 0.6. Plus the premium.
     const expected = E("0.6") + YEAR_PREMIUM;
     expect(await pool.reserveOf(usdxAddr) - before).to.equal(expected);
   });

@@ -56,6 +56,11 @@ async function stack() {
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
     operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+    // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+    // floor before M-06, so the coefficient is scaled to keep that deposit valid
+    // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+    await registry.setDepositCoeffBps(13700);
   await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
   await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
   await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
@@ -182,7 +187,7 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await vault.settledProtocolFee()).to.equal(0);
   });
 
-  it("Refuses when every asset sells, and points at settle(), which draws insurance for a loss (audit KRAIT-005)", async function () {
+  it("Refuses when every asset sells, and points at settle(), which settles in cash (audit KRAIT-005; past the insured window, so no draw: M-06)", async function () {
     const { lender, stranger, usdx, router, uniPool, vault, toInKindWindow } = await loadFixture(stack);
     // A loss: USDX is now worth half a WETH, at spot and at the TWAP alike.
     await router.setRate(await usdx.getAddress(), await vault.asset(), 1, 2);
@@ -197,8 +202,13 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
 
     await vault.connect(stranger).settle();
     expect(await vault.settledInKind()).to.equal(false);
-    // 3.5 cash + 8 USDX sold for 4 = 7.5 against 10 principal: a 1 WETH draw (10% cap).
-    expect(await vault.settledInsuranceDraw()).to.equal(E("1"));
+    // 3.5 cash + 8 USDX sold for 4 = 7.5 against 10 principal. Inside the
+    // insured window this would draw 1 WETH (10% cap); the in-kind window
+    // opens more than a week after grace, past the 5-day insured window, so
+    // since audit M-06 this late cash settlement pays out the vault's own
+    // funds and draws nothing.
+    expect(await vault.settledTotalReturned()).to.equal(E("7.5"));
+    expect(await vault.settledInsuranceDraw()).to.equal(0n);
     expect(await usdx.balanceOf(await vault.getAddress())).to.equal(0);
     expect(await usdx.balanceOf(lender.address)).to.equal(0);
   });
@@ -344,6 +354,11 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
       await kyc.verify(lender.address, 7, ethers.id("test-fixture"));
       const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
         operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+        // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+        // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+        // floor before M-06, so the coefficient is scaled to keep that deposit valid
+        // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+        await registry.setDepositCoeffBps(13700);
       await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
       await registry.addAssetWithTier(await stock.getAddress(), 0, 0);
       await registry.setMinPoolLiquidity(await weth.getAddress(), await stock.getAddress(), 1n);

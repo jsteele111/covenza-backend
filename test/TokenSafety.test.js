@@ -24,6 +24,11 @@ describe("Item 15 — token safety and timelock expiry", function () {
 
     const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
       operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+      // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+      // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+      // floor before M-06, so the coefficient is scaled to keep that deposit valid
+      // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+      await registry.setDepositCoeffBps(13700);
     await registry.addAssetWithTier(await nr.getAddress(), 0, 0);
 
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);

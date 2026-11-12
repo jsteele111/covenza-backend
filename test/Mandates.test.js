@@ -394,7 +394,8 @@ describe("Mandates", function () {
     const before = await pool.reserveOf(usdxAddr);
     await factory.connect(borrower).fillMandate(id, PRINCIPAL, 30 * DAY, true, DEPOSIT, ethers.MaxUint256);
 
-    const expected = (PRINCIPAL * PREMIUM_BPS * BigInt(30 * DAY)) / (10000n * BigInt(YEAR));
+    // Audit M-06: priced on the term plus the 5-day insured window.
+    const expected = (PRINCIPAL * PREMIUM_BPS * BigInt(30 * DAY + 5 * DAY)) / (10000n * BigInt(YEAR));
     expect(await pool.reserveOf(usdxAddr) - before).to.equal(expected);
   });
 
