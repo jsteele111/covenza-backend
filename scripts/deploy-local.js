@@ -3,7 +3,9 @@
  * for click-testing the web interface before testnet.
  *
  * Local only. Lives on the local-test branch; it changes no contract and is
- * not part of the code frozen for audit (tag audit-freeze-2026-10).
+ * not part of the code frozen for audit (tag audit-freeze-2026-10). Updated
+ * November 2026 for the audit fixes (M-01 pool minimums, M-05 first-factory
+ * timelock, Blue chip premium 250bps).
  *
  * What it builds
  * --------------
@@ -194,7 +196,9 @@ async function main() {
   await timelocked(registry, "setSettlementConfig", [
     TWAP_WINDOW_SECONDS, TWAP_TOLERANCE_BPS, GRACE_PERIOD_SECONDS, BOUNTY_RATE_PER_HOUR_BPS, BOUNTY_CAP_BPS,
   ], `settlement config (TWAP ${TWAP_WINDOW_SECONDS}s, grace ${GRACE_PERIOD_SECONDS}s)`);
-  await timelocked(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 100], "tier config: Blue chip");
+  // Blue chip premium 250bps: the launch setting after the November 2026
+  // insurance-model rerun (docs/insurance-model-rerun-2026-11.md).
+  await timelocked(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 250], "tier config: Blue chip");
   await timelocked(registry, "setTierConfig", [1, 10000, 2000, 7 * 86400, 5000, 250], "tier config: Standard");
   await timelocked(registry, "setTierConfig", [2, 20000, 4000, 86400, 2500, 100], "tier config: Speculative");
 
@@ -203,9 +207,14 @@ async function main() {
   await (await registry.addAssetWithTier(aaplA, STOCK_GRACE_SECONDS, TIER_STANDARD)).wait();
   console.log("  listed tUSDG, tWETH (Blue chip) and tAAPL (Standard, 72h grace)");
 
+  // Audit M-01: a pool needs a minimum mean liquidity before it can be
+  // approved. Set before the pool is named, which is instant; a tenth of the
+  // pool's current in-range liquidity, as scripts/lib/pool-history.js does.
   for (const p of pools) {
+    const live = await new ethers.Contract(p.address, ["function liquidity() view returns (uint128)"], operator).liquidity();
+    await (await registry.setMinPoolLiquidity(p.a, p.b, live / 10n)).wait();
     await (await registry.setPoolFeeTier(p.a, p.b, FEE)).wait();
-    console.log(`  approved pool ${p.label} at 0.3%`);
+    console.log(`  approved pool ${p.label} at 0.3% (minimum liquidity ${live / 10n})`);
   }
 
   const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
@@ -220,8 +229,11 @@ async function main() {
     operator.address, await vaultImpl.getAddress(), TIMELOCK_DELAY
   );
   await factory.waitForDeployment();
+  // Audit M-05: the FIRST factory is announced and waits the delay too.
+  await (await insurance.queueSetVaultFactory(await factory.getAddress())).wait();
+  await advance(TIMELOCK_DELAY + 1);
   await (await insurance.setVaultFactory(await factory.getAddress())).wait();
-  console.log("  insurance pool wired to the factory");
+  console.log(`  insurance pool wired to the factory (announced, waited ${TIMELOCK_DELAY}s)`);
 
   // --- Balances -----------------------------------------------------------
   const E = (n) => BigInt(n) * 10n ** 18n;
