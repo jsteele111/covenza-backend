@@ -11,12 +11,18 @@
  * Naming a pair's FIRST pool is instant; nothing here waits on the timelock.
  * Safe to re-run: pairs already approved are left alone.
  *
+ * Audit M-01: a pool can only be named against a minimum depth set for its
+ * pair. When the deploy script skipped a pool on its history check it never
+ * reached that step, so it is done here first, the same way: a tenth of the
+ * pool's current in-range liquidity, or MIN_POOL_LIQUIDITY if set, unless the
+ * pair already has one. Setting it is instant while the pair has no pool.
+ *
  *   npx hardhat run scripts/approve-testnet-pools.js --network robinhoodTestnet
  */
 const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
-const { checkPoolHistory } = require("./lib/pool-history");
+const { checkPoolHistory, ensureMinPoolLiquidity } = require("./lib/pool-history");
 
 async function main() {
   const { ethers } = hre;
@@ -50,6 +56,9 @@ async function main() {
     }
     const history = await checkPoolHistory(registry, a, b, p.fee, signer);
     if (!history.ok) { console.log(`  ${label}: NOT approved — ${history.reason}`); continue; }
+    const depth = await ensureMinPoolLiquidity(registry, a, b, history, p.minLiquidity ?? process.env.MIN_POOL_LIQUIDITY,
+      async (m, args, what) => { await (await registry[m](...args)).wait(); console.log(`  ${label}: ${what}`); });
+    if (!depth.ok) { console.log(`  ${label}: NOT approved — ${depth.reason}`); continue; }
     await (await registry.setPoolFeeTier(a, b, p.fee)).wait();
     console.log(`  ${label}: approved at fee ${p.fee} (${history.cardinality} history slots)`);
   }
