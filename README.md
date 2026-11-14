@@ -53,8 +53,10 @@ Every asset carries a tier (Blue chip, Standard, Speculative), each with an assu
 **4. Deposit segregation — the core invariant.**
 The deposit is collateral, not working capital. Every borrower-triggered outflow of the loan asset checks that the vault's loan-asset balance stays at or above the deposit. The rule is enforced the same way for every action type.
 
-**5. Settlement — oracle-free.**
-At settlement, any foreign assets are force-swapped back to the loan asset. The realised output must land within a tolerance of the Uniswap V3 time-weighted average price, or settlement reverts. Settlement happens in the loan asset or not at all. There is no price feed, no oracle governance and no oracle failure mode.
+**5. Settlement — no external price feed.**
+Ordinary `settle()` closes in the loan asset after a TWAP-bounded swap-back: any foreign assets are sold back to the loan asset, and the realised output must land within a tolerance of the approved Uniswap V3 pool's time-weighted average price, or `settle()` reverts. If a held asset cannot be sold that way, `settleInKind()` can close the loan after the grace and in-kind waiting periods by allocating the cash and the unsold asset itself; this path makes no insurance draw (see section 6).
+
+There is no external price feed and no oracle governance, so no feed can fail or be repointed. Settlement does still depend on the approved pool: if its TWAP is unavailable, its liquidity is below the pair's minimum, or the swap cannot execute within tolerance, a cash settlement cannot complete, and the loan waits for the pool to recover or for the in-kind window.
 
 | Tier | Window | Who may settle |
 |---|---|---|

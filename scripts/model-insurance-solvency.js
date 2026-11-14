@@ -1,364 +1,289 @@
 /**
  * Asks whether insurance premiums cover expected insurance draws.
  *
- * WHY: deposit floors are DERIVED — 1.8 x sigma x sqrt(T), calibrated against
- * expected loss. The premiums (100 / 250 / 600 bps) and the 10% draw cap were
- * CHOSEN. Nothing has ever checked whether the income covers the liability, so
- * the pool's solvency is an assumption wearing the costume of a parameter.
+ * WHY: deposit floors are DERIVED — coefficient x sigma x sqrt(horizon). The
+ * premiums and the 10% draw cap were CHOSEN. This checks whether premium income
+ * covers the modelled liability, by tier, term and portfolio, against a target
+ * multiple (default 3x).
  *
- * WHAT IT DOES: for each tier, works out how far an asset must fall before the
- * borrower's deposit is exhausted, how likely that is, and what the pool pays
- * when it happens. Compares that to premium income over the same term.
+ * RERUN FOR THE ZEALYNX AUDIT (M-06, M-07), November 2026. Three changes from
+ * the version reviewed at the audit freeze:
  *
- * READ THE ASSUMPTIONS BEFORE THE NUMBERS. The headline result is extremely
- * sensitive to the tail model, and the lognormal baseline is known to be wrong
- * in the direction that flatters us. Both are printed for that reason.
+ *   1. HORIZON (M-06). Insurance now covers a loan until deadline + the insured
+ *      window (5 days), extended by recorded outages of up to 72 hours. The
+ *      deposit floor and premium are both priced on term + window. The model
+ *      prices risk over the same term + window, and separately stresses the
+ *      full 72-hour outage extension, which is insured but not priced.
+ *   2. SHORT TERMS (M-06). Terms start at 60 seconds and one hour, not one day:
+ *      seconds-mode loans exist, and the window dominates their horizon.
+ *   3. PORTFOLIOS (M-07). A vault may hold several assets. Holdings share one
+ *      exposure budget: each uses value / (its tier cap x principal), total at
+ *      most 100%. The model evaluates single holdings and two-asset splits of
+ *      the budget across every tier the vault may hold, at return correlations
+ *      of 0.4, 0.8 and 1.0, and reports the worst.
  *
- * Usage:
- *   npx hardhat run scripts/model-insurance-solvency.js --network robinhoodTestnet
- *   OFFLINE=1 npx hardhat run scripts/model-insurance-solvency.js   (uses spec defaults)
+ * METHOD. Monte Carlo, seeded, so a rerun reproduces every figure. Returns are
+ * zero-drift lognormal (the baseline) and, as a tail stress, a multivariate
+ * Student-t with 4 degrees of freedom scaled to the same volatility. For each
+ * case: expected draw = E[ min( max(loss - deposit, 0), drawCap ) ] as a
+ * fraction of principal, where loss = sum over holdings of value x fall.
+ * Cover = premium / expected draw.
+ *
+ * Usage (no chain needed):
+ *   node scripts/model-insurance-solvency.js                 all three configurations
+ *   CONFIG=launch node scripts/model-insurance-solvency.js   one of: launch, defaults, caps100
+ *   PATHS=400000 TARGET_COVER=3 node scripts/model-insurance-solvency.js
  */
 
-const hre = require("hardhat");
-const fs = require("fs");
-const path = require("path");
-
-const YEAR = 365 * 24 * 3600;
+const YEAR = 365 * 86400;
+const DAY = 86400;
 const TIER_NAMES = ["Blue chip", "Standard", "Speculative"];
 
-// Terms to evaluate, in days. Each tier is only evaluated up to its own limit.
-const TERMS = [1, 7, 30, 90, 365];
+const TARGET_COVER = Number(process.env.TARGET_COVER || 3);
+const PATHS = Number(process.env.PATHS || 200000);
+const WINDOW = 5 * DAY;          // AssetRegistry.insuredWindow default
+const OUTAGE_EXT = 3 * DAY;      // maximum outage extension (72 h default cap)
+const DRAW_CAP = 0.10;           // InsurancePool drawCapBps 1000
+const CORRELATIONS = [0.4, 0.8, 1.0];
+const T_DOF = 4;
 
-// --- Distribution helpers ---------------------------------------------
+// Terms evaluated, in seconds; each tier only up to its own maximum.
+const TERMS = [60, 3600, DAY, 7 * DAY, 30 * DAY, 90 * DAY, YEAR];
 
-/** Abramowitz & Stegun 7.1.26 — plenty for four significant figures. */
-function erf(x) {
-  const s = Math.sign(x); x = Math.abs(x);
-  const t = 1 / (1 + 0.3275911 * x);
-  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
-    - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
-  return s * y;
-}
-const normCdf = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
-const normPdf = (z) => Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
+// Tier settings: [assumed vol bps, min deposit bps, max term s, cap bps, premium bps/yr]
+const CONFIGS = {
+  launch: {
+    label: "A. Launch shape (deploy script; the parameters Zealynx quoted)",
+    coeff: 1.8,
+    tiers: [
+      [6000, 1000, 30 * DAY, 7000, 100],
+      [10000, 2000, 7 * DAY, 5000, 250],
+      [20000, 4000, 1 * DAY, 2500, 100],
+    ],
+  },
+  defaults: {
+    label: "B. Contract defaults (AssetRegistry constructor)",
+    coeff: 1.8,
+    tiers: [
+      [6000, 1000, 365 * DAY, 10000, 100],
+      [10000, 2000, 90 * DAY, 5000, 250],
+      [20000, 4000, 7 * DAY, 2500, 600],
+    ],
+  },
+  caps100: {
+    label: "C. All caps 100%, coefficient 2.6 (launch terms and premiums)",
+    coeff: 2.6,
+    tiers: [
+      [6000, 1000, 30 * DAY, 10000, 100],
+      [10000, 2000, 7 * DAY, 10000, 250],
+      [20000, 4000, 1 * DAY, 10000, 100],
+    ],
+  },
+  // The settings chosen for launch after this rerun: the launch shape, with
+  // Blue chip's premium raised 100 -> 250 bps. Under A, short Blue chip loans
+  // clear the 3x target on the baseline (4.4x) but collect about half their
+  // expected draw under fat tails and the outage stress; at 250 bps they stay
+  // above break-even under both. See docs/insurance-model-rerun-2026-11.md.
+  chosen: {
+    label: "D. Chosen launch settings (launch shape, Blue chip premium 250bps)",
+    coeff: 1.8,
+    tiers: [
+      [6000, 1000, 30 * DAY, 7000, 250],
+      [10000, 2000, 7 * DAY, 5000, 250],
+      [20000, 4000, 1 * DAY, 2500, 100],
+    ],
+  },
+};
 
-/**
- * Expected shortfall below a threshold for a standard normal: E[(a - Z)+].
- * Used for "how far past the deposit does the loss go, when it goes past".
- */
-function expectedShortfall(a) {
-  return normPdf(a) - a * normCdf(-a);
-}
+// --- Seeded random numbers ----------------------------------------------
 
-// --- The model ---------------------------------------------------------
-
-/**
- * @param sigma      annualised volatility, as a fraction (1.0 = 100%)
- * @param termDays   loan term
- * @param depositFr  deposit as a fraction of principal
- * @param exposureFr most of principal that may sit in the risky asset
- * @param drawCapFr  pool's per-settlement cap, fraction of principal
- */
-function tierRisk({ sigma, termDays, depositFr, exposureFr, drawCapFr }) {
-  const T = termDays / 365;
-  const vol = sigma * Math.sqrt(T);          // volatility over the term
-
-  // Loss on PRINCIPAL is the asset's fall scaled by how much of the principal
-  // is allowed to sit in it. The exposure cap is doing as much work here as the
-  // deposit, and is easy to forget when reasoning about "a 50% crash".
-  //
-  // Breach happens when exposure x assetLoss > deposit.
-  const lossThreshold = Math.min(depositFr / exposureFr, 0.999);
-
-  // Lognormal, zero drift: ln(S_T/S_0) ~ N(-vol^2/2, vol^2). Zero drift is the
-  // conservative choice — assuming assets drift up would flatter the result.
-  const logMove = Math.log(1 - lossThreshold);
-  const z = (logMove + 0.5 * vol * vol) / vol;   // standardised
-  const pBreach = normCdf(z);
-
-  // Expected loss beyond the deposit, in fractions of principal. Approximated
-  // in log space then converted, which slightly understates deep losses — noted
-  // rather than corrected, because the tail model below dominates the error.
-  const shortfallStd = expectedShortfall(-z);
-  const expectedExcess = Math.max(0, exposureFr * vol * shortfallStd);
-  const expectedDraw = Math.min(expectedExcess, drawCapFr * pBreach + drawCapFr * 0);
-
-  return {
-    lossThreshold,
-    volOverTerm: vol,
-    sigmasToBreach: -z,
-    pBreach,
-    expectedDraw: Math.min(expectedExcess, drawCapFr),
-    cappedBy: expectedExcess > drawCapFr ? "cap" : "distribution",
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-async function loadTiers() {
-  if (process.env.OFFLINE === "1") {
-    // Spec defaults, for running without a chain.
-    return [
-      { vol: 6000, minDep: 1000, maxTerm: 365 * 86400, maxExp: 10000, prem: 100 },
-      { vol: 10000, minDep: 2000, maxTerm: 7 * 86400, maxExp: 5000, prem: 250 },
-      { vol: 20000, minDep: 4000, maxTerm: 86400, maxExp: 2500, prem: 600 },
-    ].map((t, i) => ({ ...t, tier: i, drawCapBps: 1000, source: "spec defaults" }));
+/** Pre-drawn standard normals (and t mixing factors), shared across cases so
+ *  that comparisons between cases are not muddied by sampling noise. */
+function drawShocks(n, seed) {
+  const u = rng(seed);
+  const normal = () => {
+    let x = 0;
+    while (x === 0) x = u();
+    return Math.sqrt(-2 * Math.log(x)) * Math.cos(2 * Math.PI * u());
+  };
+  const z1 = new Float64Array(n), z2 = new Float64Array(n), tmix = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    z1[i] = normal();
+    z2[i] = normal();
+    let chi = 0;
+    for (let k = 0; k < T_DOF; k++) { const g = normal(); chi += g * g; }
+    // Multivariate t, rescaled to unit variance: z * sqrt(nu / chi) * sqrt((nu - 2) / nu)
+    tmix[i] = Math.sqrt((T_DOF - 2) / chi);
   }
+  return { z1, z2, tmix };
+}
 
-  const { ethers } = hre;
-  const d = JSON.parse(
-    fs.readFileSync(path.join(__dirname, "..", "deployed-addresses.json"), "utf8")
-  )[hre.network.name];
+const SHOCKS = drawShocks(PATHS, 20261114);
 
-  const registry = await ethers.getContractAt("AssetRegistry", d.assetRegistry);
-  const pool = await ethers.getContractAt("InsurancePool", d.insurancePool);
-  const drawCapBps = Number(await pool.drawCapBps());
+// --- The model ------------------------------------------------------------
 
+function depositFloor(coeff, volBps, minDepBps, termS) {
+  const v = coeff * (volBps / 10000) * Math.sqrt((termS + WINDOW) / YEAR);
+  return Math.max(minDepBps / 10000, Math.min(1, v));
+}
+
+/**
+ * Expected draw for a portfolio of up to two holdings.
+ * @param h   [{ value, sigma }] value as a fraction of principal
+ * @param rho correlation between the two holdings' returns
+ * @param horizonS seconds of insured risk
+ * @param tails "normal" | "t"
+ */
+function expectedDraw(h, rho, deposit, horizonS, tails) {
+  const T = horizonS / YEAR;
+  const s1 = h[0].sigma * Math.sqrt(T), s2 = h[1] ? h[1].sigma * Math.sqrt(T) : 0;
+  const v1 = h[0].value, v2 = h[1] ? h[1].value : 0;
+  const c = Math.sqrt(1 - rho * rho);
+  const { z1, z2, tmix } = SHOCKS;
+  let sum = 0;
+  for (let i = 0; i < PATHS; i++) {
+    const m = tails === "t" ? tmix[i] : 1;
+    const a = z1[i] * m;
+    const b = (rho * z1[i] + c * z2[i]) * m;
+    const loss1 = v1 * (1 - Math.exp(-0.5 * s1 * s1 + s1 * a));
+    const loss2 = v2 ? v2 * (1 - Math.exp(-0.5 * s2 * s2 + s2 * b)) : 0;
+    const excess = loss1 + loss2 - deposit;
+    if (excess > 0) sum += excess < DRAW_CAP ? excess : DRAW_CAP;
+  }
+  return sum / PATHS;
+}
+
+/** Every portfolio the risk budget allows that is worth testing: one holding
+ *  at its cap, or the budget split 50/50 or 75/25 across two holdings of any
+ *  tiers the vault may hold (including two different assets of one tier). */
+function portfolios(cfg, ceiling) {
+  const caps = cfg.tiers.map((t) => t[3] / 10000);
+  const sig = cfg.tiers.map((t) => t[0] / 10000);
   const out = [];
-  for (let i = 0; i < 3; i++) {
-    const c = await registry.tierConfig(i);
-    out.push({
-      tier: i,
-      vol: Number(c[0]),
-      minDep: Number(c[1]),
-      maxTerm: Number(c[2]),
-      maxExp: Number(c[3]),
-      prem: Number(c[4]),
-      drawCapBps,
-      source: `live registry ${d.assetRegistry}`,
-    });
+  for (let j = 0; j <= ceiling; j++) {
+    out.push({ name: `100% budget in ${TIER_NAMES[j]}`, h: [{ value: Math.min(1, caps[j]), sigma: sig[j] }], single: true });
   }
-  return out;
-}
-
-async function depositFloor(registry, tier, termSeconds) {
-  return Number(await registry.minimumDepositBpsForTier(tier, termSeconds));
-}
-
-async function main() {
-  const tiers = await loadTiers();
-  const { ethers } = hre;
-
-  let registry = null;
-  if (process.env.OFFLINE !== "1") {
-    const d = JSON.parse(
-      fs.readFileSync(path.join(__dirname, "..", "deployed-addresses.json"), "utf8")
-    )[hre.network.name];
-    registry = await ethers.getContractAt("AssetRegistry", d.assetRegistry);
-  }
-
-  console.log("=".repeat(78));
-  console.log("Insurance pool solvency — do premiums cover expected draws?");
-  console.log(`Source: ${tiers[0].source}`);
-  console.log("=".repeat(78));
-
-  const rows = [];
-
-  for (const t of tiers) {
-    const maxDays = t.maxTerm / 86400;
-    console.log(`\n--- ${TIER_NAMES[t.tier]} ---`);
-    console.log(`  assumed volatility ${t.vol / 100}%   exposure cap ${t.maxExp / 100}%   ` +
-                `premium ${t.prem}bps/yr   max term ${maxDays}d`);
-    console.log("");
-    console.log("   term   deposit  breach at  sigmas  P(breach)   E[draw]   premium   cover");
-    console.log("   " + "-".repeat(70));
-
-    for (const days of TERMS) {
-      if (days > maxDays) continue;
-
-      const floorBps = registry
-        ? await depositFloor(registry, t.tier, days * 86400)
-        : Math.max(t.minDep, Math.min(10000,
-            Math.round(1.8 * (t.vol / 100) * Math.sqrt(days / 365) * 100)));
-
-      const r = tierRisk({
-        sigma: t.vol / 10000,
-        termDays: days,
-        depositFr: floorBps / 10000,
-        exposureFr: t.maxExp / 10000,
-        drawCapFr: t.drawCapBps / 10000,
-      });
-
-      // Premium is annualised on principal, so it scales with term exactly as
-      // the fee does.
-      const premiumFr = (t.prem / 10000) * (days / 365);
-      const cover = r.expectedDraw > 0 ? premiumFr / r.expectedDraw : Infinity;
-
-      rows.push({ tier: t.tier, days, cover, pBreach: r.pBreach, premiumFr, draw: r.expectedDraw });
-
-      console.log(
-        `   ${String(days).padStart(4)}d` +
-        `   ${(floorBps / 100).toFixed(1).padStart(6)}%` +
-        `   ${(r.lossThreshold * 100).toFixed(1).padStart(7)}%` +
-        `   ${r.sigmasToBreach.toFixed(2).padStart(5)}` +
-        `   ${(r.pBreach * 100).toFixed(4).padStart(8)}%` +
-        `   ${(r.expectedDraw * 10000).toFixed(2).padStart(6)}bp` +
-        `   ${(premiumFr * 10000).toFixed(2).padStart(6)}bp` +
-        `   ${cover === Infinity ? "  inf" : cover.toFixed(1).padStart(5)}x`
-      );
-    }
-  }
-
-  // --- Solve for an exposure cap that pays for itself -------------------
-  //
-  // Deposits are the control; rates are the compensation. Where premium fails
-  // to cover expected draw, the consistent response is to tighten the control
-  // rather than raise the price — pricing around a loose limit is how a lender
-  // ends up compensated for a risk they would not have accepted.
-  //
-  // Solves, per tier, the largest exposure cap at which premium income still
-  // covers the modelled draw at EVERY term the tier permits. Bisection, because
-  // the relationship runs through a normal CDF and has no closed form worth
-  // writing.
-  // TARGET_COVER is the margin over break-even. 1.0 would set the cap exactly
-  // where modelled income equals modelled loss — adopting the lognormal's
-  // optimism as policy, with nothing left for the fat tails and correlation
-  // the assumptions below admit to ignoring. The default of 3 is a
-  // risk-appetite choice, not a derivation, and is the one number here that
-  // should be argued about rather than computed.
-  const TARGET_COVER = Number(process.env.TARGET_COVER || 3);
-
-  console.log("\n" + "=".repeat(78));
-  console.log(`Exposure cap implied by the premium already charged (target ${TARGET_COVER}x cover)`);
-  console.log("=".repeat(78));
-  console.log("\nThe largest exposure at which income covers modelled draw by the target");
-  console.log("multiple at every permitted term. Where this sits BELOW the configured");
-  console.log("cap, the tier is underwriting more than it is paid for.\n");
-
-  for (const t of tiers) {
-    const maxDays = t.maxTerm / 86400;
-    const terms = TERMS.filter((d) => d <= maxDays);
-
-    async function worstCover(exposureFr) {
-      let worst = Infinity;
-      for (const days of terms) {
-        const floorBps = registry
-          ? await depositFloor(registry, t.tier, days * 86400)
-          : Math.max(t.minDep, Math.min(10000,
-              Math.round(1.8 * (t.vol / 100) * Math.sqrt(days / 365) * 100)));
-        const r = tierRisk({
-          sigma: t.vol / 10000,
-          termDays: days,
-          depositFr: floorBps / 10000,
-          exposureFr,
-          drawCapFr: t.drawCapBps / 10000,
-        });
-        const premiumFr = (t.prem / 10000) * (days / 365);
-        const cover = r.expectedDraw > 0 ? premiumFr / r.expectedDraw : Infinity;
-        if (cover < worst) worst = cover;
+  for (let j1 = 0; j1 <= ceiling; j1++) {
+    for (let j2 = j1; j2 <= ceiling; j2++) {
+      for (const w of [0.5, 0.75]) {
+        if (j1 === j2 && w === 0.75) continue;
+        for (const [a, b, wa] of [[j1, j2, w], [j2, j1, w]]) {
+          if (a === b && wa !== 0.5) continue;
+          const va = wa * caps[a], vb = (1 - wa) * caps[b];
+          if (va + vb > 1 + 1e-9) continue;   // cannot invest more than principal
+          out.push({
+            name: `${wa * 100}% ${TIER_NAMES[a]} + ${(1 - wa) * 100}% ${TIER_NAMES[b]}`,
+            h: [{ value: va, sigma: sig[a] }, { value: vb, sigma: sig[b] }],
+          });
+        }
       }
-      return worst;
     }
+  }
+  // De-duplicate by name.
+  return [...new Map(out.map((p) => [p.name, p])).values()];
+}
 
-    let lo = 0.01, hi = 1.0;
-    if (await worstCover(hi) >= TARGET_COVER) {
-      console.log(`  ${TIER_NAMES[t.tier].padEnd(12)} 100% clears the target ` +
-                  `(configured ${t.maxExp / 100}%)`);
-      continue;
+function fmtTerm(s) {
+  if (s < 3600) return `${s}s`;
+  if (s < DAY) return `${s / 3600}h`;
+  return `${s / DAY}d`;
+}
+
+function runConfig(key) {
+  const cfg = CONFIGS[key];
+  console.log("\n" + "=".repeat(86));
+  console.log(cfg.label);
+  console.log(`coefficient ${cfg.coeff}   insured window ${WINDOW / DAY}d   draw cap ${DRAW_CAP * 100}%   ` +
+              `target ${TARGET_COVER}x   paths ${PATHS.toLocaleString("en-GB")}`);
+  console.log("=".repeat(86));
+
+  const summary = [];
+  for (let tier = 0; tier < 3; tier++) {
+    const [volBps, minDep, maxTerm, capBps, premBps] = cfg.tiers[tier];
+    console.log(`\n--- ${TIER_NAMES[tier]} vault ---  vol ${volBps / 100}%  cap ${capBps / 100}%  ` +
+                `premium ${premBps}bps/yr  max term ${fmtTerm(maxTerm)}`);
+    console.log("   term  deposit  premium |  E[draw] / cover, worst portfolio and correlation");
+    console.log("                          |  baseline           fat tails (t4)      +72h outage");
+    console.log("   " + "-".repeat(82));
+
+    const pf = portfolios(cfg, tier);
+    let worstBase = Infinity, worstTail = Infinity, worstOut = Infinity, needBps = 0, worstCase = "";
+    for (const term of TERMS.filter((t) => t <= maxTerm)) {
+      const deposit = depositFloor(cfg.coeff, volBps, minDep, term);
+      const premium = (premBps / 10000) * ((term + WINDOW) / YEAR);
+      const worst = { base: 0, tail: 0, out: 0, baseName: "" };
+      for (const p of pf) {
+        for (const rho of p.single ? [1] : CORRELATIONS) {
+          const b = expectedDraw(p.h, rho, deposit, term + WINDOW, "normal");
+          const t = expectedDraw(p.h, rho, deposit, term + WINDOW, "t");
+          const o = expectedDraw(p.h, rho, deposit, term + WINDOW + OUTAGE_EXT, "normal");
+          if (b > worst.base) { worst.base = b; worst.baseName = `${p.name}${p.single ? "" : `, rho ${rho}`}`; }
+          if (t > worst.tail) worst.tail = t;
+          if (o > worst.out) worst.out = o;
+        }
+      }
+      const cov = (d) => (d > 0 ? premium / d : Infinity);
+      const cell = (d) => `${(d * 10000).toFixed(2).padStart(6)}bp ${cov(d) === Infinity ? "   inf" : cov(d).toFixed(1).padStart(6)}x`;
+      console.log(`  ${fmtTerm(term).padStart(5)}  ${(deposit * 100).toFixed(1).padStart(6)}%  ${(premium * 10000).toFixed(2).padStart(6)}bp |  ` +
+                  `${cell(worst.base)}   ${cell(worst.tail)}   ${cell(worst.out)}`);
+      if (cov(worst.base) < worstBase) { worstBase = cov(worst.base); worstCase = `${fmtTerm(term)}: ${worst.baseName}`; }
+      worstTail = Math.min(worstTail, cov(worst.tail));
+      worstOut = Math.min(worstOut, cov(worst.out));
+      // Premium (bps/yr) that would give TARGET_COVER on the baseline at this term.
+      needBps = Math.max(needBps, (TARGET_COVER * worst.base * YEAR / (term + WINDOW)) * 10000);
     }
-    for (let i = 0; i < 40; i++) {
-      const mid = (lo + hi) / 2;
-      if (await worstCover(mid) >= TARGET_COVER) lo = mid; else hi = mid;
-    }
-    const implied = lo * 100;
-    const configured = t.maxExp / 100;
-    const verdict = implied < configured
-      ? `UNDERWRITTEN — configured ${configured}% exceeds it`
-      : `covered — configured ${configured}% is inside it`;
-    console.log(`  ${TIER_NAMES[t.tier].padEnd(12)} implied cap ${implied.toFixed(1).padStart(5)}%   ${verdict}`);
+    console.log(`   worst baseline case: ${worstCase.endsWith(": ") || !worstCase ? "no portfolio draws on the baseline" : worstCase}`);
+    summary.push({ tier, premBps, worstBase, worstTail, worstOut, needBps });
   }
 
-  // --- Reserve sizing under correlated stress ---------------------------
-  //
-  // Everything above prices ONE loan in isolation. The scenario that empties a
-  // pool is the opposite: a market-wide fall breaching many deposits at once,
-  // where the per-settlement cap limits each payout and nothing limits the sum.
-  //
-  // Deliberately NOT probabilistic. Asking "how likely is a day when 20% of
-  // loans breach" invites the same lognormal that has already been flagged as
-  // the weakest assumption here. Stating the scenario and pricing it leaves the
-  // judgement visible instead of burying it in a distribution.
-  console.log("\n" + "=".repeat(78));
-  console.log("Reserve required under correlated stress");
-  console.log("=".repeat(78));
-  console.log("\nIf a fraction of open loans breach together, each draws up to the");
-  console.log(`per-settlement cap (${tiers[0].drawCapBps / 100}% of principal). Reserve needed, as a`);
-  console.log("percentage of TOTAL OPEN PRINCIPAL:\n");
-
-  const capFr = tiers[0].drawCapBps / 10000;
-  console.log("   loans breaching     reserve needed     on 1m of open principal");
-  console.log("   " + "-".repeat(62));
-  for (const share of [0.05, 0.2, 0.5, 1.0]) {
-    const reserveFr = share * capFr;
-    console.log(
-      `   ${(share * 100).toFixed(0).padStart(14)}%` +
-      `   ${(reserveFr * 100).toFixed(2).padStart(15)}%` +
-      `   ${(reserveFr * 1_000_000).toLocaleString("en-GB", { maximumFractionDigits: 0 }).padStart(22)}`
-    );
+  console.log("\n  Summary — lowest cover across every permitted term and portfolio");
+  console.log("  tier          premium   baseline   fat tails   +72h outage   premium for " + TARGET_COVER + "x (baseline)");
+  for (const s of summary) {
+    const f = (x) => (x === Infinity ? "   inf" : x.toFixed(1).padStart(6)) + "x";
+    const verdict = s.worstBase >= TARGET_COVER ? "meets target" : "BELOW target";
+    console.log(`  ${TIER_NAMES[s.tier].padEnd(12)} ${String(s.premBps).padStart(5)}bps  ${f(s.worstBase)}    ${f(s.worstTail)}     ${f(s.worstOut)}       ` +
+                `${Math.ceil(s.needBps).toString().padStart(5)}bps   ${verdict}`);
   }
+  return summary;
+}
 
-  console.log(`
-This is an UPPER bound per scenario: it assumes every breaching loan draws the
-full cap, when most draw less. It is also a LOWER bound in a different sense —
-the cap binds per settlement, so a loss larger than ${(capFr * 100).toFixed(0)}% of principal leaves the
-lender short regardless of how much reserve exists. Reserve protects against
-MANY losses, never against a DEEP one.
-
-The 10% cap is therefore doing two jobs: rationing the pool across claimants,
-and silently capping how much protection a lender has at all. Those deserve to
-be separate numbers.`);
-
-  // --- What the numbers do and do not say ------------------------------
-
-  console.log("\n" + "=".repeat(78));
-  console.log("Reading this honestly");
-  console.log("=".repeat(78));
-
-  const worst = rows.filter((r) => r.cover !== Infinity)
-                    .sort((a, b) => a.cover - b.cover)[0];
-
-  if (!worst) {
-    console.log("\nNo tier/term combination produces a measurable expected draw under the");
-    console.log("lognormal baseline. That is NOT a clean bill of health — see below.");
-  } else {
-    console.log(`\nThinnest coverage: ${TIER_NAMES[worst.tier]} at ${worst.days}d — ` +
-                `${worst.cover.toFixed(1)}x premium against expected draw.`);
+function main() {
+  const keys = process.env.CONFIG ? [process.env.CONFIG] : Object.keys(CONFIGS);
+  console.log("Insurance pool solvency — do premiums cover expected draws? (audit rerun, M-06/M-07)");
+  for (const k of keys) {
+    if (!CONFIGS[k]) throw new Error(`Unknown CONFIG ${k}`);
+    runConfig(k);
   }
-
   console.log(`
 ASSUMPTIONS, in the order they are likely to be wrong:
 
-1. LOGNORMAL TAILS. Returns are modelled as lognormal with zero drift. Real
-   assets — crypto especially, and tokenised equities during a halt — have far
-   fatter tails. A move the lognormal calls a 5-sigma event happens far more
-   often than "never". Every P(breach) above is therefore a LOWER BOUND, and
-   the coverage ratios an UPPER bound.
-
-2. INDEPENDENCE. Each loan is priced as if its loss were unrelated to every
-   other. The scenario that empties an insurance pool is precisely the one
-   where that fails: a market-wide fall breaches many deposits at once. The
-   per-settlement drawCapBps limits any SINGLE payout and nothing limits the
-   aggregate, so a correlated event drains the reserve first-come-first-served
-   and the last lender to settle finds it empty.
-
-3. THE EXPOSURE CAP IS DOING MOST OF THE WORK. Breach needs the asset to fall
-   by deposit/exposure, not by deposit. At Standard — 50% exposure, ~25%
-   deposit at 7 days — the asset must halve before the pool pays anything. That
-   is why the modelled probabilities look reassuring, and it is entirely
-   contingent on the cap staying where it is.
-
-4. NO DRIFT, NO CORRELATION BETWEEN TERM AND SELECTION. Borrowers choose their
-   term and their asset. If the ones who pick long terms on volatile assets are
-   also the ones most likely to be underwater, realised draws exceed modelled
-   ones regardless of the distribution.
-
-WHAT THIS DOES NOT ANSWER: which stress scenario to size against. The table
-above prices several; choosing among them is a risk-appetite decision and
-belongs to whoever answers for the pool being empty. Nor does it answer whether
-the draw cap should keep doing two jobs at once — rationing between claimants
-and capping any one lender's protection.
+1. TAILS. The baseline is zero-drift lognormal; real assets, and tokenised
+   equities through a halt or a weekend gap, have fatter tails. The t4 column
+   is a stress, not a calibration. Read the baseline as an upper bound on cover.
+2. CORRELATION ACROSS LOANS. Each loan is priced alone. A market-wide fall
+   breaches many deposits at once; the per-settlement cap limits each payout
+   and nothing limits the sum. Reserve size against that is a separate,
+   scenario-based decision (see the readiness notes), not an output here.
+3. VOLATILITY INPUTS. Tier volatilities are policy assumptions (60/100/200%).
+   An asset listed in a tier must actually be no more volatile than the tier
+   assumes, and each safer tier's cap x volatility must stay at or below the
+   riskier tier's, or the risk budget (M-07) stops bounding portfolio risk.
+4. SELECTION. Borrowers choose term, timing and assets; adverse selection makes
+   realised draws exceed modelled ones under any distribution.
+5. EXCLUDED: lender interest (insurance covers principal only), swap fees and
+   the 5% reserve-share limit per draw (which can only reduce a payout).
 `);
 }
 
-main().catch((e) => {
-  console.error(e.shortMessage || e.message);
-  process.exitCode = 1;
-});
+main();

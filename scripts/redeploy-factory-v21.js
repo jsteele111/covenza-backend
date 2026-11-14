@@ -187,6 +187,8 @@ async function main() {
   // is announced now and executed later by execute-timelocked.js; until then
   // the new factory cannot originate (registration would revert).
   if ((await pool.timelockDelay()) === 0n) {
+    // Every wiring is announced, even with no delay (audit M-05).
+    await (await pool.queueSetVaultFactory(factoryAddress)).wait();
     await (await pool.setVaultFactory(factoryAddress)).wait();
     console.log("✅ InsurancePool rewired to the new factory.");
   } else {

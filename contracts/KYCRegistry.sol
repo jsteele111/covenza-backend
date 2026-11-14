@@ -226,9 +226,17 @@ contract KYCRegistry is Timelocked, OperatorControlled, EIP712, IIdentityAdapter
      * @notice Revokes a wallet. Instant, and invalidates any signature already
      *         issued for it. Used on a sanctions hit, a failed re-screen, or a
      *         provider's notice.
+     *
+     * @dev    Audit L-03 (Zealynx): works whether or not the wallet has been
+     *         admitted yet. It used to require isVerified, so an adverse
+     *         notice arriving between an attester signing and the wallet
+     *         submitting that signature could not be acted on: revoke()
+     *         reverted, the nonce did not move, and the wallet could still
+     *         submit the signature and borrow. Moving the nonce now kills any
+     *         signature issued but not yet used. Repeated calls each move it
+     *         again and emit again, which is harmless.
      */
     function revoke(address _wallet) external onlyOperator {
-        require(isVerified[_wallet], "Address is not verified");
         isVerified[_wallet] = false;
         nonces[_wallet]    += 1;
         emit AddressRevoked(_wallet, block.timestamp);

@@ -113,6 +113,7 @@ describe("Group H — protocol fee", function () {
     // longer embeds Vault bytecode and needs no library link. The
     // IMPLEMENTATION does — it delegatecalls UniswapTwap.
     // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+    await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     // These suites warp the clock by days with no heartbeats, which outage
     // detection would (correctly) read as an outage. They test bounty and
@@ -130,6 +131,7 @@ describe("Group H — protocol fee", function () {
       treasury.address,
       await vaultImpl.getAddress()   // clone source
     , 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
     // Only approved integrators earn the referrer share (Krait observation).
     await factory.setReferrerApproved(referrer.address, true);

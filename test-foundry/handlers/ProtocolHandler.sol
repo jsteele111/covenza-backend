@@ -7,8 +7,8 @@ import {Vault} from "../../contracts/Vault.sol";
 import {VaultFactory} from "../../contracts/VaultFactory.sol";
 import {AssetRegistry} from "../../contracts/AssetRegistry.sol";
 import {InsurancePool} from "../../contracts/InsurancePool.sol";
-import {MockERC20} from "../../contracts/mocks/MockERC20.sol";
 import {MockFreezableToken} from "../../contracts/mocks/MockFreezableToken.sol";
+import {MockSenderBlockToken} from "../../contracts/mocks/MockSenderBlockToken.sol";
 import {MockSwapRouter} from "../../contracts/mocks/MockSwapRouter.sol";
 import {MockUniswapV3Pool} from "../../contracts/mocks/MockUniswapV3.sol";
 
@@ -18,7 +18,9 @@ import {MockUniswapV3Pool} from "../../contracts/mocks/MockUniswapV3.sol";
  *         arguments: originate (directly or through a mandate), pay or skip
  *         the deposit, swap in and out, move the price, manipulate spot, freeze
  *         the held token, donate tokens to a vault, let time pass, settle,
- *         settle in kind, cancel, and claim in-kind entitlements.
+ *         settle in kind, cancel, claim in-kind entitlements, block the
+ *         insurance pool as a WETH sender (audit L-06), and claim insurance
+ *         held for a lender after a refused transfer.
  *
  * @dev    Each action bounds its inputs to something the protocol could
  *         plausibly see, then calls through try/catch: a refusal is a valid
@@ -32,7 +34,7 @@ contract ProtocolHandler is Test {
     VaultFactory public factory;
     AssetRegistry public registry;
     InsurancePool public pool;
-    MockERC20 public weth;
+    MockSenderBlockToken public weth;
     MockFreezableToken public usdx;
     MockSwapRouter public router;
     MockUniswapV3Pool public uniPool;
@@ -50,9 +52,11 @@ contract ProtocolHandler is Test {
     uint256[] public mandateIds;
 
     uint256 public ghostReserve;        // what the pool's WETH reserve should be
+    uint256 public ghostDeferred;       // insurance the pool holds for lenders after a refused transfer (L-06)
     uint256 public ghostWethMinted;     // every WETH the handler has created
     bool public ghostDrawTooLarge;      // a draw broke the per-loan cap or the reserve share
     bool public ghostEarlyCloseShort;   // an early close paid the lender less than owed
+    bool public ghostDeferredClaimWrong; // a deferred-insurance claim paid other than the amount held
 
     // Call counts, printed at the end of a run to show coverage.
     mapping(string => uint256) public calls;
@@ -66,7 +70,7 @@ contract ProtocolHandler is Test {
     ///      overflow the stack.
     struct Deps {
         VaultFactory factory; AssetRegistry registry; InsurancePool pool;
-        MockERC20 weth; MockFreezableToken usdx; MockSwapRouter router; MockUniswapV3Pool uniPool;
+        MockSenderBlockToken weth; MockFreezableToken usdx; MockSwapRouter router; MockUniswapV3Pool uniPool;
         address keeper; uint256 initialReserve; uint256 wethAlreadyMinted;
     }
 
@@ -123,7 +127,8 @@ contract ProtocolHandler is Test {
             minTermSeconds: 1 hours, maxTermSeconds: 14 days,
             validForSeconds: 7 days, maxTier: 0, permittedBorrower: address(0),
             baseAprBps: 1200, termPremiumBpsPerDay: 1, depositCreditBpsPerPoint: 1,
-            minDepositBps: 1000, minAprBps: 500, totalCapacity: cap
+            minDepositBps: 1000, minAprBps: 500, totalCapacity: cap,
+            maxInsuranceSkimRateBps: 0
         });
         _mintWeth(lender, cap);
         vm.prank(lender);
@@ -206,6 +211,14 @@ contract ProtocolHandler is Test {
     function toggleFreeze(uint256 seed) external {
         calls["toggleFreeze"]++;
         usdx.setFrozen(seed % 4 == 0);
+    }
+
+    /// @dev Audit L-06: the loan token's issuer blocks the insurance pool as a
+    ///      sender one time in four, otherwise lifts the block. A draw made
+    ///      while blocked must be held for the lender, not revert settlement.
+    function togglePoolBlock(uint256 seed) external {
+        calls["togglePoolBlock"]++;
+        weth.setSenderBlocked(address(pool), seed % 4 == 0);
     }
 
     /// @dev Sends tokens to an open vault from outside, as a griefer would.
@@ -321,13 +334,34 @@ contract ProtocolHandler is Test {
         try v.claim(address(usdx)) { calls["claim.ok"]++; } catch {}
     }
 
+    /// @dev A lender collects insurance the pool held for them (audit L-06).
+    ///      Refused while the pool is still blocked; the claim must survive.
+    function claimDeferredDraw(uint256 lSeed) external {
+        address lender = lenders[lSeed % lenders.length];
+        uint256 amt = pool.deferredDrawOf(address(weth), lender);
+        if (amt == 0) return;
+        calls["claimDeferredDraw"]++;
+        uint256 before = weth.balanceOf(lender);
+        vm.prank(lender);
+        try pool.claimDeferredDraw(address(weth)) {
+            calls["claimDeferredDraw.ok"]++;
+            ghostDeferred -= amt;
+            if (weth.balanceOf(lender) - before != amt) ghostDeferredClaimWrong = true;
+        } catch {}
+    }
+
     // ------------------------------------------------------------------
     // Helpers and views for the invariants
     // ------------------------------------------------------------------
 
     function _afterClose(Vault v, uint256 reserveBefore) internal {
-        uint256 draw = v.settledInsuranceDraw();
+        // Paid or held for the lender, the whole draw leaves the reserve and
+        // counts against both caps (audit L-06).
+        uint256 deferred = v.settledInsuranceDeferred();
+        uint256 draw = v.settledInsuranceDraw() + deferred;
         ghostReserve -= draw;
+        ghostDeferred += deferred;
+        if (deferred > 0) calls["draw.deferred"]++;
         if (draw > (reserveBefore * pool.maxDrawShareBps()) / 10000 ||
             draw > (v.principal() * pool.drawCapBps()) / 10000) {
             ghostDrawTooLarge = true;

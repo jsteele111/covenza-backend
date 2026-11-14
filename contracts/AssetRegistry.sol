@@ -73,6 +73,19 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     uint32  public twapWindow          = 1800;  // 30 min TWAP window for forced swap-back pricing
     uint256 public twapToleranceBps    = 200;   // swap output must be within 2% of TWAP-implied value
     uint256 public constant MAX_GRACE_EXTENSION = 14 days; // per-asset extension cap, at listing and on change
+    /// @notice Audit M-06 (Zealynx): how long after its deadline a loan stays
+    ///         insured. Insurance used to cover a loan for as long as it went
+    ///         unsettled, while the deposit floor and premium were priced on the
+    ///         term alone, so a 60-second loan held through grace carried hours
+    ///         of risk at a minute's price. Every loan is now priced on
+    ///         term + insuredWindow, and snapshots the window at origination:
+    ///         the pool pays only on a settlement by deadline + window, extended
+    ///         by any recorded outage that overlaps it. 5 days covers the
+    ///         longest routine US market closure (Thanksgiving) plus a day to
+    ///         act, and outlasts the default grace plus the 72-hour per-asset
+    ///         extension. Timelocked both ways; never shorter than the global
+    ///         grace, so cover cannot end before a keeper may settle.
+    uint256 public insuredWindow = 5 days;
     uint256 public swapBackGracePeriod = 36 hours; // post-expiry window where only lender/borrower may settle a foreign-asset vault
     uint256 public bountyRatePerHourBps = 2;    // keeper bounty accrual: bps of principal per hour past grace end
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
@@ -223,6 +236,11 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      */
     mapping(address => mapping(address => uint24)) private _poolFeeTier;
 
+    /// @dev Audit M-01: the least harmonic-mean in-range liquidity a pair's
+    ///      approved pool must show over the TWAP window before its price is
+    ///      trusted, in the pool's own liquidity units. Symmetric.
+    mapping(address => mapping(address => uint128)) private _minPoolLiquidity;
+
     // --- Sequencer outages (MAINNET-READINESS item 16) ---
     //
     // Robinhood Chain has a single sequencer. While it is down nothing can be
@@ -262,12 +280,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     event AssetRemoved(address indexed asset);
     event GracePeriodUpdated(address indexed asset, uint256 gracePeriod);
     event PoolFeeTierUpdated(address indexed tokenA, address indexed tokenB, uint24 fee);
+    event MinPoolLiquidityUpdated(address indexed tokenA, address indexed tokenB, uint128 minLiquidity);
     event OutageRecorded(uint256 start, uint256 end);
     event OutageConfigUpdated(uint256 gapThreshold, uint256 recoveryPeriod, uint256 maxGraceExtension);
     event TierUpdated(address indexed asset, RiskTier tier);
     event TierConfigUpdated(RiskTier indexed tier, uint256 assumedVolBps, uint256 minDepositBps,
         uint256 maxTermSeconds, uint256 maxExposureBps, uint256 insurancePremiumBps);
     event DepositCoeffUpdated(uint256 previousBps, uint256 newBps);
+    event InsuredWindowUpdated(uint256 previousWindow, uint256 newWindow);
     event MaxEntryImpactUpdated(uint256 previousBps, uint256 newBps);
     event SettlementConfigUpdated(
         uint32  twapWindow,
@@ -443,7 +463,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         for (uint256 i = h.length; i > 0; i--) {
             TierChange storage c = h[i - 1];
             if (uint8(c.tier) > uint8(worst)) { worst = c.tier; }
-            if (c.at <= _since) { break; }
+            // Audit L-02 (Zealynx): strictly before. A re-tag in the SAME
+            // block as origination shares its timestamp, and stopping at it
+            // skipped the tier the asset held when the loan was written, so
+            // a same-block downgrade from Speculative admitted the asset to an
+            // older Blue chip loan. Reading on to the last entry strictly
+            // before `_since` includes it. A re-tag earlier in the origination
+            // block is then also counted, which only ever errs strict.
+            if (c.at < _since) { break; }
         }
         return worst;
     }
@@ -516,6 +543,17 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         maxEntryImpactBps = _newBps;
     }
 
+    /// @notice Audit M-06: sets the insured window. Read by new loans only,
+    ///         and changes the deposit floor and premium they are priced on.
+    ///         Timelocked both ways: longer raises every borrower's price,
+    ///         shorter cuts the cover lenders rely on.
+    function setInsuredWindow(uint256 _window) external onlyOperator {
+        require(_window >= swapBackGracePeriod && _window <= 28 days, "Insured window out of range");
+        _consumeIfDelayed(keccak256(msg.data));
+        emit InsuredWindowUpdated(insuredWindow, _window);
+        insuredWindow = _window;
+    }
+
     /// @notice Updates the volatility coefficient in the deposit floor.
     function setDepositCoeffBps(uint256 _newBps) external onlyOperator {
         require(_newBps > 0 && _newBps <= 50000, "Coefficient out of range");
@@ -558,6 +596,11 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         // Grow it first with the pool's increaseObservationCardinalityNext.
         (, , , uint16 cardinality, , , ) = IUniswapV3Pool(pool).slot0();
         require(uint256(cardinality) > uint256(twapWindow), "Pool keeps too little price history");
+        // Audit M-01: a pool may be named only against a minimum depth set
+        // for the pair, and only while it currently meets it.
+        uint128 minLiquidity = _minPoolLiquidity[_tokenA][_tokenB];
+        require(minLiquidity > 0, "Set the pair's minimum pool liquidity first");
+        require(IUniswapV3Pool(pool).liquidity() >= minLiquidity, "Pool liquidity below the pair's minimum");
 
         // Naming the first pool for a pair is instant: no position can exist
         // in a pair with no approved pool. Changing it waits.
@@ -566,6 +609,34 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         _poolFeeTier[_tokenA][_tokenB] = _fee;
         _poolFeeTier[_tokenB][_tokenA] = _fee;
         emit PoolFeeTierUpdated(_tokenA, _tokenB, _fee);
+    }
+
+    /**
+     * @notice Sets the least liquidity a pair's approved pool must have held,
+     *         on average over the TWAP window, for vaults to trust its price.
+     *         Below it, cash settlement and the exit check refuse the pool
+     *         and a vault falls back to delayed in-kind settlement.
+     *
+     * @dev    Audit M-01. Instant while the pair has no approved pool, since
+     *         no position can depend on it yet. Afterwards it reaches every
+     *         live loan in the pair in BOTH directions, so it waits: raising
+     *         it sends more loans to in-kind settlement (the borrower's risk),
+     *         lowering it lets thinner pools set settlement prices (the
+     *         lender's and the insurance pool's risk).
+     */
+    function setMinPoolLiquidity(address _tokenA, address _tokenB, uint128 _minLiquidity) external onlyOperator {
+        require(_tokenA != _tokenB, "Identical tokens");
+        require(_minLiquidity > 0, "Minimum pool liquidity must be nonzero");
+        if (_poolFeeTier[_tokenA][_tokenB] != 0) { _consumeIfDelayed(keccak256(msg.data)); }
+
+        _minPoolLiquidity[_tokenA][_tokenB] = _minLiquidity;
+        _minPoolLiquidity[_tokenB][_tokenA] = _minLiquidity;
+        emit MinPoolLiquidityUpdated(_tokenA, _tokenB, _minLiquidity);
+    }
+
+    /// @notice The minimum pool liquidity for a pair, or zero if none is set.
+    function minPoolLiquidity(address _tokenA, address _tokenB) external view returns (uint128) {
+        return _minPoolLiquidity[_tokenA][_tokenB];
     }
 
     /// @notice The approved fee tier for a pair, or zero if none.
@@ -618,6 +689,7 @@ contract AssetRegistry is OperatorControlled, Timelocked {
         // forced exit at once; an unbounded grace postpones keepers for ever.
         require(_twapWindow <= 1 days,                "TWAP window too long");
         require(_swapBackGracePeriod <= 7 days,       "Grace period too long");
+        require(_swapBackGracePeriod <= insuredWindow, "Grace longer than insured window");   // audit M-06
         require(_bountyRatePerHourBps <= 10000,       "Bounty rate too high");
         // The rule setOutageConfig enforces, checked from this side too: after
         // an outage the TWAP is stale for a full window, so keepers must be
@@ -697,7 +769,8 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     {
         TierConfig storage cfg = tierConfig[_tier];
 
-        uint256 sqrtTermScaled = _sqrt((_termSeconds * 1e36) / YEAR);
+        // Audit M-06: the risk horizon is the term plus the insured window.
+        uint256 sqrtTermScaled = _sqrt(((_termSeconds + insuredWindow) * 1e36) / YEAR);
         uint256 volFloor =
             (depositCoeffBps * cfg.assumedVolBps * sqrtTermScaled) / (10000 * 1e18);
 
@@ -725,7 +798,12 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      */
     function heartbeat() external {
         uint256 last = lastHeartbeat;
-        if (outageGapThreshold != 0 && block.timestamp > last + outageGapThreshold) {
+        // Audit L-05 (Zealynx): compare elapsed time rather than adding the
+        // threshold to the last heartbeat. With an oversized threshold the
+        // addition overflowed and reverted, and since settle() and
+        // settleInKind() both call heartbeat() first, every settlement froze
+        // until a timelocked repair. Subtraction cannot overflow here.
+        if (outageGapThreshold != 0 && block.timestamp > last && block.timestamp - last > outageGapThreshold) {
             _outages.push(Outage({ start: uint64(last), end: uint64(block.timestamp) }));
             emit OutageRecorded(last, block.timestamp);
         }
@@ -737,43 +815,53 @@ contract AssetRegistry is OperatorControlled, Timelocked {
      *         outages recorded so far.
      * @param  _deadline  The loan's deadline.
      * @param  _graceEnd  The grace end before any extension.
-     * @return graceEnd   `_graceEnd` extended by the outage time that fell after
-     *                    the deadline and within the (extended) window, capped
-     *                    at maxGraceExtension.
+     * @return graceEnd   `_graceEnd` pushed back by every outage that ate into
+     *                    the window, so the parties get the grace period's full
+     *                    length of LIVE chain after the deadline; capped at
+     *                    maxGraceExtension.
      * @return keeperFrom The earliest moment a keeper may settle: the extended
      *                    grace end, or the end of the latest outage plus the
      *                    recovery period, whichever is later. The keeper bounty
      *                    accrues from here.
      *
-     * @dev    Only outages that end after the deadline and start before
-     *         `_graceEnd + maxGraceExtension` (the horizon) can extend the
-     *         window. Outages are recorded in time order and never overlap, so
-     *         these form one contiguous run: a binary search finds where the run
-     *         ends, and the walk goes backwards from there, stopping at the first
-     *         outage that ended on or before the deadline. Cost is logarithmic in
-     *         the outages recorded after the horizon (audit L-4).
+     * @dev    Audit I-01 (Zealynx). An outage extends grace only if it begins
+     *         before the window, as extended so far, has ended. Outages are
+     *         recorded in time order and never overlap, so they are walked
+     *         forwards from the first that ends after the deadline, each one
+     *         that starts inside the window pushing its end back by the time
+     *         it took after the deadline, until one starts after the window's
+     *         end. Previously every outage before a horizon of grace end plus
+     *         the cap counted, so an outage after grace had ended, which cost
+     *         the parties nothing, still postponed the lender's in-kind exit.
+     *         An outage spanning the grace end still restores all the time the
+     *         parties lost; one wholly after it now restores none. keeperFrom
+     *         is unchanged: keepers wait out the recovery of any outage.
+     *
+     *         Cost: a binary search finds the first outage ending after the
+     *         deadline, and the walk stops at the first outage after the
+     *         window, so outages recorded later cost nothing (audit L-4).
      */
     function settlementWindow(uint256 _deadline, uint256 _graceEnd)
         external view returns (uint256 graceEnd, uint256 keeperFrom)
     {
-        uint256 ext;
         uint256 n = _outages.length;
-        uint256 horizon = _graceEnd + maxGraceExtension;
+        uint256 cap = _graceEnd + maxGraceExtension;
 
-        // First outage starting at or after the horizon (or n if none).
+        // First outage ending after the deadline (or n if none).
         uint256 lo = 0;
         uint256 hi = n;
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
-            if (_outages[mid].start < horizon) { lo = mid + 1; } else { hi = mid; }
+            if (_outages[mid].end <= _deadline) { lo = mid + 1; } else { hi = mid; }
         }
-        for (uint256 i = lo; i > 0; i--) {
-            Outage storage o = _outages[i - 1];
-            if (o.end <= _deadline) { break; }
-            ext += o.end - (o.start > _deadline ? o.start : _deadline);
+
+        graceEnd = _graceEnd;
+        for (uint256 i = lo; i < n; i++) {
+            Outage storage o = _outages[i];
+            if (o.start >= graceEnd) { break; }
+            graceEnd += o.end - (o.start > _deadline ? o.start : _deadline);
+            if (graceEnd >= cap) { graceEnd = cap; break; }
         }
-        if (ext > maxGraceExtension) { ext = maxGraceExtension; }
-        graceEnd = _graceEnd + ext;
 
         keeperFrom = graceEnd;
         if (n > 0) {
@@ -808,6 +896,9 @@ contract AssetRegistry is OperatorControlled, Timelocked {
             require(_recoveryPeriod == 0 && _maxGraceExtension == 0, "Disable all three together");
         } else {
             require(_gapThreshold >= 5 minutes,       "Gap threshold too short");
+            // Audit L-05: the heartbeat bot pings every few minutes; a gap of a
+            // day already treats a whole day's silence as normal running.
+            require(_gapThreshold <= 1 days,          "Gap threshold too long");
             require(_recoveryPeriod >= twapWindow,    "Recovery shorter than the TWAP window");
             require(_recoveryPeriod <= 1 days,        "Recovery period too long");
             require(_maxGraceExtension <= 7 days,     "Extension cap too long");

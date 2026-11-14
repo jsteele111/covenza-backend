@@ -44,16 +44,23 @@ async function stack() {
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
     operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+    // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+    // floor before M-06, so the coefficient is scaled to keep that deposit valid
+    // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+    await registry.setDepositCoeffBps(13700);
   await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
   await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
 
   const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
   // The protocol names the pool vaults trade through (KRAIT-003 / item 20).
+  await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
   const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
   const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+  await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await pool.setVaultFactory(await factory.getAddress());
 
   // Insurance reserve funded by other borrowers' premiums: 100 WETH.

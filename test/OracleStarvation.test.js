@@ -89,6 +89,7 @@ async function protocol(env, { listWindow = WINDOW } = {}) {
   await registry.addAssetWithTier(await x.getAddress(), 0, 0);
   await registry.setOutageConfig(0, 0, 0);   // no heartbeat bot in these tests
   if (listWindow !== WINDOW) { await registry.setSettlementConfig(listWindow, 200, 36 * 3600, 2, 100); }
+  await registry.setMinPoolLiquidity(await weth.getAddress(), await x.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await weth.getAddress(), await x.getAddress(), FEE);
 
   const ipool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
@@ -97,6 +98,7 @@ async function protocol(env, { listWindow = WINDOW } = {}) {
     signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await id.getAddress(), await registry.getAddress(), await ipool.getAddress(), operator.address, await impl.getAddress(), 0);
+  await ipool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await ipool.setVaultFactory(await factory.getAddress());
 
   const P = E("10");

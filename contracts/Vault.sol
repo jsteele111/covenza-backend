@@ -193,11 +193,16 @@ contract Vault {
      *         headline figure and the worst possible friction to put on the
      *         scarce side of the market.
      *
-     *         Priced on the FULL term and snapshotted here, so a later change
-     *         to tier pricing cannot reprice a live loan.
+     *         Priced on the FULL term plus the insured window (audit M-06) and
+     *         snapshotted here, so a later change to tier pricing cannot
+     *         reprice a live loan.
      */
     uint256 public insurancePremium;
     uint256 public deadline;
+    /// @notice Audit M-06: the end of this loan's insurance cover, before any
+    ///         outage extension. deadline + the registry's insuredWindow at
+    ///         origination, so a later change cannot reach a live loan.
+    uint256 public insuredUntil;
     bool    public isSettled;
 
     uint256 private _requiredDeposit;
@@ -214,6 +219,7 @@ contract Vault {
 
     address[] public heldAssets;
     mapping(address => bool)   public isHeld;
+    mapping(address => uint256) public admittedToleranceBps; // audit M-02: tolerance the holding's full exit last passed at
     mapping(address => uint24) public swapFeeTierOf;  // pool fee tier recorded at first entry; every later swap in or out of the asset uses it
 
     /// @notice How much of each held asset this vault BOUGHT, measured by
@@ -226,6 +232,7 @@ contract Vault {
 
     uint256 public settledTotalReturned;   // vault's own funds at settlement, BEFORE any insurance draw
     uint256 public settledInsuranceDraw;   // amount actually received from the insurance pool
+    uint256 public settledInsuranceDeferred; // Q8: insurance owed to the lender but held by the pool (token refused the transfer)
     uint256 public settledLenderPayout;
     uint256 public settledBorrowerPayout;
     uint256 public settledFee;
@@ -346,11 +353,15 @@ contract Vault {
 
         // Keyed to the CEILING the lender granted, not the loan's own asset.
         // What is being insured is whatever the borrower is permitted to hold.
+        // Audit M-06: insured for the term plus the window after it, and
+        // priced on both.
+        uint256 window = AssetRegistry(_terms.registry).insuredWindow();
+        insuredUntil = deadline + window;
         insurancePremium =
             (principal
              * AssetRegistry(_terms.registry).insurancePremiumBpsForTier(
                    AssetRegistry.RiskTier(_terms.maxTier))
-             * term) / (10000 * YEAR);
+             * (term + window)) / (10000 * YEAR);
 
         // Fee terms are snapshotted, not referenced. No require() here: a
         // zero treasury or zero rate simply means no protocol fee is taken,
@@ -612,6 +623,7 @@ contract Vault {
         _enforceEntryImpact(tokenOut, amountIn, amountOut, poolFee);
         _enforceExposureCap(tokenOut, poolFee);
         _enforceExitable(tokenOut, poolFee);
+        _enforceLossBudget();
 
         emit SwapExecuted(asset, tokenOut, amountIn, amountOut, false);
     }
@@ -681,6 +693,64 @@ contract Vault {
         );
     }
 
+    /**
+     * @dev Audit M-04 (Zealynx). The deposit is a loan-wide budget for
+     *      trading losses, not just a balance each purchase must leave alone.
+     *
+     *      _enforceDepositInvariant() and the per-trade checks bound every
+     *      purchase and exit on its own, but nothing bounded their SUM. A
+     *      borrower who owned the pool's liquidity could round-trip the
+     *      principal through it dozens of times, every trade passing, until
+     *      fees and impact paid into their own position had consumed the
+     *      deposit and then the principal, the shortfall drawn from the
+     *      shared insurance reserve.
+     *
+     *      So after every purchase the vault values itself conservatively:
+     *      its loan-asset cash plus each holding at its exit floor (TWAP less
+     *      tolerance; an unpriceable holding counts as nothing). Starting
+     *      worth is principal plus deposit, so requiring the result to stay
+     *      at or above the principal caps realised plus unrealised trading
+     *      losses at the deposit. This is the same as tracking cost basis and
+     *      realised profit per asset, and it carries across exits to zero
+     *      and changes of asset without any extra record.
+     *
+     *      Purchases only. A sale at or above its floor cannot lower this
+     *      figure, and blocking it would trap a borrower trying to cut a
+     *      market loss; sales stay governed by the floor alone. Settlement,
+     *      including in-kind, is untouched. Interest is not protected by this
+     *      bound, and a later market move can still exceed the deposit.
+     *
+     *      Audit M-07 (Zealynx): the same pass enforces an exposure BUDGET
+     *      across all holdings. _enforceExposureCap() checks only the asset
+     *      just bought, so a Standard vault could hold two Standard assets at
+     *      their 50% caps — twice the single exposure the deposit and premium
+     *      were priced on. Each holding now uses value / (its cap x principal)
+     *      of one shared budget, which may not exceed 100%. A vault can still
+     *      fill its tier's cap in one asset; putting part of the budget into
+     *      a safer asset (a higher cap) lets more of the principal be invested,
+     *      never more risk. That holds while every safer tier's cap times its
+     *      assumed volatility stays at or below the riskier tier's — a
+     *      calibration rule for the operator. The cap read is the riskiest
+     *      tier each asset has held since origination, as for the single-asset
+     *      check. A holding that cannot be valued, or whose cap is zero, blocks
+     *      purchases until it is sold or reprices; sales are never blocked.
+     */
+    function _enforceLossBudget() internal view {
+        uint256 worth = IERC20(asset).balanceOf(address(this));
+        uint256 used;   // exposure budget used, in principal units
+        uint256 keepBps = 10000 - registry.twapToleranceBps();
+        for (uint256 i = 0; i < heldAssets.length; i++) {
+            address held = heldAssets[i];
+            (bool priced, uint256 value) = _priceHeld(held);
+            uint256 capBps = registry.maxExposureBpsSince(held, originatedAt);
+            require(priced && (capBps > 0 || value == 0), "Holdings exceed exposure budget");
+            if (capBps > 0) { used += (value * 10000 + capBps - 1) / capBps; }
+            worth += (value * keepBps) / 10000;
+        }
+        require(used <= principal, "Holdings exceed exposure budget");
+        require(worth >= principal, "Trading losses would exceed the deposit");
+    }
+
     /// @dev Carries the simulated exit output out of simulateExit()'s revert.
     error ExitQuote(uint256 amountOut);
 
@@ -708,21 +778,31 @@ contract Vault {
      */
     function _enforceExitable(address held, uint24 feeTier) internal {
         uint256 amount = heldAmount[held];
-        uint256 floorOut = _exitFloor(held, amount, feeTier);
+        uint256 tolerance = registry.twapToleranceBps();
+        uint256 floorOut = _exitFloorAt(held, amount, feeTier, tolerance);
 
-        uint256 simulatedOut;
+        require(_simulateExitOut(held, amount, feeTier) >= floorOut,
+            "Position too large to exit within tolerance");
+
+        // Audit M-02: remember the tolerance this whole position was shown
+        // to clear, so settleInKind() can tell a pool that cannot take the
+        // sale from one blocked only by a later, stricter policy. A top-up
+        // updates it only here, after passing the same check.
+        admittedToleranceBps[held] = tolerance;
+    }
+
+    /// @dev Output of a full exit of `amount` of `held`, performed and then
+    ///      undone by simulateExit(). Any revert other than ExitQuote (the
+    ///      pool could not take the trade at all) counts as an exit of zero.
+    function _simulateExitOut(address held, uint256 amount, uint24 feeTier) internal returns (uint256 simulatedOut) {
         try this.simulateExit(held, amount, feeTier) {
             // simulateExit always reverts; reaching here would mean it did not.
             revert("Exit simulation did not revert");
         } catch (bytes memory reason) {
-            // Any revert other than ExitQuote (the pool could not take the
-            // trade at all) counts as an exit of zero.
             if (reason.length == 36 && bytes4(reason) == ExitQuote.selector) {
                 assembly { simulatedOut := mload(add(reason, 36)) }
             }
         }
-
-        require(simulatedOut >= floorOut, "Position too large to exit within tolerance");
     }
 
     /**
@@ -795,6 +875,14 @@ contract Vault {
         // the one the vault relies on, and the measured figure is what every
         // later check and the held-amount record use.
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+        // Audit M-03 (Zealynx): and what it actually spent. A Uniswap V3
+        // exact-input swap can stop at its price limit with part of amountIn
+        // unspent and still return enough to pass the floor; every caller
+        // then debits the FULL amount from its record, stranding the rest
+        // in the vault untracked. A partial fill reverts instead, before any
+        // record changes, so the holding stays whole for a full sale later
+        // or for in-kind settlement.
+        uint256 spentBefore = IERC20(tokenIn).balanceOf(address(this));
 
         ISwapRouter(router).exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -810,6 +898,7 @@ contract Vault {
 
         amountOut = IERC20(tokenOut).balanceOf(address(this)) - balanceBefore;
         require(amountOut >= minAmountOut, "Received less than minimum");
+        require(spentBefore - IERC20(tokenIn).balanceOf(address(this)) == amountIn, "Swap did not spend the full amount");
     }
 
     /// @dev The tier is recorded once, at first entry, and never overwritten
@@ -830,6 +919,7 @@ contract Vault {
         if (heldAmount[_asset] == 0 && isHeld[_asset]) {
             isHeld[_asset] = false;
             delete swapFeeTierOf[_asset];
+            delete admittedToleranceBps[_asset];
             for (uint256 i = 0; i < heldAssets.length; i++) {
                 if (heldAssets[i] == _asset) {
                     heldAssets[i] = heldAssets[heldAssets.length - 1];
@@ -936,7 +1026,9 @@ contract Vault {
      *            assets are allocated before unpriceable ones.
      *         4. An asset with no TWAP at all (its pool is gone) cannot be
      *            valued, so the lender receives all of it if anything is still
-     *            owed, and the borrower receives it otherwise.
+     *            owed, and the borrower receives it otherwise. It does not
+     *            count against the claim, so while anything is owed EVERY
+     *            unpriceable asset goes to the lender (Q3B).
      *
      *         NO INSURANCE on this path (M-2). The lender receives the asset
      *         instead of a claim. Drawing on a shortfall measured at the TWAP of
@@ -974,6 +1066,11 @@ contract Vault {
                 // A sale that failed for lack of gas must not be read as an
                 // asset that cannot be sold (63/64 rule; Solodit SOL-Heuristics-5).
                 if (gasleft() <= gasBefore / 63) { revert("Out of gas"); }
+                // Audit M-02: nor may a sale that failed only because the
+                // tolerance was tightened after entry. The pool can still
+                // take it, so this is a cash settlement waiting for the
+                // setting to be restored, with its insurance waterfall.
+                require(!_blockedOnlyByTightening(held), "Sale blocked only by a tightened tolerance - use settle()");
             }
         }
 
@@ -1025,6 +1122,9 @@ contract Vault {
         address uniFactory = registry.uniswapFactory();
         uint32 window = registry.twapWindow();
         if (!UniswapTwap.canQuote(uniFactory, held, asset, feeTier, window)) { return (false, 0); }
+        // Audit M-01: a price taken over a window the pool spent (nearly)
+        // empty is whatever price it was left at. Not a valuation.
+        if (!_poolDeepEnough(held, feeTier)) { return (false, 0); }
         if (amount == 0) { return (true, 0); }
         return (true, UniswapTwap.quote(uniFactory, held, asset, feeTier, amount, window));
     }
@@ -1043,9 +1143,24 @@ contract Vault {
             if (stillOwed > 0) {
                 if (!priced || value <= stillOwed) {
                     toLender = amount;
-                    stillOwed = priced ? stillOwed - value : 0;
+                    // Q3B (Covenza policy, answering Zealynx's kickoff
+                    // question): an unpriceable asset does NOT reduce what is
+                    // still owed. It used to clear the claim, so the first
+                    // unpriceable asset went to the lender and every later one
+                    // to the borrower. The borrower took the risk that left
+                    // the vault holding assets nobody can value, so while any
+                    // claim remains the lender takes all of them.
+                    if (priced) { stillOwed -= value; }
                 } else {
-                    toLender = (amount * stillOwed) / value;
+                    // Audit I-02 (Zealynx): round the lender's share UP. The
+                    // floor handed the borrower the unit that would have
+                    // covered the lender's last fraction, then cleared the
+                    // claim; with a coarse (e.g. zero-decimal) asset that left
+                    // the lender a whole unit short of what it was owed. The
+                    // lender is paid first, so it takes the fraction, and can
+                    // end at most one unit's value above what it was owed.
+                    // value > stillOwed here, so the result never exceeds amount.
+                    toLender = (amount * stillOwed + value - 1) / value;
                     stillOwed = 0;
                 }
             }
@@ -1125,9 +1240,26 @@ contract Vault {
         // against principal can only come from the vault actually losing
         // value. Found by Krait (KRAIT-002, High) on 1 October 2026; see
         // MAINNET-READINESS item 19.
+        //
+        // THE DEPOSIT IS FIRST-LOSS. It is part of totalReturned, so any loss
+        // eats the borrower's deposit before the insurance pool pays anything:
+        // the pool is drawn only once what the vault holds, deposit included,
+        // has fallen below the principal. Order of payment, below:
+        //   1. lender, up to principal + accrued interest (insurance included)
+        //   2. keeper bounty   3. protocol fee   4. borrower, the residual.
+        //
+        // Q8: if the token refuses the insurance transfer, the pool holds it
+        // for the lender (claimDeferredDraw) and the vault settles now with
+        // its own cash. The lender's place in the order does not change.
         uint256 insuranceDraw = 0;
-        if (!early && totalReturned < principal) {
-            insuranceDraw = insurancePool.draw(asset, principal - totalReturned, principal);
+        // Audit M-06: and only within the insured window, extended by any
+        // recorded outage that overlaps it (the same rule as grace). A later
+        // cash settlement still pays out the vault's own funds.
+        (uint256 insuredEnd, ) = registry.settlementWindow(deadline, insuredUntil);
+        if (!early && totalReturned < principal && block.timestamp <= insuredEnd) {
+            uint256 deferred;
+            (insuranceDraw, deferred) = insurancePool.draw(asset, principal - totalReturned, principal, lender);
+            settledInsuranceDeferred = deferred;
         }
 
         uint256 available    = totalReturned + insuranceDraw;
@@ -1222,6 +1354,7 @@ contract Vault {
         heldAmount[held] = 0;
         isHeld[held] = false;
         delete swapFeeTierOf[held];
+        delete admittedToleranceBps[held];
         heldAssets.pop();
     }
 
@@ -1229,10 +1362,64 @@ contract Vault {
     ///      TWAP-implied value less twapToleranceBps. One floor for every exit
     ///      path — voluntary swap-back, the exit simulation, and settlement.
     function _exitFloor(address held, uint256 amount, uint24 feeTier) internal view returns (uint256) {
+        return _exitFloorAt(held, amount, feeTier, registry.twapToleranceBps());
+    }
+
+    /// @dev _exitFloor() at a given tolerance.
+    function _exitFloorAt(address held, uint256 amount, uint24 feeTier, uint256 toleranceBps)
+        internal view returns (uint256)
+    {
+        // Audit M-01 (Zealynx): refuse a floor set by a pool that held too
+        // little liquidity across the window. An empty pool keeps reporting
+        // the tick it was left at, so whoever emptied it chose the floor.
+        // settle() then reverts before any insurance is drawn, and the
+        // delayed settleInKind() hands the asset over instead.
+        require(_poolDeepEnough(held, feeTier), "Pool too thin over the TWAP window");
         uint256 twapOut = UniswapTwap.quote(
             registry.uniswapFactory(), held, asset, feeTier, amount, registry.twapWindow()
         );
-        return (twapOut * (10000 - registry.twapToleranceBps())) / 10000;
+        return (twapOut * (10000 - toleranceBps)) / 10000;
+    }
+
+    /**
+     * @dev Audit M-02 (Zealynx). Whether a held asset whose sale just failed
+     *      in settleInKind() could in fact be sold at the tolerance its whole
+     *      position was admitted under, in its pinned pool.
+     *
+     *      Only a tolerance tightened since admission can make a sellable
+     *      position fail; a tighter floor than the pool's own fee (1 bp
+     *      against a 30 bp pool) fails every sale. Such a position is not
+     *      "unsold" in the sense in-kind settlement exists for, and closing
+     *      it in kind forgoes the insurance a cash settle() would draw.
+     *
+     *      False whenever the pool genuinely cannot price or take the sale:
+     *      no TWAP, too thin over the window (M-01), or a simulated exit
+     *      below the admitted floor. Those still close in kind.
+     */
+    function _blockedOnlyByTightening(address held) internal returns (bool) {
+        uint256 admitted = admittedToleranceBps[held];
+        if (registry.twapToleranceBps() >= admitted) { return false; }
+
+        uint256 amount = _sellableAmount(held);
+        uint24 feeTier = swapFeeTierOf[held];
+        if (amount == 0) { return false; }
+        if (!UniswapTwap.canQuote(registry.uniswapFactory(), held, asset, feeTier, registry.twapWindow())) { return false; }
+        if (!_poolDeepEnough(held, feeTier)) { return false; }
+
+        uint256 floorOut = _exitFloorAt(held, amount, feeTier, admitted);
+        uint256 gasBefore = gasleft();
+        uint256 out = _simulateExitOut(held, amount, feeTier);
+        // As above: an exit that failed for lack of gas proves nothing.
+        if (out == 0 && gasleft() <= gasBefore / 63) { revert("Out of gas"); }
+        return out >= floorOut;
+    }
+
+    /// @dev Whether the pair's pool held at least the registry's minimum
+    ///      liquidity, on average, across the TWAP window (audit M-01).
+    function _poolDeepEnough(address held, uint24 feeTier) internal view returns (bool) {
+        return UniswapTwap.meanLiquidity(
+            registry.uniswapFactory(), held, asset, feeTier, registry.twapWindow()
+        ) >= registry.minPoolLiquidity(held, asset);
     }
 
     /**

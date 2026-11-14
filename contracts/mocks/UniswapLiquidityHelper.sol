@@ -12,6 +12,11 @@ interface IUniswapV3PoolActions {
         bytes calldata data
     ) external returns (uint256 amount0, uint256 amount1);
 
+    function burn(int24 tickLower, int24 tickUpper, uint128 amount) external returns (uint256 amount0, uint256 amount1);
+    function collect(
+        address recipient, int24 tickLower, int24 tickUpper, uint128 amount0Requested, uint128 amount1Requested
+    ) external returns (uint128 amount0, uint128 amount1);
+
     function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external;
 
     function token0() external view returns (address);
@@ -70,6 +75,34 @@ contract UniswapLiquidityHelper {
 
         (amount0, amount1) = IUniswapV3PoolActions(pool).mint(
             address(this), tickLower, tickUpper, liquidity, abi.encode(pool)
+        );
+    }
+
+    /// @notice Mints a position over [tickLower, tickUpper] only. Lets a test
+    ///         concentrate a pool's liquidity in a narrow band, so a large
+    ///         sale runs out of liquidity part-way (audit M-03).
+    function addRangeLiquidity(address pool, int24 tickLower, int24 tickUpper, uint128 liquidity)
+        external
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (amount0, amount1) = IUniswapV3PoolActions(pool).mint(
+            address(this), tickLower, tickUpper, liquidity, abi.encode(pool)
+        );
+    }
+
+    /// @notice Burns `liquidity` of this contract's full-range position in
+    ///         `pool` and collects the tokens back to this contract. Lets a
+    ///         test empty a real pool (audit M-01).
+    function removeFullRangeLiquidity(address pool, uint128 liquidity)
+        external
+        returns (uint256 amount0, uint256 amount1)
+    {
+        int24 spacing = IUniswapV3PoolActions(pool).tickSpacing();
+        int24 tickLower = (MIN_TICK / spacing) * spacing;
+        int24 tickUpper = (MAX_TICK / spacing) * spacing;
+        (amount0, amount1) = IUniswapV3PoolActions(pool).burn(tickLower, tickUpper, liquidity);
+        IUniswapV3PoolActions(pool).collect(
+            address(this), tickLower, tickUpper, type(uint128).max, type(uint128).max
         );
     }
 

@@ -34,8 +34,8 @@ const TIMELOCK_DELAY = Number(process.env.TIMELOCK_DELAY || 0);
 const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig } = require("./lib/production-guards");
-const { sendOrQueue } = require("./lib/timelock");
-const { checkPoolHistory } = require("./lib/pool-history");
+const { sendOrQueue, readPending, writePending } = require("./lib/timelock");
+const { checkPoolHistory, ensureMinPoolLiquidity } = require("./lib/pool-history");
 
 const TWAP_WINDOW_SECONDS      = 60;   // contract floor; production is 1800
 const TWAP_TOLERANCE_BPS       = 300;  // 3%
@@ -209,15 +209,28 @@ async function main() {
   // fivefold. Tightening exposure rather than raising the premium keeps to the
   // principle the tiers were built on — deposits are the control, rates are the
   // compensation. See scripts/model-insurance-solvency.js.
+  //
+  // Blue chip's premium is 250bps, not 100 (audit rerun, November 2026). After
+  // M-06 every loan is insured for its term plus a 5-day window, so the
+  // shortest Blue chip loans carry about five days of risk on a 12.6% deposit.
+  // At 100bps they clear the 3x target on the lognormal baseline (4.4x) but
+  // collect only about half their expected draw under fat tails or a full
+  // 72-hour outage extension. At 250bps the worst case is 10.9x on the
+  // baseline, 1.1x under fat tails and 1.4x under the outage stress. Here the
+  // control could not be tightened instead: the deposit already scales with
+  // the insured horizon, and a lower cap would cut the leverage the tier
+  // exists to offer. See docs/insurance-model-rerun-2026-11.md.
+  //
   // Raising an exposure cap waits on the timelock; these all lower or keep
   // the constructor's caps, so sendOrQueue sends them at once.
-  await sendOrQueue(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 100], { network, label: "tier config: BlueChip" });
+  await sendOrQueue(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 250], { network, label: "tier config: BlueChip" });
   await sendOrQueue(registry, "setTierConfig", [1, 10000, 2000, 7 * 86400, 5000, 250], { network, label: "tier config: Standard" });
   // Speculative's premium is 100bps, not 600. Its 40% deposit exceeds the 25%
-  // maximum possible loss, so the pool's exposure is not merely improbable, it
-  // is arithmetically zero — the position cannot fall far enough. No tail model
-  // changes that, which is what separates it from Standard, whose 4.9-sigma
-  // threshold fat tails could plausibly reach.
+  // maximum loss on a Speculative holding, so that holding alone can never
+  // reach the pool. A Speculative vault may also hold safer assets at their
+  // own caps (the M-07 budget allows 70% in Blue chip), which is the only way
+  // it can draw: the November rerun finds no baseline draw at any term, and
+  // 85x cover even under fat tails.
   //
   // Charging 600bps for cover that cannot pay is not a solvency problem; it is
   // selling something that does not exist. Kept nominal rather than zero
@@ -261,6 +274,12 @@ async function main() {
     if (!listed) { console.log(`  pool ${p.address}: a token is not listed — skipped`); continue; }
     const history = await checkPoolHistory(registry, a, b, p.fee, deployer);
     if (!history.ok) { console.log(`  pool ${p.address}: not approved — ${history.reason}`); continue; }
+    const depth = await ensureMinPoolLiquidity(registry, a, b, history, p.minLiquidity,
+      (m, args, label) => sendOrQueue(registry, m, args, { network, label: `${label} for ${p.pair || "tUSDG/tWETH"}` }));
+    if (!depth.ok) { console.log(`  pool ${p.address}: not approved — ${depth.reason}`); continue; }
+    if ((await registry.minPoolLiquidity(a, b)) === 0n) {
+      console.log(`  pool ${p.address}: minimum pool liquidity announced; approve the pool after the delay`); continue;
+    }
     await sendOrQueue(registry, "setPoolFeeTier", [a, b, p.fee], {
       network, label: `approved pool ${p.pair || "tUSDG/tWETH"} (fee ${p.fee})`,
     });
@@ -303,8 +322,33 @@ async function main() {
   await factory.waitForDeployment();
   console.log(`VaultFactory    ${await factory.getAddress()}`);
 
-  await (await pool.setVaultFactory(await factory.getAddress())).wait();
-  console.log("  InsurancePool wired to factory");
+  // Audit M-05: the FIRST wiring is announced and waits like any other, and
+  // the pool refuses funding until it is wired. With a delay, the wiring is
+  // recorded for execute-timelocked.js and the reserve is seeded afterwards.
+  const factoryAddr = await factory.getAddress();
+  await (await pool.queueSetVaultFactory(factoryAddr)).wait();
+  let poolWired = false;
+  if (TIMELOCK_DELAY === 0) {
+    await (await pool.setVaultFactory(factoryAddr)).wait();
+    poolWired = true;
+    console.log("  InsurancePool wired to factory");
+  } else {
+    const id = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
+      .encode(["string", "address"], ["setVaultFactory", factoryAddr]));
+    const pending = readPending();
+    const network = hre.network.name;
+    pending[network] = (pending[network] || []).filter((p) => p.id !== id);
+    pending[network].push({
+      label: `InsurancePool.setVaultFactory(${factoryAddr})`,
+      target: await pool.getAddress(), method: "setVaultFactory", args: [factoryAddr],
+      data: pool.interface.encodeFunctionData("setVaultFactory", [factoryAddr]), id,
+      executableAt: new Date((Math.floor(Date.now() / 1000) + TIMELOCK_DELAY) * 1000).toISOString(),
+      queuedBy: deployer.address,
+    });
+    writePending(pending);
+    console.log(`  ⏳ InsurancePool wiring ANNOUNCED (${TIMELOCK_DELAY}s). Run execute-timelocked.js after the delay;`);
+    console.log("     no vault can originate, and the pool accepts no funding, until then.");
+  }
 
   // --- 6. Confirm the guard agrees with reality ------------------------
   //
@@ -341,9 +385,13 @@ async function main() {
   console.log("\nSeeded tUSDG/tWETH to deployer and borrower");
 
   const seed = ethers.parseEther("2000");
-  await (await usdgToken.approve(await pool.getAddress(), seed)).wait();
-  await (await pool.fund(usdg, seed)).wait();
-  console.log("Insurance pool seeded with 2,000 tUSDG");
+  if (poolWired) {
+    await (await usdgToken.approve(await pool.getAddress(), seed)).wait();
+    await (await pool.fund(usdg, seed)).wait();
+    console.log("Insurance pool seeded with 2,000 tUSDG");
+  } else {
+    console.log("Insurance pool NOT seeded: it accepts funding once wired (after execute-timelocked.js).");
+  }
 
   // --- 8. Persist --------------------------------------------------------
 

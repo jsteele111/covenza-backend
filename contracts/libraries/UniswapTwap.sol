@@ -27,6 +27,7 @@ interface IUniswapV3Pool {
         uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality,
         uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked
     );
+    function liquidity() external view returns (uint128);
 }
 
 /**
@@ -141,6 +142,52 @@ library UniswapTwap {
         if (pool == address(0)) return false;
         (, , , uint16 cardinality, , , ) = IUniswapV3Pool(pool).slot0();
         return uint256(cardinality) > uint256(window);
+    }
+
+    /**
+     * @notice Harmonic-mean in-range liquidity of the pool over the last
+     *         `window` seconds, or 0 if that window cannot be observed.
+     *
+     * @dev    Audit M-01 (Zealynx). An average tick says nothing about how
+     *         much liquidity stood behind it. A pool held EMPTY for the whole
+     *         window still reports a tick (whatever price it was left at), so
+     *         a TWAP taken over an empty window can be set by whoever emptied
+     *         it. Callers compare this value with a per-pair minimum and
+     *         treat a pool below it as unable to price the asset.
+     *
+     *         Same formula as Uniswap v3-periphery OracleLibrary.consult's
+     *         harmonicMeanLiquidity: the pool accumulates seconds / liquidity
+     *         (counting zero liquidity as 1), so window / Δ(seconds per
+     *         liquidity) is the harmonic mean. An empty window gives ~1.
+     *         Δ is zero only for a pool that reports no accumulator at all
+     *         (a test mock); real pools always advance it, so that case is
+     *         read as unbounded liquidity rather than as a division by zero.
+     */
+    function meanLiquidity(
+        address factory,
+        address tokenA,
+        address tokenB,
+        uint24  fee,
+        uint32  window
+    ) public view returns (uint128) {
+        if (window == 0) return 0;
+
+        address pool = IUniswapV3Factory(factory).getPool(tokenA, tokenB, fee);
+        if (pool == address(0)) return 0;
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = window;
+        secondsAgos[1] = 0;
+
+        try IUniswapV3Pool(pool).observe(secondsAgos) returns (int56[] memory, uint160[] memory spl) {
+            uint160 delta;
+            unchecked { delta = spl[1] - spl[0]; }   // the accumulator wraps by design
+            if (delta == 0) return type(uint128).max;
+            uint256 harmonic = (uint256(window) * type(uint160).max) / (uint256(delta) << 32);
+            return harmonic > type(uint128).max ? type(uint128).max : uint128(harmonic);
+        } catch {
+            return 0;
+        }
     }
 
     /// @dev Arithmetic mean tick over the window. Ported from Uniswap

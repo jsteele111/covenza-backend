@@ -97,6 +97,18 @@ contract ProtocolInvariants is ProtocolSetup {
         assertLe(reserve, weth.balanceOf(address(pool)), "reserve exceeds pool balance");
     }
 
+    /// Insurance held for lenders after a refused transfer (audit L-06) is
+    /// exactly what the draws deferred less what lenders have claimed, sits
+    /// outside the reserve, and is backed by tokens the pool still holds.
+    function invariant_deferredDrawsBacked() public view {
+        uint256 held;
+        for (uint256 i = 0; i < lenders.length; i++) held += pool.deferredDrawOf(address(weth), lenders[i]);
+        assertEq(held, h.ghostDeferred(), "deferred insurance drifted from draws and claims");
+        assertFalse(h.ghostDeferredClaimWrong(), "a claim paid other than the amount held");
+        assertLe(pool.reserveOf(address(weth)) + held, weth.balanceOf(address(pool)),
+            "reserve plus deferred insurance exceeds pool balance");
+    }
+
     /// No draw ever exceeded 10% of the loan's principal or 5% of what was
     /// left in the reserve (item 8).
     function invariant_drawsWithinBothCaps() public view {
@@ -135,9 +147,10 @@ contract ProtocolInvariants is ProtocolSetup {
 
     /// Printed once per run, so a reviewer can see the paths were exercised.
     function afterInvariant() external view {
-        string[14] memory names = ["originate", "fillMandate", "swap.ok", "swapBack.ok",
+        string[17] memory names = ["originate", "fillMandate", "swap.ok", "swapBack.ok",
             "movePrice", "manipulateSpot", "toggleFreeze", "donate", "warpToInKindWindow", "botHour",
-            "settle.ok", "settleInKind.ok", "claim.ok", "cancel.ok"];
+            "settle.ok", "settleInKind.ok", "claim.ok", "cancel.ok",
+            "togglePoolBlock", "draw.deferred", "claimDeferredDraw.ok"];
         for (uint256 i = 0; i < names.length; i++) {
             console.log(names[i], h.calls(names[i]));
         }

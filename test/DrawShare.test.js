@@ -21,6 +21,8 @@ async function poolWith(delay) {
   const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock WETH", "WETH", 18);
   const pool = await (await ethers.getContractFactory("InsurancePool", operator))
     .deploy(operator.address, 1000, delay);                 // draw cap 10% of principal
+  await pool.queueSetVaultFactory(operator.address);   // audit M-05: the first wiring is announced too
+  if (delay > 0) { await time.increase(delay); }
   await pool.setVaultFactory(operator.address);
   await pool.registerVault(claimant.address);
 
@@ -33,7 +35,7 @@ async function poolWith(delay) {
   // A loss on a 10 WETH loan: the 10% cap allows at most 1 WETH.
   async function claim() {
     const before = await weth.balanceOf(claimant.address);
-    await pool.connect(claimant).draw(await weth.getAddress(), E("5"), E("10"));
+    await pool.connect(claimant).draw(await weth.getAddress(), E("5"), E("10"), claimant.address);
     return (await weth.balanceOf(claimant.address)) - before;
   }
 

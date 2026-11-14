@@ -7,8 +7,8 @@ import {Vault} from "../contracts/Vault.sol";
 import {VaultFactory} from "../contracts/VaultFactory.sol";
 import {AssetRegistry} from "../contracts/AssetRegistry.sol";
 import {InsurancePool} from "../contracts/InsurancePool.sol";
-import {MockERC20} from "../contracts/mocks/MockERC20.sol";
 import {MockFreezableToken} from "../contracts/mocks/MockFreezableToken.sol";
+import {MockSenderBlockToken} from "../contracts/mocks/MockSenderBlockToken.sol";
 import {MockSwapRouter} from "../contracts/mocks/MockSwapRouter.sol";
 import {MockUniswapV3Factory, MockUniswapV3Pool} from "../contracts/mocks/MockUniswapV3.sol";
 import {MockIdentityAdapter} from "../contracts/mocks/MockIdentityAdapter.sol";
@@ -36,7 +36,7 @@ abstract contract ProtocolSetup is Test {
     VaultFactory internal factory;
     AssetRegistry internal registry;
     InsurancePool internal pool;
-    MockERC20 internal weth;
+    MockSenderBlockToken internal weth;   // the issuer can block the pool as a sender (audit L-06)
     MockFreezableToken internal usdx;
     MockSwapRouter internal router;
     MockUniswapV3Pool internal uniPool;
@@ -52,7 +52,7 @@ abstract contract ProtocolSetup is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
 
-        weth = new MockERC20("Mock WETH", "WETH", 18);
+        weth = new MockSenderBlockToken("Mock WETH", "WETH", 18);
         usdx = new MockFreezableToken("Mock USDX", "USDX", 18);
 
         router = new MockSwapRouter();
@@ -70,6 +70,7 @@ abstract contract ProtocolSetup is Test {
         registry = new AssetRegistry(address(this), address(router), address(uniFactory), 0);
         registry.addAssetWithTier(address(weth), 0, AssetRegistry.RiskTier.BlueChip);
         registry.addAssetWithTier(address(usdx), 0, AssetRegistry.RiskTier.BlueChip);
+        registry.setMinPoolLiquidity(address(weth), address(usdx), 1);   // audit M-01
         registry.setPoolFeeTier(address(weth), address(usdx), 3000);
         registry.setSettlementConfig(1800, 200, 1 days, 100, 200);
         // Permissive tier: only the vault's own rules bind, not the floors.
@@ -79,6 +80,7 @@ abstract contract ProtocolSetup is Test {
         pool = new InsurancePool(address(this), 1000, 0);
         Vault impl = new Vault();
         factory = new VaultFactory(address(id), address(registry), address(pool), treasury, address(impl), 0);
+        pool.queueSetVaultFactory(address(factory));   // audit M-05: the first wiring is announced too
         pool.setVaultFactory(address(factory));
 
         weth.mint(address(this), INITIAL_RESERVE);

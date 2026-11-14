@@ -56,8 +56,14 @@ async function stack() {
 
   const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
     operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+    // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+    // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+    // floor before M-06, so the coefficient is scaled to keep that deposit valid
+    // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+    await registry.setDepositCoeffBps(13700);
   await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
   await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
+  await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
   await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
   // Outage detection off: these tests jump the clock by days, which would
   // otherwise be recorded as a sequencer outage and move every window.
@@ -68,6 +74,7 @@ async function stack() {
   const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
   const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
     await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+  await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
   await pool.setVaultFactory(await factory.getAddress());
 
   // Reserve of 100 WETH, so the 5% per-draw share (item 8) is 5 WETH and the
@@ -98,7 +105,7 @@ async function stack() {
     await time.increaseTo(await vault.inKindFrom());
   }
 
-  return { operator, lender, borrower, stranger, weth, usdx, router, uniPool, registry, pool, vault,
+  return { operator, lender, borrower, stranger, weth, usdx, router, uniFactory, uniPool, registry, pool, vault,
            breakTheSale, toInKindWindow };
 }
 
@@ -180,7 +187,7 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     expect(await vault.settledProtocolFee()).to.equal(0);
   });
 
-  it("Refuses when every asset sells, and points at settle(), which draws insurance for a loss (audit KRAIT-005)", async function () {
+  it("Refuses when every asset sells, and points at settle(), which settles in cash (audit KRAIT-005; past the insured window, so no draw: M-06)", async function () {
     const { lender, stranger, usdx, router, uniPool, vault, toInKindWindow } = await loadFixture(stack);
     // A loss: USDX is now worth half a WETH, at spot and at the TWAP alike.
     await router.setRate(await usdx.getAddress(), await vault.asset(), 1, 2);
@@ -195,8 +202,13 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
 
     await vault.connect(stranger).settle();
     expect(await vault.settledInKind()).to.equal(false);
-    // 3.5 cash + 8 USDX sold for 4 = 7.5 against 10 principal: a 1 WETH draw (10% cap).
-    expect(await vault.settledInsuranceDraw()).to.equal(E("1"));
+    // 3.5 cash + 8 USDX sold for 4 = 7.5 against 10 principal. Inside the
+    // insured window this would draw 1 WETH (10% cap); the in-kind window
+    // opens more than a week after grace, past the 5-day insured window, so
+    // since audit M-06 this late cash settlement pays out the vault's own
+    // funds and draws nothing.
+    expect(await vault.settledTotalReturned()).to.equal(E("7.5"));
+    expect(await vault.settledInsuranceDraw()).to.equal(0n);
     expect(await usdx.balanceOf(await vault.getAddress())).to.equal(0);
     expect(await usdx.balanceOf(lender.address)).to.equal(0);
   });
@@ -317,5 +329,187 @@ describe("Item 14 — in-kind settlement when a held asset cannot be sold", func
     await vault.connect(borrower).swapBack(await usdx.getAddress(), BOUGHT, 1);
     await toInKindWindow();
     await expect(vault.connect(lender).settleInKind()).to.be.revertedWith("Nothing held - use settle()");
+  });
+
+  // --- Audit I-02 (Zealynx): rounding a coarse asset's split ---
+  //
+  // The lender's share of a priced, unsellable asset was floored, the rest went
+  // to the borrower, and the lender's claim was cleared. With a zero-decimal
+  // asset that left the lender up to a whole unit short. It is now rounded up.
+  describe("Audit I-02 — the lender's in-kind share is rounded up", function () {
+    /** The same loan, holding a ZERO-decimal stock priced near 0.13 WETH a unit. */
+    async function coarseStack() {
+      const [operator, lender, borrower] = await ethers.getSigners();
+      const weth = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock WETH", "WETH", 18);
+      const stock = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Whole-share stock", "WSTK", 0);
+      const router = await (await ethers.getContractFactory("MockSwapRouter", operator)).deploy();
+      const uniFactory = await (await ethers.getContractFactory("MockUniswapV3Factory", operator)).deploy();
+      const uniPool = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
+      await uniFactory.setPool(await weth.getAddress(), await stock.getAddress(), POOL_FEE, await uniPool.getAddress());
+      // 1 unit (raw 1) ≈ 0.13 WETH (raw 1.3e17): price 1.3e17 per raw unit.
+      await uniPool.setAvgTick(tickFor(await stock.getAddress(), await weth.getAddress(), 394000n));
+
+      const kyc = await (await ethers.getContractFactory("KYCRegistry", operator)).deploy(operator.address, operator.address, 0);
+      await kyc.verify(borrower.address, 7, ethers.id("test-fixture"));
+      await kyc.verify(lender.address, 7, ethers.id("test-fixture"));
+      const registry = await (await ethers.getContractFactory("AssetRegistry", operator)).deploy(
+        operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
+        // Audit M-06 prices every loan on term + the 5-day insured window. This suite
+        // tests settlement mechanics at a 15% deposit on a 7-day Blue chip loan, the
+        // floor before M-06, so the coefficient is scaled to keep that deposit valid
+        // (1.37 x 60% x sqrt(12/365) = 14.9%). Pricing itself is tested in RiskTiers.
+        await registry.setDepositCoeffBps(13700);
+      await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
+      await registry.addAssetWithTier(await stock.getAddress(), 0, 0);
+      await registry.setMinPoolLiquidity(await weth.getAddress(), await stock.getAddress(), 1n);
+      await registry.setPoolFeeTier(await weth.getAddress(), await stock.getAddress(), POOL_FEE);
+      await registry.setOutageConfig(0, 0, 0);
+
+      const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
+      const twapLib = await (await ethers.getContractFactory("UniswapTwap", operator)).deploy();
+      const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
+      const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
+        await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+      await pool.queueSetVaultFactory(await factory.getAddress());
+      await pool.setVaultFactory(await factory.getAddress());
+
+      // The router trades at exactly the TWAP price of one unit.
+      const q = await twapLib.quote(uniFactory.getAddress(), stock.getAddress(), weth.getAddress(), POOL_FEE, 1n, 1800);
+      await router.setRate(await stock.getAddress(), await weth.getAddress(), q, 1n);
+      await router.setRate(await weth.getAddress(), await stock.getAddress(), 1n, q);
+      await weth.mint(await router.getAddress(), E("1000"));
+      await stock.mint(await router.getAddress(), 1000n);
+
+      await weth.mint(lender.address, P);
+      await weth.connect(lender).approve(await factory.getAddress(), P);
+      await factory.connect(lender).deployVaultWithTier(
+        await weth.getAddress(), borrower.address, P, 1200, 7, false, D, ethers.ZeroAddress, 0);
+      const vault = await ethers.getContractAt("Vault", await factory.allVaults(0));
+      const premium = await vault.insurancePremium();
+      await weth.mint(borrower.address, D + premium);
+      await weth.connect(borrower).approve(await vault.getAddress(), D + premium);
+      await vault.connect(borrower).payDeposit();
+      const UNITS = 61n;
+      await vault.connect(borrower).swap(await stock.getAddress(), q * UNITS, 1, POOL_FEE);
+      expect(await stock.balanceOf(await vault.getAddress())).to.equal(UNITS);
+
+      // The sale fails; the TWAP still prices the stock, so it is split by value.
+      await router.setRate(await stock.getAddress(), await weth.getAddress(), 1n, 1n);
+      await time.increaseTo(await vault.inKindFrom());
+      return { lender, borrower, weth, stock, vault, q, UNITS, cash: P + D - q * UNITS };
+    }
+
+    it("The finding: a zero-decimal split gives the lender the unit that covers its last fraction", async function () {
+      const { lender, borrower, weth, stock, vault, q, UNITS, cash } = await coarseStack();
+      const before = await weth.balanceOf(lender.address);
+      await vault.connect(lender).settleInKind();
+
+      const owed = P + (await vault.settledFee());
+      const stillOwed = owed - cash;
+      expect(stillOwed % q).to.not.equal(0n);                     // a genuine fraction of a unit
+      const floor = stillOwed / q;                                 // what the lender used to receive
+      expect(await stock.balanceOf(lender.address)).to.equal(floor + 1n);
+      expect(await stock.balanceOf(borrower.address)).to.equal(UNITS - floor - 1n);
+
+      // Cash plus units at the TWAP now reach what the lender was owed, and
+      // exceed it by less than one unit's value.
+      const received = (await weth.balanceOf(lender.address)) - before + (floor + 1n) * q;
+      expect(received).to.be.greaterThanOrEqual(owed);
+      expect(received - owed).to.be.lessThan(q);
+      // Nothing is created or lost.
+      expect((await stock.balanceOf(lender.address)) + (await stock.balanceOf(borrower.address))).to.equal(UNITS);
+      expect(await stock.balanceOf(await vault.getAddress())).to.equal(0n);
+    });
+  });
+
+  // --- Q3B (Covenza's answer to Zealynx's kickoff question 3B) ---
+  //
+  // An unpriceable asset used to clear the lender's whole remaining claim, so
+  // with two of them the first went to the lender and the second to the
+  // borrower. It no longer counts against the claim: while anything is still
+  // owed, every unpriceable asset goes to the lender.
+  describe("Q3B — while anything is owed, every unpriceable asset goes to the lender", function () {
+    /** The usual 8 USDX position, plus 2 WETH of a second stock, USDY. */
+    async function twoAssets() {
+      const env = await loadFixture(stack);
+      const { operator, borrower, weth, router, uniFactory, registry, vault } = env;
+      const usdy = await (await ethers.getContractFactory("MockERC20", operator)).deploy("Mock USDY", "USDY", 18);
+      const poolY = await (await ethers.getContractFactory("MockUniswapV3Pool", operator)).deploy();
+      await uniFactory.setPool(await weth.getAddress(), await usdy.getAddress(), POOL_FEE, await poolY.getAddress());
+      await poolY.setAvgTick(0);
+      await router.setRate(await weth.getAddress(), await usdy.getAddress(), 1, 1);
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 1);
+      await usdy.mint(await router.getAddress(), E("1000"));
+      await registry.addAssetWithTier(await usdy.getAddress(), 0, 0);
+      await registry.setMinPoolLiquidity(await weth.getAddress(), await usdy.getAddress(), 1n);
+      await registry.setPoolFeeTier(await weth.getAddress(), await usdy.getAddress(), POOL_FEE);
+      await vault.connect(borrower).swap(await usdy.getAddress(), E("2"), 1, POOL_FEE);
+      return { ...env, usdy, poolY };
+    }
+
+    it("The finding: two unpriceable assets with a claim outstanding both go to the lender", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, uniPool, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      await uniPool.setMaxWindow(0);                     // neither pool can price its stock
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      // Cash of 1.5 WETH left the lender far short, so both go to the lender.
+      expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
+      expect(await usdy.balanceOf(lender.address)).to.equal(E("2"));
+      expect(await usdx.balanceOf(borrower.address)).to.equal(0n);
+      expect(await usdy.balanceOf(borrower.address)).to.equal(0n);
+      expect(await vault.settledInsuranceDraw()).to.equal(0n);
+      expect(await vault.heldAssetCount()).to.equal(0n);
+    });
+
+    it("A priced asset that does not cover the claim goes to the lender, and the unpriceable one follows it", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();                               // USDX unsellable, still priced at 1:1
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      await poolY.setMaxWindow(0);                        // USDY cannot be priced
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      // Owed ~10.02 against 1.5 of cash: 8 USDX at 1:1 leaves ~0.52 owed, so
+      // the unpriceable USDY goes to the lender too.
+      expect(await usdx.balanceOf(lender.address)).to.equal(BOUGHT);
+      expect(await usdy.balanceOf(lender.address)).to.equal(E("2"));
+    });
+
+    it("Once a priced asset has covered the claim, the unpriceable one goes to the borrower", async function () {
+      const { lender, borrower, usdx, usdy, router, weth, uniPool, poolY, vault, breakTheSale, toInKindWindow } = await twoAssets();
+      await breakTheSale();
+      await router.setRate(await usdy.getAddress(), await weth.getAddress(), 1, 100);
+      // USDX's TWAP rises to ~2 WETH a unit: 8 USDX (~16) more than covers the ~8.52 still owed.
+      await uniPool.setAvgTick(tickFor(await usdx.getAddress(), await weth.getAddress(), 6932n));
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      expect(await usdx.balanceOf(lender.address)).to.be.greaterThan(0n);
+      expect(await usdx.balanceOf(borrower.address)).to.be.greaterThan(0n);    // priced split
+      expect(await usdy.balanceOf(borrower.address)).to.equal(E("2"));        // nothing left owed
+      expect(await usdy.balanceOf(lender.address)).to.equal(0n);
+    });
+
+    it("With nothing owed after the cash, every unpriceable asset goes to the borrower", async function () {
+      const { lender, borrower, usdx, usdy, uniPool, poolY, vault, toInKindWindow } = await twoAssets();
+      // Sell back almost everything: 1.5 + 7.9 + 1.9 = 11.3 WETH of cash, above what is owed.
+      await vault.connect(borrower).swapBack(await usdx.getAddress(), E("7.9"), 1);
+      await vault.connect(borrower).swapBack(await usdy.getAddress(), E("1.9"), 1);
+      await uniPool.setMaxWindow(0);
+      await poolY.setMaxWindow(0);
+      await toInKindWindow();
+
+      await vault.connect(lender).settleInKind();
+      expect(await vault.settledLenderPayout()).to.equal(P + (await vault.settledFee()));
+      expect(await usdx.balanceOf(borrower.address)).to.equal(E("0.1"));
+      expect(await usdy.balanceOf(borrower.address)).to.equal(E("0.1"));
+      expect(await usdx.balanceOf(lender.address)).to.equal(0n);
+      expect(await usdy.balanceOf(lender.address)).to.equal(0n);
+    });
   });
 });

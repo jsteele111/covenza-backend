@@ -589,6 +589,9 @@ contract VaultFactory is Timelocked {
         // --- capacity (MAINNET-READINESS item 13) ---
         uint256 totalCapacity;              // most this mandate lends across ALL fills
         uint256 filled;                     // principal lent so far
+
+        // --- lender's consent to the insurance skim (audit L-01) ---
+        uint256 maxInsuranceSkimRateBps;    // highest insuranceSkimRateBps a fill may charge the lender
     }
 
     /// @dev Published as one struct: eleven-plus arguments would overflow the
@@ -608,6 +611,7 @@ contract VaultFactory is Timelocked {
         uint256 minDepositBps;
         uint256 minAprBps;
         uint256 totalCapacity;
+        uint256 maxInsuranceSkimRateBps;    // audit L-01; 0 = fill only while no skim is charged
     }
 
     Mandate[] internal _mandates;
@@ -654,6 +658,7 @@ contract VaultFactory is Timelocked {
         require(t.minAprBps > 0,                          "Minimum APR must be nonzero");
         require(t.minAprBps <= t.baseAprBps,              "Minimum APR above base");
         require(t.minDepositBps <= 10000,                 "Deposit floor above 100%");
+        require(t.maxInsuranceSkimRateBps <= 10000,       "Skim ceiling above 100%");
         require(
             t.maxTermSeconds <= assetRegistry.maxTermForTier(AssetRegistry.RiskTier(t.maxTier)),
             "Maximum term exceeds the tier's limit"
@@ -683,6 +688,7 @@ contract VaultFactory is Timelocked {
         m.minDepositBps            = t.minDepositBps;
         m.minAprBps                = t.minAprBps;
         m.totalCapacity            = t.totalCapacity;
+        m.maxInsuranceSkimRateBps  = t.maxInsuranceSkimRateBps;
         // cancelled defaults to false; filled starts at zero
 
         emit MandatePublished(id, msg.sender, t.asset, t.maxPrincipal, m.expiry, t.maxTier);
@@ -709,7 +715,7 @@ contract VaultFactory is Timelocked {
 
     /// @notice True if this mandate could be filled at all right now. Does not
     ///         consider the lender's balance or allowance — see
-    ///         quoteMandateFillable for that.
+    ///         quoteMandatePrincipalCapacity and previewMandateFill for that.
     function isMandateLive(uint256 id) public view returns (bool) {
         if (id >= _mandates.length) return false;
         Mandate storage m = _mandates[id];
@@ -782,14 +788,19 @@ contract VaultFactory is Timelocked {
         return apr < m.minAprBps ? m.minAprBps : apr;
     }
 
-    /// @notice How much of this mandate could actually be drawn right now —
-    ///         the lesser of what the lender has approved, what they hold, and
-    ///         what the mandate offers.
+    /// @notice An UPPER BOUND on the principal one fill of this mandate could
+    ///         take: the lesser of what the lender has approved, what they
+    ///         hold, and what the mandate still offers per fill; zero when that
+    ///         is below the mandate's minimum principal, since no fill can then
+    ///         succeed. Not a promise that a fill of this size will execute —
+    ///         the insurance skim also comes from the lender, and depends on
+    ///         the term chosen. Use previewMandateFill for a specific fill.
     ///
-    /// @dev An allowance is not a commitment; it can be revoked at any moment
-    ///      for free. A book that displays intended size rather than this
-    ///      becomes a book of liquidity that cannot be taken.
-    function quoteMandateFillable(uint256 id) public view returns (uint256) {
+    /// @dev Audit L-04 (Zealynx): renamed from quoteMandateFillable, which
+    ///      read as an executable amount and could return a remainder below
+    ///      the minimum or ignore the skim. An allowance is not a commitment;
+    ///      it can be revoked at any moment for free, so this reads it live.
+    function quoteMandatePrincipalCapacity(uint256 id) public view returns (uint256) {
         if (!isMandateLive(id)) return 0;
         Mandate storage m = _mandates[id];
 
@@ -798,7 +809,108 @@ contract VaultFactory is Timelocked {
 
         uint256 available = allowance < balance ? allowance : balance;
         uint256 offer = m.maxPrincipal < mandateRemaining(id) ? m.maxPrincipal : mandateRemaining(id);
-        return available < offer ? available : offer;
+        uint256 cap = available < offer ? available : offer;
+        return cap < m.minPrincipal ? 0 : cap;
+    }
+
+    // --- Fill preview (audit L-04) ---
+    //
+    // Result codes from previewMandateFill. 0 means the fill would execute as
+    // the chain stands now; any later change (an allowance revoked, a tier or
+    // skim reconfigured, another borrower filling first) can still stale it.
+    uint8 internal constant FILL_OK                  = 0;
+    uint8 internal constant FILL_NOT_LIVE            = 1;
+    uint8 internal constant FILL_NOT_PERMITTED       = 2;
+    uint8 internal constant FILL_PRINCIPAL_BOUNDS    = 3;
+    uint8 internal constant FILL_CAPACITY            = 4;
+    uint8 internal constant FILL_TERM_BOUNDS         = 5;
+    uint8 internal constant FILL_DEPOSIT_MANDATE     = 6;
+    uint8 internal constant FILL_SKIM_LIMIT          = 7;
+    uint8 internal constant FILL_SAME_PARTY          = 8;
+    uint8 internal constant FILL_BORROWER_KYC        = 9;
+    uint8 internal constant FILL_LENDER_KYC          = 10;
+    uint8 internal constant FILL_TIER_TERM           = 11;
+    uint8 internal constant FILL_TIER_DEPOSIT        = 12;
+    uint8 internal constant FILL_LENDER_FUNDS        = 13;
+
+    /**
+     * @notice Whether `borrower` could fill mandate `id` for this principal,
+     *         term and deposit right now, the APR it would be charged, and the
+     *         total the lender's wallet would be debited (principal plus the
+     *         current insurance skim).
+     *
+     * @dev    Audit L-04 (Zealynx). Runs the same checks as fillMandate, in
+     *         the same function for the mandate's own terms, plus origination's
+     *         eligibility and tier checks and the lender's allowance AND
+     *         balance against the full debit. The borrower compares `aprBps`
+     *         with their own limit and checks their own deposit and premium.
+     *         A preview is a snapshot: anything that changes before the fill
+     *         lands can still make it revert.
+     */
+    function previewMandateFill(
+        uint256 id,
+        address borrower,
+        uint256 principal,
+        uint256 duration,
+        bool    useSeconds,
+        uint256 deposit
+    ) external view returns (uint8 code, uint256 aprBps, uint256 lenderDebit) {
+        uint256 termSeconds = useSeconds ? duration : duration * 1 days;
+        (code, aprBps) = _checkFill(id, borrower, principal, termSeconds, deposit);
+        if (code != FILL_OK) return (code, aprBps, 0);
+
+        Mandate storage m = _mandates[id];
+        if (m.lender == borrower) return (FILL_SAME_PARTY, aprBps, 0);
+        if (!kycRegistry.isEligible(borrower, requiredBorrowerClaims)) return (FILL_BORROWER_KYC, aprBps, 0);
+        if (requiredLenderClaims != 0 && !kycRegistry.isEligible(m.lender, requiredLenderClaims)) {
+            return (FILL_LENDER_KYC, aprBps, 0);
+        }
+        AssetRegistry.RiskTier tier = AssetRegistry.RiskTier(m.maxTier);
+        if (termSeconds > assetRegistry.maxTermForTier(tier)) return (FILL_TIER_TERM, aprBps, 0);
+        if (deposit < (principal * assetRegistry.minimumDepositBpsForTier(tier, termSeconds)) / 10000) {
+            return (FILL_TIER_DEPOSIT, aprBps, 0);
+        }
+
+        lenderDebit = principal + quoteInsuranceSkim(principal, aprBps, duration, useSeconds);
+        if (IERC20(m.asset).allowance(m.lender, address(this)) < lenderDebit
+            || IERC20(m.asset).balanceOf(m.lender) < lenderDebit) {
+            return (FILL_LENDER_FUNDS, aprBps, lenderDebit);
+        }
+    }
+
+    /// @dev The mandate's own terms, shared by fillMandate and the preview so
+    ///      the two cannot disagree. Returns a FILL_ code and, when it is
+    ///      FILL_OK, the APR the formula charges.
+    function _checkFill(uint256 id, address borrower, uint256 principal, uint256 termSeconds, uint256 deposit)
+        internal view returns (uint8, uint256)
+    {
+        if (!isMandateLive(id)) return (FILL_NOT_LIVE, 0);
+        Mandate storage m = _mandates[id];
+        if (m.permittedBorrower != address(0) && m.permittedBorrower != borrower) return (FILL_NOT_PERMITTED, 0);
+        if (principal < m.minPrincipal || principal > m.maxPrincipal) return (FILL_PRINCIPAL_BOUNDS, 0);
+        if (principal > m.totalCapacity - m.filled) return (FILL_CAPACITY, 0);
+        if (termSeconds < m.minTermSeconds || termSeconds > m.maxTermSeconds) return (FILL_TERM_BOUNDS, 0);
+        uint256 depositBps = (deposit * 10000) / principal;
+        if (depositBps < m.minDepositBps) return (FILL_DEPOSIT_MANDATE, 0);
+        // Audit L-01 (Zealynx): the skim is taken from the LENDER on top of
+        // the principal, at the rate in force when the mandate is FILLED,
+        // possibly long after it was published. A lender who publishes is
+        // consenting to the rate they named, and to no higher one: silence
+        // is not consent to a later repricing. A raised rate leaves older
+        // mandates unfillable until their lender republishes.
+        if (insuranceSkimRateBps > m.maxInsuranceSkimRateBps) return (FILL_SKIM_LIMIT, 0);
+        return (FILL_OK, quoteMandateApr(id, termSeconds, depositBps));
+    }
+
+    /// @dev fillMandate's revert reason for a _checkFill code.
+    function _fillRefusal(uint8 code) internal pure returns (string memory) {
+        if (code == FILL_NOT_LIVE)         return "Mandate is not live";
+        if (code == FILL_NOT_PERMITTED)    return "Not the permitted borrower for this mandate";
+        if (code == FILL_PRINCIPAL_BOUNDS) return "Principal outside the mandate's bounds";
+        if (code == FILL_CAPACITY)         return "Exceeds the mandate's remaining capacity";
+        if (code == FILL_TERM_BOUNDS)      return "Term outside the mandate's bounds";
+        if (code == FILL_DEPOSIT_MANDATE)  return "Deposit below the mandate's minimum";
+        return "Insurance skim above the mandate's limit";
     }
 
     /**
@@ -851,41 +963,23 @@ contract VaultFactory is Timelocked {
         uint256 deposit,
         uint256 maxAprBps
     ) external returns (address vaultAddress) {
-        require(isMandateLive(id), "Mandate is not live");
-
         uint256 apr;
         address asset;
         address lender;
 
         // Scoped so the mandate pointer and the validation locals are dead
-        // before origination, which needs the stack.
+        // before origination, which needs the stack. The mandate's terms are
+        // checked by _checkFill, which previewMandateFill shares (audit L-04).
         {
+            uint8 code;
+            (code, apr) = _checkFill(id, msg.sender, principal, useSeconds ? duration : duration * 1 days, deposit);
+            if (code != FILL_OK) { revert(_fillRefusal(code)); }
+            require(apr <= maxAprBps, "APR above the borrower's limit");
+
             Mandate storage m = _mandates[id];
             asset  = m.asset;
             lender = m.lender;
-
-            require(
-                m.permittedBorrower == address(0) || m.permittedBorrower == msg.sender,
-                "Not the permitted borrower for this mandate"
-            );
-            require(
-                principal >= m.minPrincipal && principal <= m.maxPrincipal,
-                "Principal outside the mandate's bounds"
-            );
-            require(principal <= m.totalCapacity - m.filled, "Exceeds the mandate's remaining capacity");
             m.filled += principal;
-
-            uint256 termSeconds = useSeconds ? duration : duration * 1 days;
-            require(
-                termSeconds >= m.minTermSeconds && termSeconds <= m.maxTermSeconds,
-                "Term outside the mandate's bounds"
-            );
-
-            uint256 depositBps = (deposit * 10000) / principal;
-            require(depositBps >= m.minDepositBps, "Deposit below the mandate's minimum");
-
-            apr = quoteMandateApr(id, termSeconds, depositBps);
-            require(apr <= maxAprBps, "APR above the borrower's limit");
         }
 
         vaultAddress = _deployVault(OriginationParams({
@@ -936,7 +1030,8 @@ contract VaultFactory is Timelocked {
         uint256 premiumBps = assetRegistry.insurancePremiumBpsForTier(
             AssetRegistry.RiskTier(_mandates[id].maxTier)
         );
-        return (deposit, (principal * premiumBps * termSeconds) / (10000 * 365 days));
+        // Audit M-06: priced on term + the insured window, as Vault.initialize does.
+        return (deposit, (principal * premiumBps * (termSeconds + assetRegistry.insuredWindow())) / (10000 * 365 days));
     }
 
     /**

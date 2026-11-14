@@ -57,6 +57,12 @@ contract InsurancePool is Timelocked, OperatorControlled {
     ///         going through fund() are not counted as reserves).
     mapping(address => uint256) public reserveOf;
 
+    /// @notice Q8: insurance a vault's settlement was entitled to but could
+    ///         not be paid, because the token refused the transfer. Held for
+    ///         the lender (asset => lender => amount), outside the reserve, and
+    ///         paid by claimDeferredDraw() once the token allows it.
+    mapping(address => mapping(address => uint256)) public deferredDrawOf;
+
     /// @notice Vaults registered by the factory and permitted to draw.
     mapping(address => bool) public isRegisteredVault;
 
@@ -91,6 +97,8 @@ contract InsurancePool is Timelocked, OperatorControlled {
     event VaultRegistered(address indexed vault);
     event Funded(address indexed asset, address indexed from, uint256 amount);
     event Drawn(address indexed asset, address indexed vault, uint256 requested, uint256 paid);
+    event DrawDeferred(address indexed asset, address indexed vault, address indexed beneficiary, uint256 amount);
+    event DeferredDrawClaimed(address indexed asset, address indexed beneficiary, uint256 amount);
     event AdminWithdrawal(address indexed asset, address indexed to, uint256 amount);
 
     // --- Constructor ---
@@ -122,14 +130,21 @@ contract InsurancePool is Timelocked, OperatorControlled {
     // --- Configuration (operator-only) ---
 
     /**
-     * @notice Sets the VaultFactory allowed to register vaults.
+     * @notice Sets the VaultFactory allowed to register vaults. EVERY call,
+     *         the first included, must be announced with queueSetVaultFactory
+     *         and can only execute after `timelockDelay`.
      *
-     *         The FIRST call is instant: factory and pool reference each
-     *         other, so one must be deployed first and wired to the other, and
-     *         an unwired pool has no registered vaults and nothing to protect.
-     *
-     *         Every LATER call must be announced with queueSetVaultFactory and
-     *         can only execute after `timelockDelay`.
+     * @dev    WHY THE FIRST CALL IS DELAYED TOO (audit M-05, Zealynx). The
+     *         first wiring used to be instant, on the reasoning that an
+     *         unwired pool has nothing to protect. But a registration
+     *         outlives the factory that made it: an operator key compromised
+     *         only during bootstrap could wire its own address, register
+     *         itself as a vault, and keep drawing on reserves funded long
+     *         after the genuine factory was installed. Announcing the first
+     *         wiring like every other gives monitors the same review window,
+     *         and lets the operator cancel an announcement it did not make.
+     *         fund() also refuses money until a factory is wired, so nothing
+     *         can be deposited into a pool whose wiring is still pending.
      *
      * @dev    WHY THE LATER CALLS ARE DELAYED. The factory decides who may
      *         register as a vault, and a registered vault may call draw() with
@@ -148,21 +163,17 @@ contract InsurancePool is Timelocked, OperatorControlled {
      */
     function setVaultFactory(address _factory) external onlyOperator {
         require(_factory != address(0), "Invalid factory address");
-
-        if (vaultFactory != address(0)) {
-            _consume(_vaultFactoryId(_factory));
-        }
+        _consume(_vaultFactoryId(_factory));
 
         address previous = vaultFactory;
         vaultFactory = _factory;
         emit VaultFactoryUpdated(previous, _factory);
     }
 
-    /// @notice Announces a change of factory. Executable after
+    /// @notice Announces a factory, the first included. Executable after
     ///         `timelockDelay`, via setVaultFactory with the same address.
     function queueSetVaultFactory(address _factory) external onlyOperator {
         require(_factory != address(0), "Invalid factory address");
-        require(vaultFactory != address(0), "First factory is set directly");
         _queue(_vaultFactoryId(_factory));
     }
 
@@ -228,6 +239,10 @@ contract InsurancePool is Timelocked, OperatorControlled {
      * @param amount The amount to contribute.
      */
     function fund(address asset, uint256 amount) external {
+        // Audit M-05 / reserve setup: no money in before the pool is wired.
+        // A contributor then always funds a pool whose factory has already
+        // passed the timelock, and never one whose wiring is still pending.
+        require(vaultFactory != address(0), "Pool not wired to a factory yet");
         require(asset != address(0), "Invalid asset");
         require(amount > 0, "Amount must be greater than zero");
 
@@ -249,8 +264,9 @@ contract InsurancePool is Timelocked, OperatorControlled {
      *           2. the draw cap (drawCapBps of the loan's principal),
      *           3. maxDrawShareBps of the asset's current reserve (item 8).
      *
-     *         Never reverts for lack of funds — pays what it can and reports
-     *         the actual amount, so settlement always completes. The pool
+     *         Never reverts for lack of funds, or because the token refuses
+     *         the transfer (Q8) — pays what it can and reports the actual
+     *         amount, so settlement always completes. The pool
      *         reduces the probability and size of lender-impacted losses;
      *         it does not and cannot eliminate them (see UI disclosure
      *         requirements in the Build-Readiness Spec).
@@ -258,13 +274,18 @@ contract InsurancePool is Timelocked, OperatorControlled {
      * @param asset     The loan's denomination asset.
      * @param shortfall The uncovered loss remaining after the deposit.
      * @param principal The loan's principal (basis for the draw cap).
+     * @param beneficiary The vault's lender, for whom a refused transfer is held (Q8).
      * @return paid     The amount actually transferred to the vault.
+     * @return deferred The amount the token refused to transfer, held for
+     *                  `beneficiary` in deferredDrawOf (Q8). At most one of
+     *                  the two is nonzero.
      */
     function draw(
         address asset,
         uint256 shortfall,
-        uint256 principal
-    ) external returns (uint256 paid) {
+        uint256 principal,
+        address beneficiary
+    ) external returns (uint256 paid, uint256 deferred) {
         require(isRegisteredVault[msg.sender], "Only registered vaults can draw");
         require(asset != address(0), "Invalid asset");
         require(shortfall > 0, "Shortfall must be greater than zero");
@@ -272,16 +293,39 @@ contract InsurancePool is Timelocked, OperatorControlled {
         uint256 cap   = (principal * drawCapBps) / 10000;
         uint256 share = (reserveOf[asset] * maxDrawShareBps) / 10000;
 
-        paid = shortfall;
-        if (paid > cap)   { paid = cap; }
-        if (paid > share) { paid = share; }
+        uint256 amount = shortfall;
+        if (amount > cap)   { amount = cap; }
+        if (amount > share) { amount = share; }
 
-        if (paid > 0) {
-            reserveOf[asset] -= paid;
-            SafeTransfer.safeTransfer(asset, msg.sender, paid);
+        if (amount > 0) {
+            reserveOf[asset] -= amount;
+            // Q8 (Covenza, answering Zealynx's kickoff question 8): a token
+            // that refuses this transfer (paused, or the pool or vault
+            // blocked by its issuer) used to revert the draw and with it the
+            // whole settlement, so nobody was paid. The insurance is now held
+            // for the lender instead, outside the reserve, and the vault
+            // settles with the cash it has. The waterfall is unchanged: the
+            // lender is still owed it, only later.
+            if (SafeTransfer.trySafeTransfer(asset, msg.sender, amount)) {
+                paid = amount;
+            } else {
+                deferred = amount;
+                deferredDrawOf[asset][beneficiary] += amount;
+                emit DrawDeferred(asset, msg.sender, beneficiary, amount);
+            }
         }
 
         emit Drawn(asset, msg.sender, shortfall, paid);
+    }
+
+    /// @notice Pays the caller the insurance held for them by a deferred draw
+    ///         (Q8). Reverts, keeping the claim, while the token still refuses.
+    function claimDeferredDraw(address asset) external returns (uint256 amount) {
+        amount = deferredDrawOf[asset][msg.sender];
+        require(amount > 0, "Nothing deferred");
+        deferredDrawOf[asset][msg.sender] = 0;
+        SafeTransfer.safeTransfer(asset, msg.sender, amount);
+        emit DeferredDrawClaimed(asset, msg.sender, amount);
     }
 
     // --- Administrative withdrawal (operator-only) ---

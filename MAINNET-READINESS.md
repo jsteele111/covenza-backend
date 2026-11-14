@@ -273,7 +273,18 @@ assert that rather than trusting the operator to remember.
 
 ---
 
-## 8. Insurance pool solvency is untested at scale — MEDIUM — **MODELLED; aggregate drain limited (18 October 2026)**
+## 8. Insurance pool solvency is untested at scale — MEDIUM — **MODELLED; aggregate drain limited (18 October 2026); RERUN after audit M-06/M-07 (14 November 2026)**
+
+> **Rerun (14 November 2026).** After the Zealynx M-06 fix (insured window) and
+> M-07 fix (exposure budget), the model now prices risk over term + the 5-day
+> window, evaluates terms from 60 seconds, every portfolio the budget allows at
+> correlations up to 1.0, and a fat-tail stress. Blue chip's premium is raised
+> 100 → 250 bps: at 100 bps short Blue chip loans cleared the 3x target on the
+> baseline but not the stresses. Chosen settings now give at least 10.9x on the
+> baseline, 1.1x under fat tails and 1.4x under a full outage extension. **The
+> contract-default tier settings fail (Blue chip 0.2x) and must never go live;
+> the deployment sets every tier explicitly.** Full results:
+> `docs/insurance-model-rerun-2026-11.md`.
 
 > **Aggregate limit (18 October 2026).** `InsurancePool.maxDrawShareBps`
 > (default 500 = 5%) caps every draw at a share of the asset's reserve as it

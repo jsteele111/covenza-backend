@@ -39,6 +39,7 @@ describe("Item 16 — sequencer outages and the grace window", function () {
       operator.address, await router.getAddress(), await uniFactory.getAddress(), 0);
     await registry.addAssetWithTier(await weth.getAddress(), 0, 0);
     await registry.addAssetWithTier(await usdx.getAddress(), 0, 0);
+    await registry.setMinPoolLiquidity(await weth.getAddress(), await usdx.getAddress(), 1n);   // audit M-01
     await registry.setPoolFeeTier(await weth.getAddress(), await usdx.getAddress(), POOL_FEE);
     await registry.setSettlementConfig(1800, 200, GRACE, 2, 100);
     const pool = await (await ethers.getContractFactory("InsurancePool", operator)).deploy(operator.address, 1000, 0);
@@ -46,6 +47,7 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     const impl = await (await ethers.getContractFactory("Vault", { signer: operator, libraries: { UniswapTwap: await twapLib.getAddress() } })).deploy();
     const factory = await (await ethers.getContractFactory("VaultFactory", operator)).deploy(
       await kyc.getAddress(), await registry.getAddress(), await pool.getAddress(), operator.address, await impl.getAddress(), 0);
+    await pool.queueSetVaultFactory(await factory.getAddress());   // audit M-05: the first wiring is announced too
     await pool.setVaultFactory(await factory.getAddress());
 
     // Originate, fund, and take a position so settlement must force a sale.
@@ -177,6 +179,50 @@ describe("Item 16 — sequencer outages and the grace window", function () {
     expect(keeperFrom).to.equal(graceEnd);
   });
 
+  // --- Audit I-01 (Zealynx): only outages that eat into the window extend it ---
+  //
+  // Every outage before grace end plus the cap used to extend grace, including
+  // one that began after grace had already ended and so cost the parties
+  // nothing. That postponed the lender's in-kind exit for no reason. Grace now
+  // ends when the parties have had its full length of LIVE chain.
+
+  it("Audit I-01: an outage wholly after grace no longer postpones grace or the lender's in-kind exit", async function () {
+    const { registry, vault, deadline, graceEnd } = await loadFixture(stack);
+    await botRunsUntil(registry, graceEnd + BigInt(2 * HOUR));   // grace over, chain live throughout
+    await time.increase(7 * HOUR);                               // then a 7h outage
+    await registry.heartbeat();
+    const [, end] = await registry.outageAt(0);
+
+    const [extended, keeperFrom] = await registry.settlementWindow(deadline, graceEnd);
+    expect(extended).to.equal(graceEnd);                         // previously graceEnd + 7h
+    expect(keeperFrom).to.equal(end + BigInt(HOUR));             // keepers still wait out recovery
+    expect(await vault.inKindFrom()).to.equal(graceEnd + BigInt(7 * 24 * HOUR));
+  });
+
+  it("Audit I-01: outages that start inside the window, as extended so far, each restore their time; a later one restores none", async function () {
+    const { registry, deadline, graceEnd } = await loadFixture(stack);
+    await botRunsUntil(registry, graceEnd - BigInt(HOUR));
+    await time.increase(3 * HOUR);                               // spans the original grace end
+    await registry.heartbeat();
+    const [s1, e1] = await registry.outageAt(0);
+
+    await botRunsUntil(registry, e1 + BigInt(30 * MIN));         // window now ends at graceEnd + 3h
+    await time.increase(2 * HOUR);                               // starts inside the extended window
+    await registry.heartbeat();
+    const [s2, e2] = await registry.outageAt(1);
+    expect(s2).to.be.lessThan(graceEnd + (e1 - s1));
+
+    const [afterTwo] = await registry.settlementWindow(deadline, graceEnd);
+    expect(afterTwo).to.equal(graceEnd + (e1 - s1) + (e2 - s2));
+
+    await botRunsUntil(registry, afterTwo + BigInt(HOUR));        // window has ended
+    await time.increase(HOUR);                                   // starts after it
+    await registry.heartbeat();
+    expect(await registry.outageCount()).to.equal(3);
+    const [afterThree] = await registry.settlementWindow(deadline, graceEnd);
+    expect(afterThree).to.equal(afterTwo);
+  });
+
   describe("Configuration", function () {
     it("Refuses a recovery period shorter than the TWAP window", async function () {
       const { registry } = await loadFixture(stack);
@@ -191,6 +237,43 @@ describe("Item 16 — sequencer outages and the grace window", function () {
       await time.increase(10 * HOUR);
       await registry.heartbeat();
       expect(await registry.outageCount()).to.equal(0);
+    });
+
+    it("Audit L-05: refuses a gap threshold above one day, and accepts exactly one day", async function () {
+      const { registry } = await loadFixture(stack);
+      await expect(registry.setOutageConfig(24 * HOUR + 1, HOUR, 72 * HOUR))
+        .to.be.revertedWith("Gap threshold too long");
+      await expect(registry.setOutageConfig(ethers.MaxUint256, HOUR, 72 * HOUR))
+        .to.be.revertedWith("Gap threshold too long");
+      await registry.setOutageConfig(24 * HOUR, HOUR, 72 * HOUR);
+      expect(await registry.outageGapThreshold()).to.equal(BigInt(24 * HOUR));
+    });
+
+    it("Audit L-05: an oversized gap already in storage no longer freezes the heartbeat or either settlement path", async function () {
+      const { registry, vault, lender, deadline } = await loadFixture(stack);
+      // The setter now refuses it, so write an oversized legacy value straight
+      // into the threshold's storage slot, found by a distinctive marker.
+      await registry.setOutageConfig(1234, HOUR, 72 * HOUR);
+      const addr = await registry.getAddress();
+      let slot = -1;
+      for (let i = 0; i < 200; i++) {
+        if (BigInt(await ethers.provider.getStorage(addr, i)) === 1234n) { slot = i; break; }
+      }
+      expect(slot).to.be.greaterThanOrEqual(0);
+      await ethers.provider.send("hardhat_setStorageAt", [addr, ethers.toQuantity(slot), ethers.toBeHex(ethers.MaxUint256, 32)]);
+      expect(await registry.outageGapThreshold()).to.equal(ethers.MaxUint256);
+
+      // last + MaxUint256 overflowed; elapsed time compared by subtraction does not.
+      await time.increase(HOUR);
+      await registry.heartbeat();
+      expect(await registry.outageCount()).to.equal(0);
+
+      // settleInKind() gets past its heartbeat to its own timing check...
+      await time.increaseTo(deadline + 1n);
+      await expect(vault.connect(lender).settleInKind()).to.be.revertedWith("In-kind settlement not yet open");
+      // ...and cash settlement completes.
+      await vault.connect(lender).settle();
+      expect(await vault.isSettled()).to.equal(true);
     });
 
     it("Waits on the timelock when the registry has a delay", async function () {
