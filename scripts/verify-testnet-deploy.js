@@ -17,12 +17,13 @@ const path = require("path");
 const EXPECT = {
   timelockDelay: 3600,
   twapWindow: 60, twapToleranceBps: 300, swapBackGracePeriod: 90,
+  insuredWindow: 5 * 86400,   // audit M-06: the contract default, left in place
   bountyRatePerHourBps: 3000, bountyCapBps: 200,
   drawCapBps: 1000, maxDrawShareBps: 500,
   requiredBorrowerClaims: 7, requiredLenderClaims: 2,
   tiers: { tUSDG: 0, tWETH: 0, tAAPL: 1 },
   tierConfig: {
-    0: [6000, 1000, 30 * 86400, 7000, 100],
+    0: [6000, 1000, 30 * 86400, 7000, 250],   // 250bps: insurance-model rerun, Nov 2026
     1: [10000, 2000, 7 * 86400, 5000, 250],
     2: [20000, 4000, 86400, 2500, 100],
   },
@@ -83,7 +84,7 @@ async function main() {
 
   // --- Settings ------------------------------------------------------------
   console.log("");
-  for (const k of ["twapWindow", "twapToleranceBps", "swapBackGracePeriod", "bountyRatePerHourBps", "bountyCapBps"]) {
+  for (const k of ["twapWindow", "twapToleranceBps", "swapBackGracePeriod", "bountyRatePerHourBps", "bountyCapBps", "insuredWindow"]) {
     const v = Number(await reg[k]());
     check(`registry ${k} = ${EXPECT[k]}`, v === EXPECT[k], String(v));
   }
