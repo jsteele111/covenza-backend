@@ -209,15 +209,28 @@ async function main() {
   // fivefold. Tightening exposure rather than raising the premium keeps to the
   // principle the tiers were built on — deposits are the control, rates are the
   // compensation. See scripts/model-insurance-solvency.js.
+  //
+  // Blue chip's premium is 250bps, not 100 (audit rerun, November 2026). After
+  // M-06 every loan is insured for its term plus a 5-day window, so the
+  // shortest Blue chip loans carry about five days of risk on a 12.6% deposit.
+  // At 100bps they clear the 3x target on the lognormal baseline (4.4x) but
+  // collect only about half their expected draw under fat tails or a full
+  // 72-hour outage extension. At 250bps the worst case is 10.9x on the
+  // baseline, 1.1x under fat tails and 1.4x under the outage stress. Here the
+  // control could not be tightened instead: the deposit already scales with
+  // the insured horizon, and a lower cap would cut the leverage the tier
+  // exists to offer. See docs/insurance-model-rerun-2026-11.md.
+  //
   // Raising an exposure cap waits on the timelock; these all lower or keep
   // the constructor's caps, so sendOrQueue sends them at once.
-  await sendOrQueue(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 100], { network, label: "tier config: BlueChip" });
+  await sendOrQueue(registry, "setTierConfig", [0, 6000, 1000, 30 * 86400, 7000, 250], { network, label: "tier config: BlueChip" });
   await sendOrQueue(registry, "setTierConfig", [1, 10000, 2000, 7 * 86400, 5000, 250], { network, label: "tier config: Standard" });
   // Speculative's premium is 100bps, not 600. Its 40% deposit exceeds the 25%
-  // maximum possible loss, so the pool's exposure is not merely improbable, it
-  // is arithmetically zero — the position cannot fall far enough. No tail model
-  // changes that, which is what separates it from Standard, whose 4.9-sigma
-  // threshold fat tails could plausibly reach.
+  // maximum loss on a Speculative holding, so that holding alone can never
+  // reach the pool. A Speculative vault may also hold safer assets at their
+  // own caps (the M-07 budget allows 70% in Blue chip), which is the only way
+  // it can draw: the November rerun finds no baseline draw at any term, and
+  // 85x cover even under fat tails.
   //
   // Charging 600bps for cover that cannot pay is not a solvency problem; it is
   // selling something that does not exist. Kept nominal rather than zero
