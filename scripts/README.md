@@ -29,6 +29,7 @@ environment variables.
 | `check-sizes.js` | Bytecode size of every contract against the 24,576-byte limit (`npx hardhat run scripts/check-sizes.js`). |
 | `warm-testnet-pool.js` | Gives a pool the price history approval needs: requests 64 slots, tops liquidity up to ~100,000 a side if shallower, then writes observations with three tiny full-range liquidity additions. Not trades: a pool writes an observation only on a trade that changes the tick, which a 1-token trade in a deep pool does not. `POOL=0x…` for a pool other than the first. |
 | `approve-testnet-pools.js` | Names the approved pool for every pair still without one, after checking its history (`lib/pool-history.js`). Run only once the 60-second TWAP window has been executed through the timelock. |
+| `seed-insurance-testnet.js` | Tops the insurance pool's tUSDG reserve up to 2,000 (`SEED=` to change). Since audit M-05 the pool refuses funding until its first factory wiring clears the timelock, so with a delay the deploy script cannot seed it; run this after `execute-timelocked.js`. Funds only the shortfall; refuses if the pool is not wired. |
 | `verify-testnet-deploy.js` | Read-only, 55 PASS/FAIL checks of a testnet deployment against the values in its `EXPECT` block: code at every address, wiring, roles and timelocks, settlement, insurance and tier parameters, tiers and approved pools, pool history, the reserve, the attester and both test wallets. |
 
 ## Redeploying testnet, in order
@@ -40,9 +41,10 @@ from the repository root:
 ```
 npx hardhat run scripts/deploy-uniswap-testnet.js --network robinhoodTestnet      # only if testnet was wiped
 $env:TIMELOCK_DELAY=3600; npx hardhat run scripts/deploy-robinhood-testnet.js --network robinhoodTestnet
-npx hardhat run scripts/deploy-stock-token-testnet.js --network robinhoodTestnet
+npx hardhat run scripts/deploy-stock-token-testnet.js --network robinhoodTestnet   # only if testnet was wiped: the deploy above re-lists existing stocks
 # wait one hour
 npx hardhat run scripts/execute-timelocked.js --network robinhoodTestnet
+npx hardhat run scripts/seed-insurance-testnet.js --network robinhoodTestnet
 npx hardhat run scripts/warm-testnet-pool.js --network robinhoodTestnet           # any pool under 61 slots
 npx hardhat run scripts/approve-testnet-pools.js --network robinhoodTestnet
 npx hardhat run scripts/verify-testnet-deploy.js --network robinhoodTestnet       # expect 55 passed

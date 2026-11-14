@@ -72,19 +72,20 @@
   },
   "robinhoodTestnet": {
     "chainId": 46630,
-    "kycRegistry": "0xE67Da97d9d9A56032Dc08c01F0AA0f12E6A0A641",
-    "assetRegistry": "0x3910c7fa358212dF4A629d4F809cdAE643619926",
-    "insurancePool": "0x0eeB323aeD8b830817A74BE4eBbdfc97940d4214",
-    "vaultFactory": "0xff2273b60b69DaB7d106027b4735ddeA2e421a4d",
-    "vaultImplementation": "0xea81E07A7D3b56C74a84b6B742F479115a9ba7B4",
-    "uniswapTwapLibrary": "0x9DBEEAfDcDE2E8851C4aB91dBDcabf6FE1D0a848",
+    "kycRegistry": "0x2c3D42c27b70AB4b86bCb108d6DA23673d1f802f",
+    "assetRegistry": "0x6a29b61D2009ec4A9231da28E58cfD201Bb54Cc2",
+    "insurancePool": "0xbd21aBe3e9e312CDabf34d7770287FBdfd6A79d0",
+    "vaultFactory": "0x0BDcD69D47a42aD889867A0B8f1Ea0f81f8d7272",
+    "vaultImplementation": "0xa48D7502Ce991dC2d7Bc94FC3C0b214b7f9DD535",
+    "uniswapTwapLibrary": "0x49d6EaA25303E61E334235a99087e93cbc6955b5",
     "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
     "yieldVenue4626": "0x86d6b40BD8aE3f75F7850BCe7fCefbf6Ea960f53",
     "verifiedBorrower": "0x6369ffc9F3D8cdAB69Fa0e6C002ABE617A5D576D",
     "keeper": "0x26c6fba1774EA978482c0D9CDd1560641DB401c0",
     "tokens": {
       "tUSDG": "0x6ce0243a7790347C18805101947Bb10e7A4D427d",
-      "tWETH": "0x5218C7c2Fde6E8Ae083c32D714F624c69fc383f6"
+      "tWETH": "0x5218C7c2Fde6E8Ae083c32D714F624c69fc383f6",
+      "tAAPL": "0x5B25fD2570480067E1f1391f04673163D7B47B6A"
     },
     "uniswap": {
       "factory": "0xCd5EEAd4bfF7460d4ef15d3B3bE35327505b0Be3",
@@ -93,9 +94,9 @@
       "note": "REAL Uniswap V3, deployed by deploy-uniswap-testnet.js"
     },
     "twapWindow": 60,
-    "deployedAt": "2026-10-26T08:36:59.302Z",
+    "deployedAt": "2026-11-14T06:08:41.239Z",
     "operatorSafe": "0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c",
     "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B",
-    "vaultLens": "0x92ebA00eC7d12A5fEF6b550e2017c2fCb6379aae"
+    "vaultLens": "0x6d37CBB5C83dcBdC31f7f99C466E62f619B2644e"
   }
 }
