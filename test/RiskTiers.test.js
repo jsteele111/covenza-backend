@@ -770,6 +770,87 @@ describe("Risk tiers", function () {
       expect(await vault.settledInsuranceDraw()).to.equal(0n);           // still the 5-day window
     });
 
+    // M-06 fix review (Zealynx): the cut-off read the registry's CURRENT
+    // maxGraceExtension, so an operator change after origination reached live
+    // loans: raising it to 7 days extended cover past the 72 hours the premium
+    // was stressed on, and setting it to zero cut the outage protection the
+    // lender was promised. Insurance cover now extends by at most the fixed
+    // INSURED_OUTAGE_EXTENSION (72 hours), whatever the registry says later.
+    describe("Fix review: the outage extension of insurance cover is fixed at 72 hours", function () {
+      const OUTAGE_CFG = [DAY, 3600, 72 * 3600];   // a silence over a day is an outage; grace extension 72 h
+
+      // Heartbeats every 20 hours until `until`, so no outage is recorded
+      // before the one each test creates.
+      async function keepAlive(registry, until) {
+        while (BigInt(await time.latest()) + 20n * 3600n < until) {
+          await time.increase(20 * 3600);
+          await registry.heartbeat();
+        }
+        await time.increaseTo(until);
+        await registry.heartbeat();
+      }
+
+      it("Exposes the fixed 72-hour cap", async function () {
+        const { registry } = await loadFixture(fixture);
+        expect(await registry.INSURED_OUTAGE_EXTENSION()).to.equal(72n * 3600n);
+      });
+
+      it("The finding: raising the registry's grace extension to 7 days after origination does not extend a live loan's cover", async function () {
+        const { lender, registry, vault } = await lossStack({ outages: OUTAGE_CFG });
+        const d = await vault.deadline();
+        const insuredUntil = await vault.insuredUntil();
+        await registry.setOutageConfig(DAY, 3600, 7 * DAY);               // the operator raises the cap after origination
+
+        // Live until 3 days after the deadline, then six days of silence.
+        await keepAlive(registry, d + BigInt(3 * DAY));
+        await time.increaseTo(d + BigInt(9 * DAY));
+        await registry.heartbeat();                                        // records the outage [d+3d, d+9d]
+
+        // The parties' grace still follows the registry's 7-day cap ...
+        const [graceEnd] = await registry.settlementWindow(d, insuredUntil);
+        expect(graceEnd).to.equal(insuredUntil + BigInt(6 * DAY));        // d + 11 days
+        // ... but insurance cover stops at the fixed 72 hours.
+        expect(await registry.insuredCoverEnd(d, insuredUntil)).to.equal(insuredUntil + 72n * 3600n);   // d + 8 days
+
+        await vault.connect(lender).settle();                              // at d + 9 days: past the cover
+        expect(await vault.settledInsuranceDraw()).to.equal(0n);           // frozen code drew here
+      });
+
+      it("Control: a loss settled inside the 72-hour extension still draws", async function () {
+        const { lender, registry, vault } = await lossStack({ outages: OUTAGE_CFG });
+        const d = await vault.deadline();
+        await registry.setOutageConfig(DAY, 3600, 7 * DAY);
+        await keepAlive(registry, d + BigInt(3 * DAY));
+        // Silence from d + 3 days; the lender settles at d + 7.5 days, and
+        // settle()'s own heartbeat records the outage up to that moment.
+        await time.increaseTo(d + BigInt(7 * DAY + DAY / 2));
+        await vault.connect(lender).settle();
+        expect(await vault.settledInsuranceDraw()).to.equal(E("1"));      // 10% cap
+      });
+
+      it("Setting the registry's grace extension to zero after origination does not shorten a live loan's cover", async function () {
+        const { lender, registry, vault } = await lossStack({ outages: OUTAGE_CFG });
+        const d = await vault.deadline();
+        await registry.setOutageConfig(DAY, 3600, 0);                     // detection stays on; grace extension cut to zero
+        await keepAlive(registry, d + BigInt(3 * DAY));
+        // Same outage from d + 3 days, settled at d + 7.5 days: after the
+        // unextended 5-day window, inside the fixed 72-hour extension.
+        await time.increaseTo(d + BigInt(7 * DAY + DAY / 2));
+        await vault.connect(lender).settle();
+        expect(await vault.settledInsuranceDraw()).to.equal(E("1"));      // frozen code drew nothing here
+      });
+
+      it("Applies the same fixed cap to a loan originated after the registry cap was raised", async function () {
+        const { registry, vault } = await lossStack({ outages: [DAY, 3600, 7 * DAY] });   // raised before origination
+        const d = await vault.deadline();
+        const insuredUntil = await vault.insuredUntil();
+        await keepAlive(registry, d + BigInt(3 * DAY));
+        await time.increaseTo(d + BigInt(9 * DAY));
+        await registry.heartbeat();
+        expect(await registry.insuredCoverEnd(d, insuredUntil)).to.equal(insuredUntil + 72n * 3600n);
+      });
+    });
+
     it("Bounds the window: never shorter than grace, never over 28 days, and grace cannot outgrow it", async function () {
       const { registry } = await loadFixture(fixture);
       const grace = Number(await registry.swapBackGracePeriod());

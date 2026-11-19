@@ -691,6 +691,16 @@ receives the asset" rather than "nobody receives anything".
 > the production guard refuses that. Eleven tests in `OutageGrace.test.js`;
 > the three that matter fail against `a9b954b`.
 >
+> **Audit M-06 fix review (November 2026).** Insurance cover uses the same
+> outage walk, through `insuredCoverEnd()`, but capped at the fixed
+> `INSURED_OUTAGE_EXTENSION` (72 hours, the extension the solvency model
+> stresses), not at `maxGraceExtension`. A later `setOutageConfig` change can
+> therefore neither lengthen nor shorten a live loan's insurance cover.
+> `maxGraceExtension` (up to 7 days) now governs only the parties' grace, which
+> is not insured. Five tests in `RiskTiers.test.js` ("Fix review: the outage
+> extension of insurance cover is fixed at 72 hours"); two fail against the
+> previous `_distribute`.
+>
 > **Operational dependency:** an off-chain bot must call `heartbeat()` every
 > 5 minutes. Without it, any 30 minutes with no transaction reads as an
 > outage, even when the sequencer was fine. If it stops, quiet periods read as outages: the parties gain time

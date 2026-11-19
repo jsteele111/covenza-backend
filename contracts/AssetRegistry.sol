@@ -86,6 +86,14 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     ///         extension. Timelocked both ways; never shorter than the global
     ///         grace, so cover cannot end before a keeper may settle.
     uint256 public insuredWindow = 5 days;
+    /// @notice Audit M-06 fix review (Zealynx): the most that recorded outages
+    ///         can extend a loan's insurance cover past deadline + insuredWindow.
+    ///         Fixed in code, not read from maxGraceExtension, so no later
+    ///         registry change can lengthen or shorten a live loan's cover.
+    ///         72 hours is the outage extension the solvency model stresses.
+    ///         maxGraceExtension still governs how far outages extend the
+    ///         parties' grace, which is not insured.
+    uint256 public constant INSURED_OUTAGE_EXTENSION = 72 hours;
     uint256 public swapBackGracePeriod = 36 hours; // post-expiry window where only lender/borrower may settle a foreign-asset vault
     uint256 public bountyRatePerHourBps = 2;    // keeper bounty accrual: bps of principal per hour past grace end
     uint256 public bountyCapBps        = 100;   // keeper bounty ceiling: 1% of principal
@@ -844,8 +852,33 @@ contract AssetRegistry is OperatorControlled, Timelocked {
     function settlementWindow(uint256 _deadline, uint256 _graceEnd)
         external view returns (uint256 graceEnd, uint256 keeperFrom)
     {
+        return _settlementWindow(_deadline, _graceEnd, maxGraceExtension);
+    }
+
+    /**
+     * @notice The end of a loan's insurance cover: `_insuredUntil` pushed back
+     *         by every recorded outage that ate into it, by the same walk as
+     *         settlementWindow, but capped at INSURED_OUTAGE_EXTENSION rather
+     *         than the current maxGraceExtension.
+     * @dev    Audit M-06 fix review (Zealynx). Reading the live
+     *         maxGraceExtension let a later setOutageConfig change reach loans
+     *         already open: raising it to 7 days extended their cover beyond
+     *         the 72 hours the premium was stressed on; setting it to zero cut
+     *         the outage protection their lenders were promised. The cap is
+     *         now a constant, so a live loan's cover depends only on its own
+     *         snapshotted insuredUntil and the outages actually recorded.
+     */
+    function insuredCoverEnd(uint256 _deadline, uint256 _insuredUntil)
+        external view returns (uint256 coverEnd)
+    {
+        (coverEnd, ) = _settlementWindow(_deadline, _insuredUntil, INSURED_OUTAGE_EXTENSION);
+    }
+
+    function _settlementWindow(uint256 _deadline, uint256 _graceEnd, uint256 _extensionCap)
+        internal view returns (uint256 graceEnd, uint256 keeperFrom)
+    {
         uint256 n = _outages.length;
-        uint256 cap = _graceEnd + maxGraceExtension;
+        uint256 cap = _graceEnd + _extensionCap;
 
         // First outage ending after the deadline (or n if none).
         uint256 lo = 0;

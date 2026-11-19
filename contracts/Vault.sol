@@ -202,6 +202,9 @@ contract Vault {
     /// @notice Audit M-06: the end of this loan's insurance cover, before any
     ///         outage extension. deadline + the registry's insuredWindow at
     ///         origination, so a later change cannot reach a live loan.
+    ///         Recorded outages extend it by at most the registry's fixed
+    ///         INSURED_OUTAGE_EXTENSION (72 hours), never by the adjustable
+    ///         maxGraceExtension (M-06 fix review).
     uint256 public insuredUntil;
     bool    public isSettled;
 
@@ -1253,9 +1256,12 @@ contract Vault {
         // its own cash. The lender's place in the order does not change.
         uint256 insuranceDraw = 0;
         // Audit M-06: and only within the insured window, extended by any
-        // recorded outage that overlaps it (the same rule as grace). A later
-        // cash settlement still pays out the vault's own funds.
-        (uint256 insuredEnd, ) = registry.settlementWindow(deadline, insuredUntil);
+        // recorded outage that overlaps it (the same walk as grace), by at
+        // most the fixed 72-hour INSURED_OUTAGE_EXTENSION, so no registry
+        // change after origination can lengthen or shorten this loan's cover
+        // (M-06 fix review). A later cash settlement still pays out the
+        // vault's own funds.
+        uint256 insuredEnd = registry.insuredCoverEnd(deadline, insuredUntil);
         if (!early && totalReturned < principal && block.timestamp <= insuredEnd) {
             uint256 deferred;
             (insuranceDraw, deferred) = insurancePool.draw(asset, principal - totalReturned, principal, lender);
