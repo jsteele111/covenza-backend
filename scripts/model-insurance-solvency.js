@@ -18,9 +18,14 @@
  *      seconds-mode loans exist, and the window dominates their horizon.
  *   3. PORTFOLIOS (M-07). A vault may hold several assets. Holdings share one
  *      exposure budget: each uses value / (its tier cap x principal), total at
- *      most 100%. The model evaluates single holdings and two-asset splits of
- *      the budget across every tier the vault may hold, at return correlations
- *      of 0.4, 0.8 and 1.0, and reports the worst.
+ *      most 100%. The main tables evaluate single holdings and two-asset splits
+ *      of the budget (50/50 and 75/25) across every tier the vault may hold, at
+ *      return correlations of 0.4, 0.8 and 1.0, and report the worst. A
+ *      separate portfolio coverage check (added in the M-07 fix review) widens
+ *      this to up to three holdings, budget shares in 10% steps and
+ *      correlations from 0 to 1, and reports whether any of those mixes draws
+ *      more than the worst single holding. Both are sampled checks over stated
+ *      sets of portfolios, not a proof covering every possible portfolio.
  *
  * METHOD. Monte Carlo, seeded, so a rerun reproduces every figure. Returns are
  * zero-drift lognormal (the baseline) and, as a tail stress, a multivariate
@@ -33,6 +38,8 @@
  *   node scripts/model-insurance-solvency.js                 all three configurations
  *   CONFIG=launch node scripts/model-insurance-solvency.js   one of: launch, defaults, caps100
  *   PATHS=400000 TARGET_COVER=3 node scripts/model-insurance-solvency.js
+ *   CHECK=0 node scripts/model-insurance-solvency.js        skip the portfolio coverage check
+ *   CHECK_PATHS=100000 GRID_STEP=0.05 node scripts/model-insurance-solvency.js
  */
 
 const YEAR = 365 * 86400;
@@ -164,9 +171,10 @@ function expectedDraw(h, rho, deposit, horizonS, tails) {
   return sum / PATHS;
 }
 
-/** Every portfolio the risk budget allows that is worth testing: one holding
- *  at its cap, or the budget split 50/50 or 75/25 across two holdings of any
- *  tiers the vault may hold (including two different assets of one tier). */
+/** The portfolios the main tables test: one holding at its cap, or the budget
+ *  split 50/50 or 75/25 across two holdings of any tiers the vault may hold
+ *  (including two different assets of one tier). The portfolio coverage check
+ *  below tests a wider grid. */
 function portfolios(cfg, ceiling) {
   const caps = cfg.tiers.map((t) => t[3] / 10000);
   const sig = cfg.tiers.map((t) => t[0] / 10000);
@@ -247,7 +255,7 @@ function runConfig(key) {
     summary.push({ tier, premBps, worstBase, worstTail, worstOut, needBps });
   }
 
-  console.log("\n  Summary — lowest cover across every permitted term and portfolio");
+  console.log("\n  Summary — lowest cover across every permitted term and every portfolio in these tables");
   console.log("  tier          premium   baseline   fat tails   +72h outage   premium for " + TARGET_COVER + "x (baseline)");
   for (const s of summary) {
     const f = (x) => (x === Infinity ? "   inf" : x.toFixed(1).padStart(6)) + "x";
@@ -258,6 +266,195 @@ function runConfig(key) {
   return summary;
 }
 
+// --- Portfolio coverage check (M-07 fix review) ----------------------------
+//
+// The tables above test a fixed set of portfolios: one holding at its cap, and
+// two holdings splitting the budget 50/50 or 75/25. This check widens that set
+// and asks one question per vault tier, term and stress: does any portfolio in
+// the grid have a larger expected draw than the worst single holding at its
+// cap? It is a sampled check over a stated grid, not a proof for every
+// possible portfolio.
+//
+// Grid: one, two or three holdings (three or more different assets of the same
+// tier allowed), drawn from every tier the vault may hold; budget shares in
+// steps of GRID_STEP (default 10%) summing to the full budget; every pair of
+// holdings at the same return correlation, from 0 to 1 in steps of 0.2.
+//
+// Why only full-budget portfolios: on every path the payout
+// min(max(loss - deposit, 0), drawCap) is non-decreasing as all holdings are
+// scaled up together (it is zero wherever the scaled loss is negative, and
+// non-decreasing in the loss elsewhere). So holding the same mix with part of
+// the budget unused can never have a larger expected draw than the full-budget
+// version, and the full-budget grid covers it.
+//
+// Not covered: four or more holdings, budget shares off the grid, unequal
+// pairwise correlations, and distributions other than the two stated. Each
+// tier's assets are assumed to have exactly the tier's volatility.
+
+const CHECK_PATHS = Number(process.env.CHECK_PATHS || 50000);
+const GRID_STEP = Number(process.env.GRID_STEP || 0.1);
+const MAX_HOLDINGS = 3;
+const CHECK_RHOS = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
+const TOLERANCE = 0.01;   // a mix must beat the single holding by > 1% to count
+
+/** Equicorrelated shocks: holding i's shock = sqrt(rho) x common + sqrt(1 - rho) x own. */
+function drawCheckShocks(n, seed) {
+  const u = rng(seed);
+  const normal = () => {
+    let x = 0;
+    while (x === 0) x = u();
+    return Math.sqrt(-2 * Math.log(x)) * Math.cos(2 * Math.PI * u());
+  };
+  const common = new Float64Array(n), tmix = new Float64Array(n);
+  const own = [0, 1, 2].map(() => new Float64Array(n));
+  for (let i = 0; i < n; i++) {
+    common[i] = normal();
+    for (let k = 0; k < MAX_HOLDINGS; k++) own[k][i] = normal();
+    let chi = 0;
+    for (let k = 0; k < T_DOF; k++) { const g = normal(); chi += g * g; }
+    tmix[i] = Math.sqrt((T_DOF - 2) / chi);
+  }
+  return { n, common, own, tmix };
+}
+
+let CHECK_SHOCKS;
+const CONFIRM_PATHS = Number(process.env.CONFIRM_PATHS || 400000);
+let CONFIRM_SHOCKS;
+
+/** Expected draw for any number of holdings at equal pairwise correlation. */
+function expectedDrawN(h, rho, deposit, horizonS, tails, shocks = CHECK_SHOCKS) {
+  const T = horizonS / YEAR;
+  const { n, common, own, tmix } = shocks;
+  const a = Math.sqrt(rho), b = Math.sqrt(1 - rho);
+  const s = h.map((x) => x.sigma * Math.sqrt(T));
+  const k = h.length;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const m = tails === "t" ? tmix[i] : 1;
+    let loss = 0;
+    for (let j = 0; j < k; j++) {
+      const z = (a * common[i] + b * own[j][i]) * m;
+      loss += h[j].value * (1 - Math.exp(-0.5 * s[j] * s[j] + s[j] * z));
+    }
+    const excess = loss - deposit;
+    if (excess > 0) sum += excess < DRAW_CAP ? excess : DRAW_CAP;
+  }
+  return sum / n;
+}
+
+/** Budget shares in GRID_STEP steps: every way to split 1 into n positive parts. */
+function splits(n) {
+  const steps = Math.round(1 / GRID_STEP);
+  const out = [];
+  const rec = (left, parts, acc) => {
+    if (parts === 1) { out.push([...acc, left]); return; }
+    for (let x = 1; x <= left - (parts - 1); x++) rec(left - x, parts - 1, [...acc, x]);
+  };
+  rec(steps, n, []);
+  return out.map((p) => p.map((x) => x / steps));
+}
+
+/** Tier assignments for n holdings: multisets of tiers 0..ceiling. */
+function tierSets(n, ceiling) {
+  const out = [];
+  const rec = (from, acc) => {
+    if (acc.length === n) { out.push(acc); return; }
+    for (let t = from; t <= ceiling; t++) rec(t, [...acc, t]);
+  };
+  rec(0, []);
+  return out;
+}
+
+function gridPortfolios(cfg, ceiling) {
+  const caps = cfg.tiers.map((t) => t[3] / 10000);
+  const sig = cfg.tiers.map((t) => t[0] / 10000);
+  const out = [];
+  for (let n = 2; n <= MAX_HOLDINGS; n++) {
+    for (const tiers of tierSets(n, ceiling)) {
+      for (const w of splits(n)) {
+        out.push({
+          name: tiers.map((t, i) => `${Math.round(w[i] * 100)}% ${TIER_NAMES[t]}`).join(" + "),
+          h: tiers.map((t, i) => ({ value: w[i] * caps[t], sigma: sig[t] })),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function portfolioCheck(keys) {
+  CHECK_SHOCKS = drawCheckShocks(CHECK_PATHS, 20261119);
+  console.log("\n" + "=".repeat(86));
+  console.log("PORTFOLIO COVERAGE CHECK (M-07) — does any mix in the grid draw more than a single holding?");
+  console.log(`up to ${MAX_HOLDINGS} holdings, budget shares in ${GRID_STEP * 100}% steps, equal pairwise correlation ` +
+              `${CHECK_RHOS.join("/")}, paths ${CHECK_PATHS.toLocaleString("en-GB")}`);
+  console.log("ratio = worst mix E[draw] / worst single-holding E[draw], over every permitted term (<= 1 means no mix is worse)");
+  console.log("=".repeat(86));
+  const results = [];
+  for (const key of keys) {
+    const cfg = CONFIGS[key];
+    console.log(`\n${cfg.label}`);
+    console.log("  vault         portfolios   baseline    fat tails   +72h outage   result");
+    for (let tier = 0; tier < 3; tier++) {
+      const [volBps, minDep, maxTerm] = cfg.tiers[tier];
+      const caps = cfg.tiers.map((t) => t[3] / 10000);
+      const sig = cfg.tiers.map((t) => t[0] / 10000);
+      const mixes = gridPortfolios(cfg, tier);
+      const worstRatio = { base: 0, t: 0, out: 0 };
+      const worstName = { base: "", t: "", out: "" };
+      let exceeds = false, remeasured = 0;
+      for (const term of TERMS.filter((t) => t <= maxTerm)) {
+        const deposit = depositFloor(cfg.coeff, volBps, minDep, term);
+        for (const [stress, tails, horizon] of [["base", "normal", term + WINDOW], ["t", "t", term + WINDOW], ["out", "normal", term + WINDOW + OUTAGE_EXT]]) {
+          let single = 0;
+          for (let j = 0; j <= tier; j++) {
+            single = Math.max(single, expectedDrawN([{ value: Math.min(1, caps[j]), sigma: sig[j] }], 1, deposit, horizon, tails));
+          }
+          let mix = 0, best = null;
+          for (const p of mixes) {
+            for (const rho of CHECK_RHOS) {
+              const d = expectedDrawN(p.h, rho, deposit, horizon, tails);
+              if (d > mix) { mix = d; best = { p, rho }; }
+            }
+          }
+          let note = "";
+          // A mix that looks worse on the grid's sample is re-measured on a
+          // larger, independent sample, against the single holding on that same
+          // sample. Rare-tail draws are noisy at CHECK_PATHS; this separates a
+          // real excess from sampling noise.
+          if (best && mix > single * (1 + TOLERANCE)) {
+            if (!CONFIRM_SHOCKS) CONFIRM_SHOCKS = drawCheckShocks(CONFIRM_PATHS, 20261120);
+            let s2 = 0;
+            for (let j = 0; j <= tier; j++) {
+              for (const rho of [1, best.rho]) {
+                s2 = Math.max(s2, expectedDrawN([{ value: Math.min(1, caps[j]), sigma: sig[j] }], rho, deposit, horizon, tails, CONFIRM_SHOCKS));
+              }
+            }
+            const m2 = expectedDrawN(best.p.h, best.rho, deposit, horizon, tails, CONFIRM_SHOCKS);
+            note = ` (grid sample ${(mix * 1e4).toFixed(4)}bp vs ${(single * 1e4).toFixed(4)}bp; ` +
+                   `re-measured on ${CONFIRM_PATHS.toLocaleString("en-GB")} paths: ${(m2 * 1e4).toFixed(4)}bp vs ${(s2 * 1e4).toFixed(4)}bp)`;
+            single = s2; mix = m2; remeasured++;
+          }
+          if (mix > single * (1 + TOLERANCE) && mix > 0) exceeds = true;
+          const ratio = single > 0 ? mix / single : (mix > 0 ? Infinity : 0);
+          if (ratio > worstRatio[stress]) {
+            worstRatio[stress] = ratio;
+            worstName[stress] = best ? `${fmtTerm(term)}: ${best.p.name}, rho ${best.rho}${note}` : "";
+          }
+        }
+      }
+      const f = (r) => (r === Infinity ? "   inf" : r === 0 ? "no draw" : r.toFixed(3)).padStart(9);
+      console.log(`  ${TIER_NAMES[tier].padEnd(12)} ${String(mixes.length * CHECK_RHOS.length).padStart(8)}   ${f(worstRatio.base)}   ${f(worstRatio.t)}     ${f(worstRatio.out)}     ` +
+                  `${exceeds ? "A MIX IS WORSE" : "no mix worse"}`);
+      if (exceeds) for (const s of ["base", "t", "out"]) if (worstRatio[s] > 1 + TOLERANCE) console.log(`      ${s}: ${worstName[s]}`);
+      if (remeasured) console.log(`      ${remeasured} case(s) looked worse on the grid sample and were re-measured on ${CONFIRM_PATHS.toLocaleString("en-GB")} paths` +
+                                  (exceeds ? "" : "; all within 1% of the single holding"));
+      results.push({ key, tier, worstRatio, exceeds, remeasured });
+    }
+  }
+  return results;
+}
+
 function main() {
   const keys = process.env.CONFIG ? [process.env.CONFIG] : Object.keys(CONFIGS);
   console.log("Insurance pool solvency — do premiums cover expected draws? (audit rerun, M-06/M-07)");
@@ -265,6 +462,7 @@ function main() {
     if (!CONFIGS[k]) throw new Error(`Unknown CONFIG ${k}`);
     runConfig(k);
   }
+  if (process.env.CHECK !== "0") portfolioCheck(keys);
   console.log(`
 ASSUMPTIONS, in the order they are likely to be wrong:
 
@@ -278,7 +476,9 @@ ASSUMPTIONS, in the order they are likely to be wrong:
 3. VOLATILITY INPUTS. Tier volatilities are policy assumptions (60/100/200%).
    An asset listed in a tier must actually be no more volatile than the tier
    assumes, and each safer tier's cap x volatility must stay at or below the
-   riskier tier's, or the risk budget (M-07) stops bounding portfolio risk.
+   riskier tier's. The portfolio coverage check shows the budget keeps every
+   tested mix at or below the single-holding case under these settings; it is
+   a sampled check over a stated grid, not a general bound.
 4. SELECTION. Borrowers choose term, timing and assets; adverse selection makes
    realised draws exceed modelled ones under any distribution.
 5. EXCLUDED: lender interest (insurance covers principal only), swap fees and

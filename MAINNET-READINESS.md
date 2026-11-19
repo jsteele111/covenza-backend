@@ -268,8 +268,12 @@ assert that rather than trusting the operator to remember.
 
 > **Rerun (14 November 2026).** After the Zealynx M-06 fix (insured window) and
 > M-07 fix (exposure budget), the model now prices risk over term + the 5-day
-> window, evaluates terms from 60 seconds, every portfolio the budget allows at
-> correlations up to 1.0, and a fat-tail stress. Blue chip's premium is raised
+> window, evaluates terms from 60 seconds, single holdings and two-holding
+> splits of the budget at correlations up to 1.0, and a fat-tail stress. A
+> portfolio coverage check added in the M-07 fix review widens this to up to
+> three holdings, budget shares in 10% steps and correlations from 0 to 1; no
+> tested mix draws more than the worst single holding. It is a sampled check
+> over that grid, not a general bound. Blue chip's premium is raised
 > 100 → 250 bps: at 100 bps short Blue chip loans cleared the 3x target on the
 > baseline but not the stresses. Chosen settings now give at least 10.9x on the
 > baseline, 1.1x under fat tails and 1.4x under a full outage extension. **The
