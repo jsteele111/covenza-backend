@@ -44,6 +44,13 @@
  * Usage (PowerShell: set each variable with $env:NAME = "value" first):
  *   npx hardhat run scripts/deploy-ethereum-carry.js --network mainnet
  *   PHASE=approve-pool npx hardhat run scripts/deploy-ethereum-carry.js --network mainnet
+ *
+ * TESTNET REHEARSAL (Sepolia; deployment plan decision 1). Two extra settings,
+ * both REFUSED on mainnet:
+ *   CHAIN_FILE=uniswap-sepolia.json   the test pool from setup-sepolia-carry-pool.js
+ *   TIMELOCK_DELAY_SECONDS=3600       a shorter delay, so both phases fit in an afternoon
+ * On testnets the attester and treasury default to the deployer, with a warning.
+ *   CHAIN_FILE=uniswap-sepolia.json TIMELOCK_DELAY_SECONDS=3600 npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia
  */
 
 const fs = require("fs");
@@ -242,6 +249,8 @@ async function deployCarry(o) {
     tokens: { WETH: chain.weth, wstETH: chain.wstETH },
     uniswap: { factory: chain.uniswapFactory, router: chain.swapRouter02, pool: poolAddr, fee: chain.poolFee },
     timelockDelay: delay,
+    deployer: deployer.address,
+    drawCapBps: DRAW_CAP_BPS,
     guidance: { maxLoanWeth: 500, minReserveWeth: 500, note: "Deployment plan v2, decisions 3 and 4" },
     deployedAt: new Date().toISOString(),
   };
@@ -256,9 +265,10 @@ async function deployCarry(o) {
   if (!named) log("  - Grow the pool's history: GROW=1 npx hardhat run scripts/grow-pool-history.js --network " + network);
   log(`  - After ${delay / 86400} days: npx hardhat run scripts/execute-timelocked.js --network ${network}`);
   log("      (switches outage detection off and wires the protection reserve)");
-  if (!named) log(`  - When grow-pool-history says READY: PHASE=approve-pool npx hardhat run scripts/deploy-ethereum-carry.js --network ${network}`);
+  if (!named) log(`  - When grow-pool-history says READY: PHASE=approve-pool npx hardhat run scripts/deploy-ethereum-carry.js --network ${network}` +
+                  (isProduction(network) ? "" : " (with CHAIN_FILE as before)"));
   log("  - The partner funds the protection reserve: at least 500 WETH (decision 4).");
-  log("  - Verify every contract above on Etherscan.");
+  log(`  - Verify every contract above on Etherscan: npx hardhat run scripts/verify-ethereum-carry.js --network ${network}`);
   log(`  - Hand control to the partner: OPERATOR_SAFE=… OWNER_SAFE=… npx hardhat run scripts/transfer-control.js --network ${network}`);
   log("-".repeat(70));
 
@@ -291,34 +301,62 @@ async function approvePool({ ethers, deployer, network, registry, chain = ETHERE
   return r === "executed";
 }
 
+/** Reads CHAIN_FILE (testnets only) into the shape deployCarry expects. */
+function loadChainFile(file) {
+  const c = JSON.parse(fs.readFileSync(path.resolve(file), "utf8"));
+  for (const k of ["chainId", "uniswapFactory", "swapRouter02", "weth", "wstETH", "poolFee"]) {
+    if (c[k] === undefined) throw new Error(`${file} has no ${k}.`);
+  }
+  return { ...c, chainId: BigInt(c.chainId), poolFee: Number(c.poolFee) };
+}
+
 async function main() {
   const hre = require("hardhat");
   const { ethers } = hre;
   const network = hre.network.name;
+  const production = isProduction(network);
   const [deployer] = await ethers.getSigners();
   if (!deployer) {
     throw new Error(`No signer for ${network}. On Ethereum mainnet only MAINNET_DEPLOYER_PRIVATE_KEY can sign (hardhat.config.js).`);
+  }
+
+  // Testnet-only settings are refused outright on a production network.
+  if (production && (process.env.CHAIN_FILE || process.env.TIMELOCK_DELAY_SECONDS)) {
+    throw new Error(`CHAIN_FILE and TIMELOCK_DELAY_SECONDS are for test networks only, not ${network}.`);
+  }
+  let chain = ETHEREUM;
+  if (!production) {
+    if (process.env.CHAIN_FILE) chain = loadChainFile(process.env.CHAIN_FILE);
+    else if (network !== "hardhat") {
+      throw new Error(`On ${network}, pass CHAIN_FILE=uniswap-sepolia.json (written by setup-sepolia-carry-pool.js).`);
+    }
   }
 
   if (process.env.PHASE === "approve-pool") {
     const d = JSON.parse(fs.readFileSync(DEFAULT_ADDRESSES_PATH, "utf8"))[network];
     if (!d || !d.assetRegistry) throw new Error(`No deployment recorded for ${network}. Run phase 1 first.`);
     const registry = await ethers.getContractAt("AssetRegistry", d.assetRegistry, deployer);
-    await approvePool({ ethers, deployer, network, registry });
+    await approvePool({ ethers, deployer, network, registry, chain });
     return;
   }
 
+  let attesterKey = process.env.ATTESTER_KEY;
+  let treasury = process.env.TREASURY_ADDRESS;
+  if (!production) {
+    if (!attesterKey) { attesterKey = deployer.address; console.log("NOTE (testnet): no ATTESTER_KEY; the deployer is the identity attester."); }
+    if (!treasury)    { treasury = deployer.address;    console.log("NOTE (testnet): no TREASURY_ADDRESS; fees go to the deployer."); }
+  }
+
   await deployCarry({
-    ethers, deployer, network,
-    attesterKey: process.env.ATTESTER_KEY,
+    ethers, deployer, network, chain, attesterKey, treasury,
     operatorSafe: process.env.OPERATOR_SAFE,
-    treasury: process.env.TREASURY_ADDRESS,
+    timelockDelay: !production && process.env.TIMELOCK_DELAY_SECONDS ? Number(process.env.TIMELOCK_DELAY_SECONDS) : undefined,
     protocolFeeBps: process.env.PROTOCOL_FEE_BPS !== undefined ? Number(process.env.PROTOCOL_FEE_BPS) : undefined,
     minPoolLiquidity: process.env.MIN_POOL_LIQUIDITY ? BigInt(process.env.MIN_POOL_LIQUIDITY) : undefined,
   });
 }
 
-module.exports = { deployCarry, approvePool, ETHEREUM, TIERS, TIMELOCK_DELAY, EXPECTED };
+module.exports = { deployCarry, approvePool, loadChainFile, ETHEREUM, TIERS, TIMELOCK_DELAY, EXPECTED, DRAW_CAP_BPS };
 
 if (require.main === module) {
   main().catch((e) => { console.error(e.message || e); process.exitCode = 1; });

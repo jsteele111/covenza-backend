@@ -11,6 +11,7 @@ const {
   ROBINHOOD_MAINNET_RPC_URL,
   ETHEREUM_MAINNET_RPC_URL,
   SEPOLIA_RPC_URL,
+  ETHERSCAN_API_KEY,
 } = process.env;
 
 const devAccounts = [DEVTEST_PRIVATE_KEY, BORROWER_PRIVATE_KEY, KEEPER_PRIVATE_KEY].filter(Boolean);
@@ -96,5 +97,12 @@ module.exports = {
       chainId: 11155111,
       accounts: devAccounts,
     },
+  },
+
+  // Etherscan source verification (scripts/verify-ethereum-carry.js). One free
+  // key covers every Etherscan chain, Sepolia and Ethereum mainnet included.
+  // Read-only: the key can publish source code, it cannot move funds.
+  etherscan: {
+    apiKey: ETHERSCAN_API_KEY || "",
   },
 };
