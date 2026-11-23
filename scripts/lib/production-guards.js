@@ -17,17 +17,40 @@
  *     same block — the ceremony of a delay with none of the protection. This
  *     default was introduced in the same change that added the timelocks.
  *
+ * Outage detection depends on the CHAIN (Ethereum deployment plan, 23 Nov 2026):
+ *
+ *   - Robinhood Chain and Arbitrum have a single block producer (a sequencer).
+ *     If it stops, the chain stops, and a grace window can silently run out.
+ *     Detection must be ON there, with a heartbeat bot running.
+ *
+ *   - Ethereum mainnet has no single block producer, so there is no outage of
+ *     that kind to detect. Worse, with detection on and no heartbeat bot, any
+ *     quiet half-hour between Covenza transactions would be recorded as an
+ *     "outage", extending grace and holding keepers back for no reason.
+ *     Detection must be OFF there.
+ *
  * Override with ALLOW_UNSAFE_PRODUCTION=1 — deliberately ugly, and it prints
  * what is being waived so it appears in the terminal history.
  */
 
 const PRODUCTION_NETWORKS = ["robinhoodMainnet", "mainnet", "arbitrum"];
 
+// Chains with a single block producer: outage detection must be on.
+const SINGLE_SEQUENCER_NETWORKS = ["robinhoodMainnet", "arbitrum"];
+
+// Chains without one: outage detection must be off.
+const NO_SEQUENCER_NETWORKS = ["mainnet"];
+
 const MIN_TWAP_WINDOW   = 1800;   // 30 minutes
 const MIN_TIMELOCK      = 24 * 3600;
 
 function isProduction(networkName) {
   return PRODUCTION_NETWORKS.includes(networkName);
+}
+
+/** True where the chain has a single block producer, so outages must be detected. */
+function needsOutageDetection(networkName) {
+  return SINGLE_SEQUENCER_NETWORKS.includes(networkName);
 }
 
 /**
@@ -38,6 +61,7 @@ function isProduction(networkName) {
  * @param {number} [cfg.outageGapThreshold] sequencer-outage detection (0 = off)
  * @param {string} [cfg.operator]     intended operator address
  * @param {string} [cfg.deployer]     the deploying EOA
+ * @param {string} [cfg.attesterKey]  the initial identity attester
  */
 function guardProductionConfig(networkName, cfg = {}) {
   if (!isProduction(networkName)) { return; }
@@ -61,10 +85,23 @@ function guardProductionConfig(networkName, cfg = {}) {
   // MAINNET-READINESS item 16. With detection off, a sequencer outage across a
   // grace window silently consumes it and hands keepers the time jump. The
   // contract defaults to on; this catches a deployment that switched it off.
-  if (cfg.outageGapThreshold !== undefined && Number(cfg.outageGapThreshold) === 0) {
+  if (needsOutageDetection(networkName) &&
+      cfg.outageGapThreshold !== undefined && Number(cfg.outageGapThreshold) === 0) {
     problems.push(
       "sequencer-outage detection is disabled (gap threshold 0). Production " +
       "needs it on, with a heartbeat bot running."
+    );
+  }
+
+  // Ethereum deployment plan, 23 Nov 2026. No sequencer, so detection can only
+  // misfire: a quiet half-hour would be recorded as an outage.
+  if (NO_SEQUENCER_NETWORKS.includes(networkName) &&
+      cfg.outageGapThreshold !== undefined && Number(cfg.outageGapThreshold) !== 0) {
+    problems.push(
+      `outage detection is on (gap threshold ${cfg.outageGapThreshold}s), but ${networkName} ` +
+      "has no single block producer. With no heartbeat bot, any quiet period would be " +
+      "recorded as an outage, extending grace and holding keepers back. Switch it off " +
+      "with setOutageConfig(0, 0, 0)."
     );
   }
 
@@ -111,6 +148,7 @@ function guardProductionConfig(networkName, cfg = {}) {
 module.exports = {
   guardProductionConfig,
   isProduction,
+  needsOutageDetection,
   MIN_TWAP_WINDOW,
   MIN_TIMELOCK,
 };

@@ -2,6 +2,7 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const {
   guardProductionConfig,
+  needsOutageDetection,
   MIN_TWAP_WINDOW,
   MIN_TIMELOCK,
 } = require("../scripts/lib/production-guards");
@@ -96,5 +97,54 @@ describe("Production deployment guards", function () {
     expect(() =>
       guardProductionConfig("robinhoodMainnet", { timelockDelay: 0, twapWindow: 60 })
     ).to.not.throw();
+  });
+
+  // Ethereum deployment plan (23 Nov 2026): outage detection depends on the chain.
+  describe("Outage detection follows the chain", function () {
+
+    it("Requires it on chains with a single block producer: Robinhood Chain and Arbitrum", function () {
+      expect(needsOutageDetection("robinhoodMainnet")).to.equal(true);
+      expect(needsOutageDetection("arbitrum")).to.equal(true);
+      expect(() =>
+        guardProductionConfig("arbitrum", { ...SAFE, outageGapThreshold: 0 })
+      ).to.throw(/sequencer-outage detection is disabled/);
+    });
+
+    it("Accepts it switched off on Ethereum mainnet", function () {
+      expect(needsOutageDetection("mainnet")).to.equal(false);
+      expect(() =>
+        guardProductionConfig("mainnet", { ...SAFE, outageGapThreshold: 0 })
+      ).to.not.throw();
+    });
+
+    it("Refuses it left on on Ethereum mainnet, where a quiet half-hour would look like an outage", function () {
+      expect(() =>
+        guardProductionConfig("mainnet", { ...SAFE, outageGapThreshold: 1800 })
+      ).to.throw(/no single block producer/);
+    });
+
+    it("Still applies every other check on Ethereum mainnet", function () {
+      let message = "";
+      try {
+        guardProductionConfig("mainnet", { timelockDelay: 0, twapWindow: 60, outageGapThreshold: 0 });
+      } catch (e) { message = e.message; }
+      expect(message).to.match(/timelock delay is 0s/);
+      expect(message).to.match(/TWAP window is 60s/);
+      expect(message).to.not.match(/outage/);
+
+      const addr = "0x3333333333333333333333333333333333333333";
+      expect(() =>
+        guardProductionConfig("mainnet", { ...SAFE, outageGapThreshold: 0, operator: addr, deployer: addr })
+      ).to.throw(/operator is the deploying EOA/);
+    });
+
+    it("Leaves Sepolia and the Robinhood Chain testnet unchecked, as testnets", function () {
+      expect(() =>
+        guardProductionConfig("sepolia", { timelockDelay: 0, twapWindow: 60, outageGapThreshold: 1800 })
+      ).to.not.throw();
+      expect(() =>
+        guardProductionConfig("robinhoodTestnet", { ...SAFE, outageGapThreshold: 0 })
+      ).to.not.throw();
+    });
   });
 });

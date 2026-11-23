@@ -5,12 +5,21 @@ const {
   DEVTEST_PRIVATE_KEY,
   BORROWER_PRIVATE_KEY,
   KEEPER_PRIVATE_KEY,
+  MAINNET_DEPLOYER_PRIVATE_KEY,
   ARBITRUM_SEPOLIA_RPC_URL,
   ROBINHOOD_TESTNET_RPC_URL,
   ROBINHOOD_MAINNET_RPC_URL,
+  ETHEREUM_MAINNET_RPC_URL,
+  SEPOLIA_RPC_URL,
 } = process.env;
 
 const devAccounts = [DEVTEST_PRIVATE_KEY, BORROWER_PRIVATE_KEY, KEEPER_PRIVATE_KEY].filter(Boolean);
+
+// Ethereum mainnet signs ONLY with a dedicated deployer key, never the test
+// keys above, so a test key can never send a transaction on Ethereum mainnet.
+// Leave it unset until a real deployment: the network then has no signer, and
+// read-only scripts and forked tests still work.
+const ethereumMainnetAccounts = [MAINNET_DEPLOYER_PRIVATE_KEY].filter(Boolean);
 
 // KEEPER_PRIVATE_KEY is new for Group F: the three-tier settlement proof
 // needs a genuinely third-party account (neither lender nor borrower) to
@@ -68,6 +77,23 @@ module.exports = {
     robinhoodMainnet: {
       url: ROBINHOOD_MAINNET_RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
       chainId: 4663,
+      accounts: devAccounts,
+    },
+
+    // Ethereum (deployment plan, 23 Nov 2026): matched-pair carry, later the
+    // PT vault. Named "mainnet" because scripts/lib/production-guards.js
+    // treats that name as production, with outage detection required OFF
+    // (no single block producer). chainId pinned, as above.
+    mainnet: {
+      url: ETHEREUM_MAINNET_RPC_URL || "",
+      chainId: 1,
+      accounts: ethereumMainnetAccounts,
+    },
+    // Ethereum's test network, for rehearsing the Ethereum deployment
+    // (decision 1 of the plan). Test keys only.
+    sepolia: {
+      url: SEPOLIA_RPC_URL || "",
+      chainId: 11155111,
       accounts: devAccounts,
     },
   },
