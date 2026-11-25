@@ -99,6 +99,8 @@
       "vault": "0x8dBc68Af751a8d0A845a6B4fBE8f43b0E06F15d3",
       "deadline": 1795594608,
       "openedAt": "2026-11-25T07:17:39.834Z"
-    }
+    },
+    "operatorSafe": "0xb46d1415b7A877FD2f347b942fd9d55d7cc6F2e7",
+    "ownerSafe": "0xbc5a1099F3986399c4eCeb0b9E210Ab33b7F52eD"
   }
 }
