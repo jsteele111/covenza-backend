@@ -1,0 +1,12 @@
+{
+  "chainId": 11155111,
+  "uniswapFactory": "0xc20fc2E57B4c9dbf66797C96b6421C540056C1C5",
+  "swapRouter02": "0x85E4CDedC656b131B0cB5577a59B6a1892697540",
+  "weth": "0x0D0352C76cD2caAF54b62F1B0351b1b9f87b45a0",
+  "wstETH": "0xe570b397f53C2220b71f8dFb7adB95Ceb9D5ce7c",
+  "poolFee": 100,
+  "pool": "0xeE02722D2a7c8b6BAF8870527fc824a13e008668",
+  "liquidityHelper": "0xe97f53CC6877Bb4839c163E9e60E4Ef57D1Bd79F",
+  "note": "TEST tokens and our own Uniswap V3 on a testnet. Written by setup-sepolia-carry-pool.js.",
+  "createdAt": "2026-11-24T09:21:16.240Z"
+}

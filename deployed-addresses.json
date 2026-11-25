@@ -62,5 +62,43 @@
     "deployedAt": "2026-08-05T05:55:51.254Z",
     "operatorSafe": "0x0A2e01C8CE58a53E44cd475faDD0a376906E5B1c",
     "ownerSafe": "0x7FfCbd24b5EA061C1e5d478D608BcCc2eb45988B"
+  },
+  "sepolia": {
+    "product": "matched-pair carry",
+    "chainId": 11155111,
+    "kycRegistry": "0x29fE0C0B71C814dcFf427C4D8cAeF820c4811dA8",
+    "assetRegistry": "0x175CE0Eb10652aeB390977A01329CE7D552fe123",
+    "insurancePool": "0x78F17f13Ac94d39837fb699AdE42636D9D9C53Ad",
+    "vaultFactory": "0xf92CBab67174011f7FA167b2ff33c3572Eb94D54",
+    "vaultImplementation": "0x601c87d044e9cd7A5F62B818C8CAa3e2EA3D908C",
+    "vaultLens": "0x41bbA16C2024288a4ef37aF0d0a02e241eB4A58D",
+    "uniswapTwapLibrary": "0x2021d2F88EEE9E75a858635bf9158d8A2CE4dfab",
+    "treasury": "0x2e6075b0B10c747357C2Bd58075af5e471f1f5F3",
+    "attester": "0x6C9317C1F839Ca166a9B92d925515BD1Fd533a68",
+    "intendedOperatorSafe": null,
+    "tokens": {
+      "WETH": "0x0D0352C76cD2caAF54b62F1B0351b1b9f87b45a0",
+      "wstETH": "0xe570b397f53C2220b71f8dFb7adB95Ceb9D5ce7c"
+    },
+    "uniswap": {
+      "factory": "0xc20fc2E57B4c9dbf66797C96b6421C540056C1C5",
+      "router": "0x85E4CDedC656b131B0cB5577a59B6a1892697540",
+      "pool": "0xeE02722D2a7c8b6BAF8870527fc824a13e008668",
+      "fee": 100
+    },
+    "timelockDelay": 3600,
+    "deployer": "0x6C9317C1F839Ca166a9B92d925515BD1Fd533a68",
+    "drawCapBps": 1000,
+    "guidance": {
+      "maxLoanWeth": 500,
+      "minReserveWeth": 500,
+      "note": "Deployment plan v2, decisions 3 and 4"
+    },
+    "deployedAt": "2026-11-24T09:57:14.862Z",
+    "demoLoan": {
+      "vault": "0x8dBc68Af751a8d0A845a6B4fBE8f43b0E06F15d3",
+      "deadline": 1795594608,
+      "openedAt": "2026-11-25T07:17:39.834Z"
+    }
   }
 }
