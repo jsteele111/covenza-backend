@@ -50,13 +50,13 @@
  *   CHAIN_FILE=uniswap-sepolia.json   the test pool from setup-sepolia-carry-pool.js
  *   TIMELOCK_DELAY_SECONDS=3600       a shorter delay, so both phases fit in an afternoon
  * On testnets the attester and treasury default to the deployer, with a warning.
- *   CHAIN_FILE=uniswap-sepolia.json TIMELOCK_DELAY_SECONDS=3600 npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia
+ *   $env:CHAIN_FILE="uniswap-sepolia.json"; $env:TIMELOCK_DELAY_SECONDS="3600"; npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia   (PowerShell)
  */
 
 const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig, isProduction } = require("./lib/production-guards");
-const { sendOrQueue, readPending, writePending } = require("./lib/timelock");
+const { sendOrQueue, readPending, writePending, fmt } = require("./lib/timelock");
 const { checkPoolHistory } = require("./lib/pool-history");
 
 // Ethereum mainnet. Verify every address on Etherscan before a real run.
@@ -141,7 +141,7 @@ async function deployCarry(o) {
   log(`Attester        ${o.attesterKey}`);
   log(`Operator Safe   ${o.operatorSafe || "(none: testing only)"}`);
   log(`Treasury        ${o.treasury}`);
-  log(`Timelock        ${delay / 86400} days`);
+  log(`Timelock        ${fmt(delay)}`);
   log(`Pool            ${poolAddr} (wstETH/WETH 0.01%)`);
 
   // --- 1. Identity registry: the partner's provider is the attester -------
@@ -225,7 +225,7 @@ async function deployCarry(o) {
       queuedBy: deployer.address,
     });
     writePending(pending);
-    log(`  protection reserve wiring ANNOUNCED: executable in ${delay / 86400} days. No loan can open until then.`);
+    log(`  protection reserve wiring ANNOUNCED: executable in ${fmt(delay)}. No loan can open until then.`);
   }
 
   // --- 6. Record ------------------------------------------------------------
@@ -262,14 +262,15 @@ async function deployCarry(o) {
 
   log("\n" + "-".repeat(70));
   log("NEXT, in order:");
-  if (!named) log("  - Grow the pool's history: GROW=1 npx hardhat run scripts/grow-pool-history.js --network " + network);
-  log(`  - After ${delay / 86400} days: npx hardhat run scripts/execute-timelocked.js --network ${network}`);
+  if (!named) log(`  - Grow the pool's history: $env:GROW="1"; npx hardhat run scripts/grow-pool-history.js --network ${network}`);
+  log(`  - After ${fmt(delay)}: npx hardhat run scripts/execute-timelocked.js --network ${network}`);
   log("      (switches outage detection off and wires the protection reserve)");
-  if (!named) log(`  - When grow-pool-history says READY: PHASE=approve-pool npx hardhat run scripts/deploy-ethereum-carry.js --network ${network}` +
+  if (!named) log(`  - When grow-pool-history says READY: $env:PHASE="approve-pool"; npx hardhat run scripts/deploy-ethereum-carry.js --network ${network}` +
                   (isProduction(network) ? "" : " (with CHAIN_FILE as before)"));
   log("  - The partner funds the protection reserve: at least 500 WETH (decision 4).");
   log(`  - Verify every contract above on Etherscan: npx hardhat run scripts/verify-ethereum-carry.js --network ${network}`);
-  log(`  - Hand control to the partner: OPERATOR_SAFE=… OWNER_SAFE=… npx hardhat run scripts/transfer-control.js --network ${network}`);
+  log(`  - Hand control to the partner: $env:OPERATOR_SAFE="0x…"; $env:OWNER_SAFE="0x…"; npx hardhat run scripts/transfer-control.js --network ${network}`);
+  log(`      then the Safes accept: npx hardhat run scripts/safe-accept-roles.js --network ${network}`);
   log("-".repeat(70));
 
   return { kyc, reserve, registry, twapLib, vaultImpl, lens, factory, poolAddr, minLiquidity, named };
@@ -328,7 +329,7 @@ async function main() {
   if (!production) {
     if (process.env.CHAIN_FILE) chain = loadChainFile(process.env.CHAIN_FILE);
     else if (network !== "hardhat") {
-      throw new Error(`On ${network}, pass CHAIN_FILE=uniswap-sepolia.json (written by setup-sepolia-carry-pool.js).`);
+      throw new Error(`On ${network}, set $env:CHAIN_FILE="uniswap-sepolia.json" (written by setup-sepolia-carry-pool.js).`);
     }
   }
 

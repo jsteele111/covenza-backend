@@ -103,7 +103,7 @@ async function setupCarryPool({ ethers, deployer, outPath = DEFAULT_OUT, log = c
   fs.writeFileSync(outPath, JSON.stringify(chain, null, 2));
   log(`\nWritten ${path.basename(outPath)}.`);
   log("NEXT: wait at least 31 minutes (swaps need 30 minutes of price history), then run");
-  log("  CHAIN_FILE=uniswap-sepolia.json TIMELOCK_DELAY_SECONDS=3600 npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia");
+  log('  $env:CHAIN_FILE="uniswap-sepolia.json"; $env:TIMELOCK_DELAY_SECONDS="3600"; npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia');
   return { chain, weth, wst, factory, router, pool, lp };
 }
 
