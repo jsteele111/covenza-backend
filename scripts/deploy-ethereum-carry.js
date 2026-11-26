@@ -50,12 +50,22 @@
  *   CHAIN_FILE=uniswap-sepolia.json   the test pool from setup-sepolia-carry-pool.js
  *   TIMELOCK_DELAY_SECONDS=3600       a shorter delay, so both phases fit in an afternoon
  * On testnets the attester and treasury default to the deployer, with a warning.
+ *
+ * PRODUCTION (security review, 26 Nov 2026): the run reads only .env.mainnet
+ * and signs only with its DEPLOYER_PRIVATE_KEY (S5); the operator Safe and the
+ * treasury must be Safes needing at least 2 of 3 signatures (S1, S2) and must
+ * be typed for the run:
+ *   $env:CONFIRM_OPERATOR_SAFE="0x…"; $env:CONFIRM_TREASURY="0x…"
+ * The tier settings must pass the M-07 calibration rule (S8), and the
+ * deployment record carries the audit status and disclosures (S7).
  *   $env:CHAIN_FILE="uniswap-sepolia.json"; $env:TIMELOCK_DELAY_SECONDS="3600"; npx hardhat run scripts/deploy-ethereum-carry.js --network sepolia   (PowerShell)
  */
 
 const fs = require("fs");
 const path = require("path");
 const { guardProductionConfig, isProduction } = require("./lib/production-guards");
+const { requireProductionSafe } = require("./lib/safe-checks");
+const { envFileFor, requireTypedConfirmation } = require("./lib/production-env");
 const { sendOrQueue, readPending, writePending, fmt } = require("./lib/timelock");
 const { checkPoolHistory } = require("./lib/pool-history");
 
@@ -119,8 +129,17 @@ async function deployCarry(o) {
     outageGapThreshold: 0,                 // the INTENDED setting, announced below
     operator: o.operatorSafe,
     attesterKey: o.attesterKey,
+    treasury: o.treasury,
     deployer: deployer.address,
+    // S8: the M-07 calibration rule, checked on the tiers this script sets.
+    tiers: TIERS.map((t) => ({ name: t.name, assumedVolBps: t.cfg[0], maxExposureBps: t.cfg[3] })),
   });
+  // S1 and S2 (security review, 26 Nov 2026): on production the operator and
+  // the treasury must be Safes needing at least 2 of 3 signatures.
+  if (isProduction(network)) {
+    await requireProductionSafe(ethers, o.operatorSafe, "Operator Safe");
+    await requireProductionSafe(ethers, o.treasury, "Treasury");
+  }
 
   const net = await ethers.provider.getNetwork();
   if (isProduction(network) && net.chainId !== chain.chainId) {
@@ -252,6 +271,14 @@ async function deployCarry(o) {
     deployer: deployer.address,
     drawCapBps: DRAW_CAP_BPS,
     guidance: { maxLoanWeth: 500, minReserveWeth: 500, note: "Deployment plan v2, decisions 3 and 4" },
+    // S7 (security review, 26 Nov 2026): what a reader of this record must know.
+    auditStatus: "Contracts: Audited by Zealynx — fixes under verification, final report pending (audit-fixes branch, 8b7311a). " +
+                 "This deployment's scripts and settings are NOT AUDITED.",
+    disclosures: isProduction(network) ? [
+      "Outage detection is OFF on Ethereum by design: Ethereum has no single block producer, so there is no sequencer outage to detect. " +
+      "The audit's M-06 fix review assumed detection is on in production; that assumption does not apply to this deployment.",
+      "The 5% matched-pair tier is safe only while matched-pair pools alone are approved and the protection reserve is at least twice the largest open loan.",
+    ] : ["TEST NETWORK: test tokens and settings only."],
     deployedAt: new Date().toISOString(),
   };
   fs.writeFileSync(addressesPath, JSON.stringify(all, null, 2));
@@ -318,7 +345,7 @@ async function main() {
   const production = isProduction(network);
   const [deployer] = await ethers.getSigners();
   if (!deployer) {
-    throw new Error(`No signer for ${network}. On Ethereum mainnet only MAINNET_DEPLOYER_PRIVATE_KEY can sign (hardhat.config.js).`);
+    throw new Error(`No signer for ${network}. On a production network only DEPLOYER_PRIVATE_KEY in .env.${network} can sign (hardhat.config.js).`);
   }
 
   // Testnet-only settings are refused outright on a production network.
@@ -346,6 +373,15 @@ async function main() {
   if (!production) {
     if (!attesterKey) { attesterKey = deployer.address; console.log("NOTE (testnet): no ATTESTER_KEY; the deployer is the identity attester."); }
     if (!treasury)    { treasury = deployer.address;    console.log("NOTE (testnet): no TREASURY_ADDRESS; fees go to the deployer."); }
+  }
+
+  // S1: on production, the operator Safe and the treasury are typed in the
+  // terminal for this run, so a stale value in the environment file cannot
+  // slip through unseen.
+  if (production) {
+    const envFile = envFileFor(network, path.join(__dirname, ".."));
+    requireTypedConfirmation({ name: "OPERATOR_SAFE", value: process.env.OPERATOR_SAFE || "(not set)", envFile });
+    requireTypedConfirmation({ name: "TREASURY", value: treasury || "(not set)", envFile });
   }
 
   await deployCarry({

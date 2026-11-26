@@ -24,11 +24,17 @@
  * Usage:
  *   OPERATOR_SAFE=0x… OWNER_SAFE=0x… npx hardhat run scripts/transfer-control.js --network robinhoodTestnet
  *   DRY_RUN=1 OPERATOR_SAFE=0x… OWNER_SAFE=0x… npx hardhat run ...   (checks only)
+ *
+ * PRODUCTION (security review S2, 26 Nov 2026): both Safes must need at least
+ * 2 of 3 signatures, and ALLOW_EOA is refused. A 1-of-1 Safe is no safer than
+ * the key behind it; on a test network it is fine for rehearsing.
  */
 
 const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
+const { isProduction } = require("./lib/production-guards");
+const { requireProductionSafe } = require("./lib/safe-checks");
 
 const OPERATOR_SAFE = process.env.OPERATOR_SAFE || "";
 const OWNER_SAFE    = process.env.OWNER_SAFE || "";
@@ -46,6 +52,13 @@ async function main() {
     console.log("\nNOTE: operator and owner are the same address. That is a real");
     console.log("improvement on one EOA, but it concentrates curation and the power to");
     console.log("repoint the protocol behind a single threshold.\n");
+  }
+
+  // S2: on production, a real multisig or nothing.
+  if (isProduction(hre.network.name)) {
+    if (ALLOW_EOA) throw new Error(`ALLOW_EOA is refused on ${hre.network.name}.`);
+    await requireProductionSafe(ethers, OPERATOR_SAFE, "OPERATOR_SAFE");
+    await requireProductionSafe(ethers, OWNER_SAFE, "OWNER_SAFE");
   }
 
   // A Safe has code. An EOA does not. Transferring to a typo'd EOA is

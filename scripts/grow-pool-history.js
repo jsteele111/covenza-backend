@@ -20,7 +20,7 @@
  *     own recent pace.
  *
  * READ-ONLY BY DEFAULT. It reports and sends nothing unless GROW=1 is set.
- * Ethereum mainnet signs only with MAINNET_DEPLOYER_PRIVATE_KEY (see
+ * Ethereum mainnet signs only with DEPLOYER_PRIVATE_KEY from .env.mainnet (see
  * hardhat.config.js), so without that key it can only report there.
  *
  * Usage (defaults: Ethereum mainnet, wstETH/WETH 0.01%, 30-minute window):
@@ -172,8 +172,8 @@ async function main() {
   const signers = await ethers.getSigners();
   if (signers.length === 0) {
     throw new Error(
-      `No signer for ${hre.network.name}. On Ethereum mainnet only MAINNET_DEPLOYER_PRIVATE_KEY ` +
-      "can sign (hardhat.config.js); add it to .env when it is time to deploy."
+      `No signer for ${hre.network.name}. On Ethereum mainnet only DEPLOYER_PRIVATE_KEY in .env.mainnet ` +
+      "can sign (hardhat.config.js); add it to .env.mainnet when it is time to deploy."
     );
   }
   console.log(`\nGrowing from ${signers[0].address}:`);

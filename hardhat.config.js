@@ -1,11 +1,19 @@
 require("@nomicfoundation/hardhat-toolbox");
-require("dotenv").config();
+
+// Security review S5 (26 Nov 2026): a production network reads ONLY its own
+// file (.env.mainnet for Ethereum, .env.robinhoodMainnet for Robinhood Chain)
+// and signs ONLY with that file's DEPLOYER_PRIVATE_KEY. Every other run reads
+// the everyday .env and has no production key loaded at all. .gitignore
+// already excludes .env.*, so these files are never committed.
+const { selectedNetwork, envFileFor, PRODUCTION_ENV_NETWORKS } = require("./scripts/lib/production-env");
+const NETWORK = selectedNetwork();
+require("dotenv").config({ path: envFileFor(NETWORK, __dirname) });
 
 const {
   DEVTEST_PRIVATE_KEY,
   BORROWER_PRIVATE_KEY,
   KEEPER_PRIVATE_KEY,
-  MAINNET_DEPLOYER_PRIVATE_KEY,
+  DEPLOYER_PRIVATE_KEY,
   ARBITRUM_SEPOLIA_RPC_URL,
   ROBINHOOD_TESTNET_RPC_URL,
   ROBINHOOD_MAINNET_RPC_URL,
@@ -16,11 +24,13 @@ const {
 
 const devAccounts = [DEVTEST_PRIVATE_KEY, BORROWER_PRIVATE_KEY, KEEPER_PRIVATE_KEY].filter(Boolean);
 
-// Ethereum mainnet signs ONLY with a dedicated deployer key, never the test
-// keys above, so a test key can never send a transaction on Ethereum mainnet.
-// Leave it unset until a real deployment: the network then has no signer, and
-// read-only scripts and forked tests still work.
-const ethereumMainnetAccounts = [MAINNET_DEPLOYER_PRIVATE_KEY].filter(Boolean);
+// A production network signs ONLY with the deployer key from its own file, and
+// only when the run was started for that network. The test keys above are
+// never loaded for production, so they can never sign there. Leave the key
+// out until a real deployment: the network then has no signer, and read-only
+// scripts still work.
+const productionAccounts = (net) =>
+  (PRODUCTION_ENV_NETWORKS.includes(net) && NETWORK === net ? [DEPLOYER_PRIVATE_KEY].filter(Boolean) : []);
 
 // KEEPER_PRIVATE_KEY is new for Group F: the three-tier settlement proof
 // needs a genuinely third-party account (neither lender nor borrower) to
@@ -78,7 +88,7 @@ module.exports = {
     robinhoodMainnet: {
       url: ROBINHOOD_MAINNET_RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
       chainId: 4663,
-      accounts: devAccounts,
+      accounts: productionAccounts("robinhoodMainnet"),   // was devAccounts: test keys could sign on mainnet (S5)
     },
 
     // Ethereum (deployment plan, 23 Nov 2026): matched-pair carry, later the
@@ -88,7 +98,7 @@ module.exports = {
     mainnet: {
       url: ETHEREUM_MAINNET_RPC_URL || "",
       chainId: 1,
-      accounts: ethereumMainnetAccounts,
+      accounts: productionAccounts("mainnet"),
     },
     // Ethereum's test network, for rehearsing the Ethereum deployment
     // (decision 1 of the plan). Test keys only.

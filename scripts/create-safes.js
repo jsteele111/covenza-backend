@@ -60,6 +60,17 @@ async function main() {
     throw new Error(`Threshold ${threshold} impossible with ${owners.length} owner(s).`);
   }
 
+  // Security review S2 (26 Nov 2026): on production, at least 2 of 3. A
+  // 1-of-1 Safe is fine for rehearsing on a test network, never for real.
+  const { isProduction } = require("./lib/production-guards");
+  const { MIN_THRESHOLD, MIN_OWNERS } = require("./lib/safe-checks");
+  if (isProduction(hre.network.name) && (threshold < MIN_THRESHOLD || owners.length < MIN_OWNERS)) {
+    throw new Error(`On ${hre.network.name} a Safe needs at least ${MIN_THRESHOLD} of ${MIN_OWNERS} signatures; asked for ${threshold} of ${owners.length}. Set OWNERS and THRESHOLD.`);
+  }
+  if (new Set(owners.map((o) => o.toLowerCase())).size !== owners.length) {
+    throw new Error("The same owner is listed twice.");
+  }
+
   console.log("=".repeat(70));
   console.log("Creating Safes");
   console.log("=".repeat(70));

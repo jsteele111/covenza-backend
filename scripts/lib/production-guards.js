@@ -31,6 +31,17 @@
  *
  * Override with ALLOW_UNSAFE_PRODUCTION=1 — deliberately ugly, and it prints
  * what is being waived so it appears in the terminal history.
+ *
+ * HARD CHECKS cannot be waived, not even with ALLOW_UNSAFE_PRODUCTION
+ * (security review, 26 Nov 2026):
+ *
+ *   - S8, the tier calibration rule from the audit M-07 fix review: each
+ *     safer tier's exposure cap x assumed volatility must be at or below the
+ *     next riskier tier's. The exposure budget only keeps a mixed portfolio
+ *     inside the risk the insurance model priced while this holds. The
+ *     contract defaults break it (Blue chip 1.00 x 60% = 0.60 > Standard
+ *     0.50 x 100% = 0.50) and must never go live.
+ *   - The operator, treasury and attester must be three different addresses.
  */
 
 const PRODUCTION_NETWORKS = ["robinhoodMainnet", "mainnet", "arbitrum"];
@@ -54,6 +65,24 @@ function needsOutageDetection(networkName) {
 }
 
 /**
+ * S8. Returns a problem string, or null. `tiers` is safest first, each
+ * { name, assumedVolBps, maxExposureBps }.
+ */
+function calibrationProblem(tiers) {
+  for (let i = 0; i + 1 < tiers.length; i++) {
+    const a = tiers[i], b = tiers[i + 1];
+    const ra = BigInt(a.maxExposureBps) * BigInt(a.assumedVolBps);
+    const rb = BigInt(b.maxExposureBps) * BigInt(b.assumedVolBps);
+    if (ra > rb) {
+      const f = (t) => `${(Number(t.maxExposureBps) / 10000).toFixed(2)} x ${(Number(t.assumedVolBps) / 100).toFixed(0)}% = ${(Number(t.maxExposureBps) * Number(t.assumedVolBps) / 1e8).toFixed(2)}`;
+      return `tier calibration rule broken (audit M-07): ${a.name} ${f(a)} is above ${b.name} ${f(b)}. ` +
+             "Each safer tier's cap x volatility must be at or below the riskier tier's.";
+    }
+  }
+  return null;
+}
+
+/**
  * @param {string} networkName        hre.network.name
  * @param {object} cfg
  * @param {number} [cfg.timelockDelay]
@@ -62,6 +91,8 @@ function needsOutageDetection(networkName) {
  * @param {string} [cfg.operator]     intended operator address
  * @param {string} [cfg.deployer]     the deploying EOA
  * @param {string} [cfg.attesterKey]  the initial identity attester
+ * @param {string} [cfg.treasury]     the protocol fee recipient
+ * @param {Array}  [cfg.tiers]        safest first: { name, assumedVolBps, maxExposureBps }
  */
 function guardProductionConfig(networkName, cfg = {}) {
   if (!isProduction(networkName)) { return; }
@@ -128,6 +159,26 @@ function guardProductionConfig(networkName, cfg = {}) {
     );
   }
 
+  // Hard checks: never waivable.
+  const hard = [];
+  if (cfg.tiers) {
+    const c = calibrationProblem(cfg.tiers);
+    if (c) { hard.push(c); }
+  }
+  const roles = [["operator", cfg.operator], ["treasury", cfg.treasury], ["attester", cfg.attesterKey]]
+    .filter(([, a]) => a);
+  for (let i = 0; i < roles.length; i++) {
+    for (let j = i + 1; j < roles.length; j++) {
+      if (roles[i][1].toLowerCase() === roles[j][1].toLowerCase()) {
+        hard.push(`the ${roles[i][0]} and the ${roles[j][0]} are the same address (${roles[i][1]}). Each must be separate.`);
+      }
+    }
+  }
+  if (hard.length > 0) {
+    throw new Error(`Refusing to deploy to ${networkName}. These cannot be overridden:\n` +
+      hard.map((p) => `  - ${p}`).join("\n"));
+  }
+
   if (problems.length === 0) { return; }
 
   const message =
@@ -147,6 +198,7 @@ function guardProductionConfig(networkName, cfg = {}) {
 
 module.exports = {
   guardProductionConfig,
+  calibrationProblem,
   isProduction,
   needsOutageDetection,
   MIN_TWAP_WINDOW,

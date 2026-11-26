@@ -38,6 +38,7 @@ async function expectRejects(promise, re) {
   this.timeout(1_800_000);
 
   let deployer, attester, operatorSafe, treasury, lender, borrower;
+  let opSafe, treasurySafe;   // 2-of-3 Safes (security review S1, S2)
   let d;                 // what deployCarry returned
   let addressesPath;
   const logs = [];
@@ -46,6 +47,12 @@ async function expectRejects(promise, re) {
     await network.provider.request({ method: "hardhat_reset", params: [{ forking: { jsonRpcUrl: RPC, blockNumber: FORK_BLOCK } }] });
     [deployer, attester, operatorSafe, treasury, lender, borrower] = await ethers.getSigners();
     addressesPath = path.join(os.tmpdir(), `covenza-carry-rehearsal-${Date.now()}.json`);
+    // On production the operator and the treasury must be Safes needing at
+    // least 2 of 3 signatures. Stand-ins answer the same two questions a Safe does.
+    const Safe = await ethers.getContractFactory("MockSafe");
+    const owners = [operatorSafe.address, treasury.address, attester.address];
+    opSafe = await (await Safe.deploy(owners, 2)).getAddress();
+    treasurySafe = await (await Safe.deploy(owners, 2)).getAddress();
   });
 
   after(async function () {
@@ -58,19 +65,26 @@ async function expectRejects(promise, re) {
 
   it("refuses a mainnet run without the partner's attester, Safe and treasury, before deploying anything", async function () {
     const nonce = await ethers.provider.getTransactionCount(deployer.address);
-    await expectRejects(deployCarry({ ethers, deployer, network: "mainnet", operatorSafe: operatorSafe.address, treasury: treasury.address }), /ATTESTER_KEY must be set/);
+    await expectRejects(deployCarry({ ethers, deployer, network: "mainnet", operatorSafe: opSafe, treasury: treasurySafe }), /ATTESTER_KEY must be set/);
     await expectRejects(deployCarry({ ethers, deployer, network: "mainnet",
-      attesterKey: deployer.address, operatorSafe: operatorSafe.address, treasury: treasury.address }), /initial attester is the deploying key/);
+      attesterKey: deployer.address, operatorSafe: opSafe, treasury: treasurySafe }), /initial attester is the deploying key/);
     await expectRejects(deployCarry({ ethers, deployer, network: "mainnet",
-      attesterKey: attester.address, operatorSafe: deployer.address, treasury: treasury.address }), /operator is the deploying EOA/);
-    expect(await ethers.provider.getTransactionCount(deployer.address)).to.equal(nonce);   // nothing sent
+      attesterKey: attester.address, operatorSafe: deployer.address, treasury: treasurySafe }), /operator is the deploying EOA/);
+    // S1 and S2: a single key, or a Safe below 2 of 3, is refused for either role.
+    await expectRejects(deployCarry({ ethers, deployer, network: "mainnet",
+      attesterKey: attester.address, operatorSafe: operatorSafe.address, treasury: treasurySafe }), /single key, not a Safe/);
+    const oneOfOne = await (await (await ethers.getContractFactory("MockSafe")).deploy([treasury.address], 1)).getAddress();
+    await expectRejects(deployCarry({ ethers, deployer, network: "mainnet",
+      attesterKey: attester.address, operatorSafe: opSafe, treasury: oneOfOne }), /at least 2 of 3/);
+    // Nothing sent by these refusals (the 1-of-1 stand-in above is the only deployment).
+    expect(await ethers.provider.getTransactionCount(deployer.address)).to.equal(nonce + 1);
   });
 
   it("phase 1: deploys, applies what may apply now, and announces what must wait 2 days", async function () {
     const before = await ethers.provider.getBalance(deployer.address);
     d = await deployCarry({
       ethers, deployer, network: NET, addressesPath,
-      attesterKey: attester.address, operatorSafe: operatorSafe.address, treasury: treasury.address,
+      attesterKey: attester.address, operatorSafe: opSafe, treasury: treasurySafe,
       log: (s) => logs.push(s),
     });
     const spent = before - (await ethers.provider.getBalance(deployer.address));
@@ -102,7 +116,7 @@ async function expectRejects(promise, re) {
     const rec = JSON.parse(fs.readFileSync(addressesPath, "utf8"))[NET];
     expect(rec.vaultFactory).to.equal(await d.factory.getAddress());
     expect(rec.guidance.maxLoanWeth).to.equal(500);
-    expect(await d.factory.treasury()).to.equal(treasury.address);
+    expect(await d.factory.treasury()).to.equal(treasurySafe);
   });
 
   it("after 2 days the announcements execute; the live settings then pass the mainnet guard", async function () {
@@ -123,7 +137,7 @@ async function expectRejects(promise, re) {
     expect(await d.reserve.vaultFactory()).to.equal(await d.factory.getAddress());
     expect(() => guardProductionConfig("mainnet", {
       timelockDelay: Number(TIMELOCK_DELAY), twapWindow: Number(1800),
-      outageGapThreshold: Number(0), operator: operatorSafe.address, attesterKey: attester.address, deployer: deployer.address,
+      outageGapThreshold: Number(0), operator: opSafe, attesterKey: attester.address, deployer: deployer.address,
     })).to.not.throw();
   });
 
